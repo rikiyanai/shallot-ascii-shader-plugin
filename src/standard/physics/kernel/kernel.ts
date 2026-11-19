@@ -1,0 +1,1438 @@
+// Each engine World owns its kernel instance, memory and worker pool. Explicit undefined selects
+// one process-local kernel for the standalone API. Initialization is asynchronous; stepping stays
+// synchronous. init() owns threading and startup contracts. The shared artifact loads dynamically
+// so single-thread consumers never parse it.
+
+import type { EntityRef, World } from "../../../engine";
+import { makeShapeId } from "../api/config";
+import type { EntityId } from "../common/ids";
+import { type ShapeEntity, shapeEntityAt } from "../world/shape-entities";
+import type { WorldState } from "../world/world";
+import { KERNEL_WASM_BASE64 } from "./kernel.wasm";
+import { createPool, maxWorkers, type Pool, solverPause } from "./pool";
+
+/** Physics kernel ABI. */
+export type Kernel = {
+    memory: WebAssembly.Memory;
+    geometryMass(operation: number): void;
+    hullBuildInputPtr(count: number): number;
+    hull2DInputPtr(count: number): number;
+    hull2D(operation: number, count: number, target: number): number;
+    hullBuild(operation: number, count: number, budget: number): number;
+    nonconvexBuildInputPtr(words: number): number;
+    nonconvexBuild(operation: number): number;
+    nonconvexRetain(): number;
+    nonconvexDestroy(image: number): void;
+    worldSetIsotropicInertiaTolerance(world: number, tolerance: number): void;
+    worldGetIsotropicInertiaTolerance(world: number): number;
+    worldSetCustomFilterCallback(world: number, enabled: boolean): void;
+    worldSetPreSolveCallback(world: number, enabled: boolean): void;
+    /** Present only in a checked build (`build-kernel.ts --checked`); routes panics to `kernelPanic`. */
+    installPanicHook?(): void;
+    viewEpochPtr(): number;
+    activeWorld(): number;
+    /** Per-shape scratch input: transform(7), count/radius, translation(3), fraction/encroach,
+     * then up to 128 xyz points. Cast output: hit, fraction, point(3), normal(3), iterations,
+     * triangle, child, material. Mover output is caller-owned: normal(3), offset, point(3),
+     * then three i32 indices, 40 bytes per plane. `local` selects per-kind dispatch without a
+     * shape transform, preserving the local oracle's signed zeros. */
+    jointReaction(world: number, joint: number, invH: number, torque: number): void;
+    jointRead(world: number, joint: number, operation: number): number;
+    geometryReadInputPtr(words: number): number;
+    geometryRead(operation: number): number;
+    worldDraw(world: number, flags: number, maskHi: number, maskLo: number, invH: number): number;
+    worldDrawRelease(start: number): void;
+    worldDrawPtr(): number;
+    worldDrawLen(): number;
+    worldDrawShape(world: number, shape: number): number;
+    moverPlanesPtr(count: number): number;
+    moverOutputPtr(): number;
+    moverSolve(operation: number, x: number, y: number, z: number, count: number): void;
+    contactQuery(world: number, shapeA: number, shapeB: number, childIndex: number): number;
+    eventChildIndex(world: number, kind: number, index: number): number;
+    collisionInputPtr(): number;
+    collisionOutputPtr(): number;
+    collisionQuery(operation: number): void;
+    manifoldInputPtr(): number;
+    manifoldOutputPtr(): number;
+    manifoldQuery(operation: number): void;
+    shapeQueryInputPtr(): number;
+    shapeQueryOutputPtr(): number;
+    shapeQueryRay(world: number, shape: number, local: number): void;
+    shapeQueryCast(world: number, shape: number, local: number): void;
+    shapeQueryOverlap(world: number, shape: number): number;
+    shapeQueryMover(
+        world: number,
+        shape: number,
+        output: number,
+        capacity: number,
+        local: number,
+    ): number;
+    characterInputPtr(): number;
+    characterOutputPtr(): number;
+    characterMove(world: number, own: number): void;
+    materialMixDefault(kind: number, a: number, b: number): number;
+    mathInputPtr(): number;
+    mathRead(operation: number): number;
+    mathCosSin(radians: number): number;
+    mathNormalizeQuat(x: number, y: number, z: number, s: number): number;
+    mathQuatIsValid(x: number, y: number, z: number, s: number): number;
+    worldCounters(world: number): number;
+    worldQueryHeaderPtr(): number;
+    worldQueryResultPtr(): number;
+    worldQuery(world: number, operation: number, callback: number): void;
+    bodyQuery(world: number, operation: number, head: number, capacity: number): void;
+    bodyTimeOfImpactMover(world: number, body: number): void;
+    eventCount(world: number, kind: number): number;
+    eventWord(world: number, kind: number, index: number, lane: number): number;
+    eventBufferPtr(world: number, kind: number): number;
+    eventFloat(world: number, kind: number, index: number, lane: number): number;
+    sensorVisitorCount(world: number, index: number): number;
+    sensorVisitorWord(world: number, index: number, visitor: number, word: number): number;
+
+    islandSplit(id: number): void;
+    islandCreate(set: number): number;
+    islandCount(): number;
+    islandField(id: number, field: number): number;
+    islandSetField(id: number, field: number, value: number): void;
+    islandArrayCount(id: number, kind: number): number;
+    islandArrayGet(id: number, kind: number, index: number, lane: number): number;
+    islandAddBody(id: number, body: number): void;
+    islandRemoveBody(id: number, index: number): void;
+    islandUnlinkContact(id: number): void;
+    solverSetCreate(): number;
+    solverSetCount(): number;
+    solverSetIndex(id: number): number;
+    solverSetBodyCount(id: number): number;
+    solverSetBodyId(set: number, index: number): number;
+    solverSetLayout(id: number): number;
+    solverSetArrayCount(id: number, kind: number): number;
+    solverSetArrayGet(id: number, kind: number, index: number): number;
+    bodyLayoutPtr(): number;
+    bodySetEntity(world: number, body: number, eid: number): void;
+    bodySleepChange(world: number): number;
+    /** The record capacity the resident body region is sized to — the single source of truth for the
+     * TS body-store's column-view lengths (bodycolumns.ts). Zero before the kernel first reserves bodies. */
+    bodyCap(): number;
+    /** Set the world context used by kernel finalization's move publication. */
+    bodySetActiveWorld(world: number): void;
+    /** Select the World's persistent layouts for the next kernel operation; no bytes are copied. */
+    shapeSetActiveWorld(world: number): void;
+    /** Allocate a body index/generation from the kernel-owned world-local pool. */
+    bodyCreate(world: number): number;
+    bodyCreateSim(
+        world: number,
+        type: number,
+        flags: number,
+        awake: boolean,
+        enabled: boolean,
+        threshold: number,
+        px: number,
+        py: number,
+        pz: number,
+        qx: number,
+        qy: number,
+        qz: number,
+        qs: number,
+        vx: number,
+        vy: number,
+        vz: number,
+        wx: number,
+        wy: number,
+        wz: number,
+        linearDamping: number,
+        angularDamping: number,
+        gravityScale: number,
+    ): number;
+    /** Release a body index into the kernel-owned world-local free list. */
+    bodyDestroy(world: number, id: number): number;
+    bodyDestroyWorld(world: number, id: number): void;
+    residentResetWorld(world: number): void;
+    worldDestroyKernel(world: number): void;
+    shapeApplyWind(
+        world: number,
+        id: number,
+        x: number,
+        y: number,
+        z: number,
+        drag: number,
+        lift: number,
+        maxSpeed: number,
+        wake: number,
+    ): void;
+    worldExplode(
+        world: number,
+        maskHi: number,
+        maskLo: number,
+        x: number,
+        y: number,
+        z: number,
+        radius: number,
+        falloff: number,
+        impulsePerArea: number,
+    ): void;
+    shapeSetFilter64(
+        world: number,
+        id: number,
+        category: bigint,
+        mask: bigint,
+        group: number,
+    ): void;
+    shapeFilterWrite64(
+        world: number,
+        id: number,
+        category: bigint,
+        mask: bigint,
+        group: number,
+    ): void;
+    shapeDestroyWorld(world: number, id: number, updateMass: boolean): void;
+    shapeFinishCreate(
+        world: number,
+        id: number,
+        force: boolean,
+        sensor: boolean,
+        updateMass: boolean,
+    ): void;
+    shapeSetFlag(world: number, id: number, flag: number, enabled: boolean): void;
+    shapeSetDensity(world: number, id: number, value: number, updateMass: boolean): void;
+    shapeSetSphere(
+        world: number,
+        id: number,
+        x: number,
+        y: number,
+        z: number,
+        radius: number,
+    ): void;
+    shapeSetCapsule(
+        world: number,
+        id: number,
+        ax: number,
+        ay: number,
+        az: number,
+        bx: number,
+        by: number,
+        bz: number,
+        radius: number,
+    ): void;
+    shapeSetHull(world: number, id: number, handle: number): void;
+    shapeSetMesh(world: number, id: number, handle: number, x: number, y: number, z: number): void;
+    shapeGetGeometryReference(world: number, id: number): number;
+    shapeSetFriction(world: number, id: number, value: number): void;
+    shapeSetRestitution(world: number, id: number, value: number): void;
+    shapeSetSurfaceMaterial(
+        world: number,
+        id: number,
+        friction: number,
+        restitution: number,
+        rolling: number,
+        x: number,
+        y: number,
+        z: number,
+        low: number,
+        high: number,
+        color: number,
+    ): void;
+    shapeSetMeshMaterial(
+        world: number,
+        id: number,
+        index: number,
+        friction: number,
+        restitution: number,
+        rolling: number,
+        x: number,
+        y: number,
+        z: number,
+        low: number,
+        high: number,
+        color: number,
+    ): void;
+    worldSnapshot(world: number): number;
+    worldSnapshotBuffer(bytes: number): number;
+    worldRestore(world: number): void;
+    bodyGeneration(world: number, id: number): number;
+    bodyAlive(world: number, id: number): number;
+    bodyCount(world: number): number;
+    bodyLength(world: number): number;
+    hashWorldState(world: number, seed: bigint): bigint;
+    bodyVelocitySet(
+        world: number,
+        id: number,
+        angular: boolean,
+        x: number,
+        y: number,
+        z: number,
+    ): boolean;
+    bodyApply(
+        world: number,
+        id: number,
+        kind: number,
+        x: number,
+        y: number,
+        z: number,
+        px: number,
+        py: number,
+        pz: number,
+        maxSpeed: number,
+        wake: boolean,
+    ): void;
+    bodySetPose(
+        world: number,
+        id: number,
+        x: number,
+        y: number,
+        z: number,
+        qx: number,
+        qy: number,
+        qz: number,
+        qs: number,
+    ): void;
+    bodyTransfer(world: number, id: number, target: number, clearTransient: boolean): number;
+    contactCreateWorld(world: number, shapeA: number, shapeB: number, child: number): void;
+    contactDestroyWorld(world: number, id: number, wake: boolean): void;
+    contactLinkWorld(world: number, id: number): void;
+    bodyGetProperty(world: number, id: number, property: number): number;
+    bodySetProperty(world: number, id: number, property: number, value: number): void;
+    bodySetType(world: number, id: number, type: number): void;
+    bodySetAwake(world: number, id: number, awake: boolean): void;
+    bodyDisable(world: number, id: number): void;
+    bodyEnable(world: number, id: number): void;
+    bodySetMassData(
+        world: number,
+        id: number,
+        mass: number,
+        cx: number,
+        cy: number,
+        cz: number,
+        xx: number,
+        xy: number,
+        xz: number,
+        yx: number,
+        yy: number,
+        yz: number,
+        zx: number,
+        zy: number,
+        zz: number,
+    ): void;
+    bodyUpdateMass(world: number, id: number): void;
+    bodyColumnPtr(world: number, id: number, column: number): number;
+    simColumnPtr(world: number, set: number, index: number, column: number): number;
+    bodyStateIndex(world: number, id: number): number;
+    bodyLocalPoint(world: number, id: number, x: number, y: number, z: number): number;
+    bodyTargetVelocity(
+        world: number,
+        id: number,
+        tx: number,
+        ty: number,
+        tz: number,
+        qx: number,
+        qy: number,
+        qz: number,
+        qs: number,
+        timeStep: number,
+        wake: boolean,
+    ): boolean;
+    islandSplitCandidate(): number;
+    islandSetSplitCandidate(id: number): void;
+
+    // Allocator-owned shape records and lifecycle columns for the selected World.
+    shapeLayoutPtr(): number;
+    shapeCap(): number;
+    /** Allocate/release a world-local shape slot; generation and validity stay in wasm. */
+    shapeCreate(
+        world: number,
+        body: number,
+        type: number,
+        density: number,
+        explosion: number,
+        flags: number,
+    ): number;
+    shapeCanCreate(world: number, body: number, type: number): boolean;
+    shapeSetGeometry(
+        world: number,
+        id: number,
+        a: number,
+        b: number,
+        c: number,
+        d: number,
+        e: number,
+        f: number,
+        g: number,
+    ): number;
+    shapeGeometryOutputPtr(): number;
+    shapeComputeMass(world: number, id: number): void;
+    shapeComputeExtent(world: number, id: number, x: number, y: number, z: number): void;
+    shapeGetCentroid(world: number, id: number): void;
+    shapeFindHullSupportVertex(world: number, id: number, x: number, y: number, z: number): number;
+    shapeFindHullSupportFace(world: number, id: number, x: number, y: number, z: number): number;
+    shapeQueryCompound(
+        world: number,
+        id: number,
+        lx: number,
+        ly: number,
+        lz: number,
+        ux: number,
+        uy: number,
+        uz: number,
+    ): void;
+    shapeComputeAABB(
+        world: number,
+        id: number,
+        x: number,
+        y: number,
+        z: number,
+        qx: number,
+        qy: number,
+        qz: number,
+        qs: number,
+        extra: number,
+    ): void;
+    shapeFinishGeometry(world: number, id: number): void;
+    shapeGeneration(world: number, id: number): number;
+    shapeAlive(world: number, id: number): number;
+    shapeCount(world: number): number;
+    /** Kernel-owned live material records attached to shape slots. */
+    shapeAllocateMaterials(world: number, id: number, count: number): number;
+    shapeMaterialPtr(world: number, id: number): number;
+    shapeMaterialSet(
+        world: number,
+        id: number,
+        index: number,
+        friction: number,
+        restitution: number,
+        rolling: number,
+        x: number,
+        y: number,
+        z: number,
+        low: number,
+        high: number,
+        color: number,
+    ): void;
+    shapeMaterialCount(world: number, id: number): number;
+
+    // World-local tree pools, pair membership and moves. Pass zero to retain a capacity.
+    reserveBroad(capS: number, capK: number, capD: number, setCap: number): number;
+    bodyShouldBodiesCollide(bodyA: number, bodyB: number): number;
+    broadLayoutPtr(): number;
+    broadTreeCap(i: number): number;
+    reserveTreeWork(depth: number, words: number): number;
+    treeCreateProxy(
+        index: number,
+        lx: number,
+        ly: number,
+        lz: number,
+        hx: number,
+        hy: number,
+        hz: number,
+        hi: number,
+        lo: number,
+        user: number,
+    ): number;
+    treeDestroyProxy(index: number, id: number): void;
+    treeEnlargeProxy(
+        index: number,
+        id: number,
+        lx: number,
+        ly: number,
+        lz: number,
+        hx: number,
+        hy: number,
+        hz: number,
+    ): void;
+    broadBufferMove(key: number): void;
+    broadIsMoved(key: number): number;
+    treeMutateResident(
+        index: number,
+        op: number,
+        id: number,
+        lx: number,
+        ly: number,
+        lz: number,
+        hx: number,
+        hy: number,
+        hz: number,
+        ch: number,
+        cl: number,
+        ud: number,
+        udh: number,
+    ): number;
+    standaloneTreeCreate(capacity: number): number;
+    standaloneTreeDestroy(pointer: number): void;
+    standaloneTreeWords(pointer: number): number;
+    standaloneTreePool(pointer: number): number;
+    standaloneTreeCall(
+        pointer: number,
+        op: number,
+        id: number,
+        maskHi: number,
+        maskLo: number,
+        all: number,
+        userLow: number,
+        userHigh: number,
+        limit: number,
+    ): number;
+    treeQuery(
+        ptr: number,
+        cap: number,
+        root: number,
+        count: number,
+        lx: number,
+        ly: number,
+        lz: number,
+        hx: number,
+        hy: number,
+        hz: number,
+        mh: number,
+        ml: number,
+        all: number,
+        state: number,
+    ): void;
+    broadCreateProxy(
+        type: number,
+        lx: number,
+        ly: number,
+        lz: number,
+        hx: number,
+        hy: number,
+        hz: number,
+        categoryHi: number,
+        categoryLo: number,
+        shape: number,
+        force: number,
+    ): number;
+    broadTestOverlap(a: number, b: number): number;
+    broadDestroyProxy(key: number): void;
+    broadMoveProxy(
+        key: number,
+        lx: number,
+        ly: number,
+        lz: number,
+        hx: number,
+        hy: number,
+        hz: number,
+    ): void;
+    broadEnlargeProxy(
+        key: number,
+        lx: number,
+        ly: number,
+        lz: number,
+        hx: number,
+        hy: number,
+        hz: number,
+    ): void;
+    broadEnsureSet(capacity: number): void;
+    broadAddPair(a: number, b: number, child: number): number;
+    broadRemovePair(a: number, b: number, child: number): number;
+
+    // Immutable native geometry images are retained by caller identity inside each world; shapes
+    // and compounds hold the resulting kernel address. Hulls remain content-interned separately.
+    hullUploadBuffer(world: number, bytes: number): number;
+    hullDatabaseAdd(world: number, bytes: number): number;
+    hullDatabaseLookup(world: number, bytes: number): number;
+    hullDatabaseRemove(world: number, handle: number): void;
+    hullDatabaseCount(world: number): number;
+    hullDatabaseRefs(world: number, handle: number): number;
+    geometryUploadBuffer(world: number, bytes: number): number;
+    geometryDatabaseAdd(
+        world: number,
+        kind: number,
+        identity: number,
+        bytes: number,
+        refs: number,
+    ): number;
+    geometryDatabaseLookup(world: number, kind: number, identity: number): number;
+    geometryDatabaseCount(world: number): number;
+    geometryDatabaseAllocationBytes(world: number): number;
+    geometryDatabaseRefs(world: number, kind: number, pointer: number): number;
+
+    // The contact-id directory grows on allocation. Its block addresses remain stable while the
+    // manifold-count allocators grow; this layout header exposes only the directory's address.
+    contactRecordCapacity(worldId: number): number;
+    manifoldAllocatorOperations(worldId: number): bigint;
+    allocateManifolds(contactId: number, count: number): number;
+    freeManifolds(contactId: number): void;
+    manifoldLayoutPtr(): number;
+    collideHullsGeo(
+        a: number,
+        b: number,
+        px: number,
+        py: number,
+        pz: number,
+        qx: number,
+        qy: number,
+        qz: number,
+        qs: number,
+    ): number;
+    geoOutPtr(): number;
+    geoTriangleOutPtr(): number;
+    collideSpheresGeo(
+        ax: number,
+        ay: number,
+        az: number,
+        ar: number,
+        bx: number,
+        by: number,
+        bz: number,
+        br: number,
+        px: number,
+        py: number,
+        pz: number,
+        qx: number,
+        qy: number,
+        qz: number,
+        qs: number,
+    ): number;
+
+    reserveCollide(count: number, threads: number, defaultMix: number, distance: number): void;
+    collideListPtr(): number;
+    stepBegin(
+        world: number,
+        restitutionIterations: number,
+        restitutionPropagation: boolean,
+        dt: number,
+        substeps: number,
+        threads: number,
+        gx: number,
+        gy: number,
+        gz: number,
+        hertz: number,
+        damping: number,
+        maxSpeed: number,
+        contactSpeed: number,
+        restitution: number,
+        hit: number,
+        recycle: number,
+        warm: boolean,
+        continuous: boolean,
+        sleep: boolean,
+        defaultMix: boolean,
+    ): void;
+    stepAdvance(): number;
+    pairsBegin(world: number, threads: number): void;
+    stepProfilePtr(world: number): number;
+    stepInvDt(): number;
+    stepInvH(): number;
+    bodySyncCount(): number;
+    stepContext(dt: number, substeps: number, hertz: number, damping: number): number;
+    stepSolveBuild(
+        restitutionIterations: number,
+        restitutionPropagation: boolean,
+        threads: number,
+        substeps: number,
+        gx: number,
+        gy: number,
+        gz: number,
+        maxSpeed: number,
+        contactSpeed: number,
+        warm: boolean,
+        restitution: number,
+        hit: number,
+        continuous: boolean,
+    ): void;
+    allocContact(): number;
+    freeContact(contactId: number): void;
+    contactCapacity(worldId: number): number;
+    contactCount(worldId: number): number;
+    graphCreate(capacity: number): void;
+    graphBodyBit(color: number, id: number): number;
+    graphAssignColor(a: number, b: number, ta: number, tb: number): number;
+    graphContactCount(color: number, scalar: number): number;
+    graphContactPtr(color: number, scalar: number): number;
+    graphAddContact(id: number, indexA: number, indexB: number): void;
+    graphRemoveContact(a: number, b: number, color: number, index: number, mesh: number): void;
+    jointCreate(
+        a: number,
+        b: number,
+        type: number,
+        drawScale: number,
+        collideConnected: number,
+        ax: number,
+        ay: number,
+        az: number,
+        aqx: number,
+        aqy: number,
+        aqz: number,
+        aqs: number,
+        bx: number,
+        by: number,
+        bz: number,
+        bqx: number,
+        bqy: number,
+        bqz: number,
+        bqs: number,
+        force: number,
+        torque: number,
+        hertz: number,
+        damping: number,
+    ): number;
+    jointDefinitionPtr(world: number): number;
+    jointCreateDistance(
+        world: number,
+        definition: number,
+        length: number,
+        hertz: number,
+        damping: number,
+        lowerForce: number,
+        upperForce: number,
+        minLength: number,
+        maxLength: number,
+        maxForce: number,
+        speed: number,
+        spring: boolean,
+        limit: boolean,
+        motor: boolean,
+    ): number;
+    jointCreateRevolute(
+        world: number,
+        definition: number,
+        hertz: number,
+        damping: number,
+        target: number,
+        lower: number,
+        upper: number,
+        maxTorque: number,
+        speed: number,
+        spring: boolean,
+        limit: boolean,
+        motor: boolean,
+    ): number;
+    jointCreateSpherical(
+        world: number,
+        definition: number,
+        hertz: number,
+        damping: number,
+        qx: number,
+        qy: number,
+        qz: number,
+        qs: number,
+        cone: number,
+        lower: number,
+        upper: number,
+        maxTorque: number,
+        vx: number,
+        vy: number,
+        vz: number,
+        spring: boolean,
+        coneLimit: boolean,
+        twistLimit: boolean,
+        motor: boolean,
+    ): number;
+    jointCreatePrismatic(
+        world: number,
+        definition: number,
+        hertz: number,
+        damping: number,
+        target: number,
+        lower: number,
+        upper: number,
+        maxForce: number,
+        speed: number,
+        spring: boolean,
+        limit: boolean,
+        motor: boolean,
+    ): number;
+    jointCreateWheel(
+        world: number,
+        definition: number,
+        suspensionSpring: boolean,
+        suspensionHertz: number,
+        suspensionDamping: number,
+        suspensionLimit: boolean,
+        suspensionLower: number,
+        suspensionUpper: number,
+        spinMotor: boolean,
+        maxSpinTorque: number,
+        spinSpeed: number,
+        steering: boolean,
+        steeringHertz: number,
+        steeringDamping: number,
+        steeringTarget: number,
+        maxSteeringTorque: number,
+        steeringLimit: boolean,
+        steeringLower: number,
+        steeringUpper: number,
+    ): number;
+    jointCreateWeld(
+        world: number,
+        definition: number,
+        linearHertz: number,
+        linearDamping: number,
+        angularHertz: number,
+        angularDamping: number,
+    ): number;
+    jointCreateMover(
+        world: number,
+        definition: number,
+        x: number,
+        y: number,
+        z: number,
+        maxForce: number,
+    ): number;
+    jointCreatePogo(
+        world: number,
+        definition: number,
+        nx: number,
+        ny: number,
+        nz: number,
+        restLength: number,
+        hertz: number,
+        dampingRatio: number,
+        maxTensionForce: number,
+        maxCompressionForce: number,
+        impulse: number,
+        velocity: number,
+    ): number;
+    jointCreateMotor(
+        world: number,
+        definition: number,
+        lx: number,
+        ly: number,
+        lz: number,
+        maxForce: number,
+        ax: number,
+        ay: number,
+        az: number,
+        maxTorque: number,
+        linearHertz: number,
+        linearDamping: number,
+        springForce: number,
+        angularHertz: number,
+        angularDamping: number,
+        springTorque: number,
+    ): number;
+    jointCreateParallel(
+        world: number,
+        definition: number,
+        hertz: number,
+        damping: number,
+        maxTorque: number,
+    ): number;
+    jointDestroy(id: number, wake: number): void;
+    jointWriteVec3(id: number, field: number, x: number, y: number, z: number): void;
+    jointWriteQuat(id: number, field: number, x: number, y: number, z: number, s: number): void;
+    jointSetCollideConnected(world: number, id: number, collide: boolean): void;
+    jointWakeBodies(world: number, id: number): void;
+    jointEnable(world: number, id: number, bit: number, enabled: boolean): void;
+    jointSetLimits(world: number, id: number, lower: number, upper: number): void;
+    distanceJointSetLength(world: number, id: number, length: number): void;
+    motorJointSetMaxSpring(world: number, id: number, torque: boolean, value: number): void;
+    solverSetWake(set: number): void;
+    jointCollectEvents(): number;
+    jointResetEventBits(world: number): void;
+    jointSetEventBit(world: number, id: number): void;
+    awakeContactCount(): number;
+    awakeContactGet(index: number): number;
+    mixContacts(world: number): void;
+    jointRecordCount(): number;
+    jointRecordCapacity(): number;
+    jointRecordPtr(): number;
+    jointSimPtr(id: number): number;
+    jointArrayCount(key: number): number;
+    jointArrayPtr(key: number): number;
+    jointReadWord(key: number, index: number, field: number): number;
+    meshCacheCapacity(worldId: number): number;
+    freeMeshCache(contactId: number): void;
+    dispatchContacts(count: number): void;
+
+    // Solve columns are reserved while workers are parked. With no pool,
+    // threadCount is one and finish executes queued tasks inline.
+    parallelFor(kind: number, count: number, threadCount: number): void;
+    schedulerStart(): void;
+    schedulerStop(): void;
+    schedulerFaultPtr(): number;
+    workerRegister(): void;
+    /** Enter the scheduler loop; returns only on shutdown or fault. */
+    workerMain(injectFault: number): void;
+    /** Release live workers and the stepping thread after a worker trap. */
+    workerFault(): void;
+};
+
+/** Options for {@link init}. */
+export type InitOptions = {
+    /**
+     * the advanced escape from the default threading. {@link init} multithreads on its own wherever the
+     * host allows it. The default is half the host's logical cores (floor),
+     * clamped to 1–8, including the calling thread; an unavailable core count reads as 0.
+     * Pass `0` to force the single-thread kernel, or `n` to
+     * override the auto count (counting the calling thread, clamped to the ceiling the shadow stack
+     * affords). `n` still needs a host that can hold shared memory — a browser without cross-origin
+     * isolation runs single-thread whatever you ask. read {@link threads} for what you got.
+     */
+    threads?: number;
+    /** Shared linear memory ceiling in bytes; defaults to 1 GiB. Read once at initialization. */
+    maximumMemory?: number;
+};
+
+export type QueryCallback = (kind: number, shape: number, data: number, count: number) => number;
+
+const QUERY_RETURN_WORD = 79;
+
+export interface KernelState {
+    queryCallback: QueryCallback | null;
+    queryReturnF: Float32Array | null;
+    queryReturnWritten: boolean;
+    materialWorld: WorldState | null;
+    collisionWorld: WorldState | null;
+    queryWorld: number;
+    callbackDepth: number;
+    stepCallback: boolean;
+    queryFailed: boolean;
+    queryError: unknown;
+    instance: Kernel | null;
+    sharedMemory: WebAssembly.Memory | null;
+    maximumMemory: number;
+    pool: Pool | null;
+    resolved: number;
+    booting: Promise<void> | null;
+    dead: boolean;
+    viewEpoch: Uint32Array | null;
+    viewValue: number;
+    viewRevision: number;
+    /** Hull builds through shapes/build-hull since this state was created. */
+    hullBuilds: number;
+}
+
+function createKernelState(): KernelState {
+    return {
+        queryCallback: null,
+        queryReturnF: null,
+        queryReturnWritten: false,
+        materialWorld: null,
+        collisionWorld: null,
+        queryWorld: -1,
+        callbackDepth: 0,
+        stepCallback: false,
+        queryFailed: false,
+        queryError: undefined,
+        instance: null,
+        sharedMemory: null,
+        maximumMemory: 1073741824,
+        pool: null,
+        resolved: 1,
+        booting: null,
+        dead: false,
+        viewEpoch: null,
+        viewValue: -1,
+        viewRevision: 0,
+        hullBuilds: 0,
+    };
+}
+
+const kernelStateKey = { create: createKernelState };
+const standaloneKernelState = createKernelState();
+
+export function kernelState(world: World | undefined): KernelState {
+    return world ? world.resource(kernelStateKey) : standaloneKernelState;
+}
+
+/** Whether no view over `world`'s kernel memory changed since `state.viewRevision` was taken. */
+export function kernelViewsCurrent(world: World | undefined, state: KernelState): boolean {
+    const epoch = state.viewEpoch;
+    // Shared memory compares the cached buffer, as Emscripten's growMemViews does before each heap
+    // access. Unshared growth detaches the cached buffer, whose epoch view then reads undefined.
+    return (
+        epoch !== null &&
+        !state.dead &&
+        world?.disposed !== true &&
+        (state.sharedMemory === null || epoch.buffer === state.sharedMemory.buffer) &&
+        epoch[0] === state.viewValue
+    );
+}
+
+/** One staleness key for every store on this kernel, including reallocations within existing pages. */
+export function kernelViewKey(world: World | undefined, state = kernelState(world)): number {
+    if (kernelViewsCurrent(world, state)) return state.viewRevision;
+    const k = kernel(world);
+    const buffer = k.memory.buffer;
+    if (state.viewEpoch === null || state.viewEpoch.buffer !== buffer) {
+        state.viewEpoch = new Uint32Array(buffer, k.viewEpochPtr() >>> 0, 1);
+        state.viewRevision++;
+    }
+    const value = state.viewEpoch[0];
+    if (value !== state.viewValue) {
+        state.viewValue = value;
+        state.viewRevision++;
+    }
+    return state.viewRevision;
+}
+
+function queryReturnView(runtime: KernelState): Float32Array {
+    const instance = runtime.instance;
+    if (instance === null) throw new Error("physics: query callback has no kernel");
+    if (runtime.queryReturnF?.buffer !== instance.memory.buffer) {
+        runtime.queryReturnF = new Float32Array(
+            instance.memory.buffer,
+            (instance.worldQueryResultPtr() >>> 0) + QUERY_RETURN_WORD * 4,
+            1,
+        );
+    }
+    return runtime.queryReturnF;
+}
+
+export function writeQueryReturn(world: World | undefined, value: number): void {
+    const runtime = kernelState(world);
+    queryReturnView(runtime)[0] = value;
+    runtime.queryReturnWritten = true;
+}
+
+export function setQueryCallback(
+    world: World | undefined,
+    callback: QueryCallback | null,
+): QueryCallback | null {
+    const state = kernelState(world);
+    const previous = state.queryCallback;
+    state.queryCallback = callback;
+    return previous;
+}
+
+export function assertKernelEntry(world: World | undefined): void {
+    assertEntry(kernelState(world));
+}
+
+function assertEntry(state: KernelState): void {
+    if (state.stepCallback)
+        throw new Error("physics: cannot re-enter the shared kernel instance from a step callback");
+}
+
+export function assertQueryWorld(world: World | undefined, worldId: number): void {
+    assertKernelEntry(world);
+    const state = kernelState(world);
+    if (state.callbackDepth !== 0 && state.queryWorld !== worldId)
+        throw new Error("physics: one kernel cannot interleave two worlds' queries");
+    state.queryWorld = worldId;
+}
+
+export function rethrowQueryError(world: World | undefined): void {
+    const state = kernelState(world);
+    if (!state.queryFailed) return;
+    const error = state.queryError;
+    state.queryFailed = false;
+    state.queryError = undefined;
+    throw error;
+}
+
+// The clock writes a scalar through the ABI, avoiding a boxed f64 result at the host boundary.
+export function clockImport(memory: () => WebAssembly.Memory): (pointer: number) => void {
+    let view = new Float64Array(0);
+    return (pointer) => {
+        const buffer = memory().buffer;
+        if (view.buffer !== buffer) view = new Float64Array(buffer);
+        view[pointer >>> 3] = performance.now();
+    };
+}
+
+/** A checked kernel's panic message, printed before its abort traps; release kernels never import it. */
+function panicImport(memory: () => WebAssembly.Memory): (pointer: number, length: number) => void {
+    return (pointer, length) => {
+        const bytes = new Uint8Array(memory().buffer, pointer >>> 0, length >>> 0).slice();
+        console.error(`physics kernel ${new TextDecoder().decode(bytes)}`);
+    };
+}
+
+const callbackShapeEntity: ShapeEntity = { shape: 0 as EntityRef, body: 0 as EntityRef };
+/** @internal The Shape EntityRef a kernel callback names for `shape`, live or retired since the last event read. */
+export function ecsShapeReference(world: WorldState, shape: EntityId): EntityRef {
+    if (
+        !shapeEntityAt(world.shapeEntities, shape.index1 - 1, shape.generation, callbackShapeEntity)
+    )
+        throw new Error("physics: ECS shape callback reference is stale");
+    return callbackShapeEntity.shape;
+}
+
+function collisionImport(runtime: KernelState) {
+    let values = new Float32Array(0);
+    return (kind: number, a: number, b: number, pointer: number): number => {
+        if (runtime.queryFailed) return 0;
+        const previous = runtime.queryWorld;
+        ++runtime.callbackDepth;
+        try {
+            const world = runtime.collisionWorld;
+            if (world === null) throw new Error("physics: collision callback is not installed");
+            runtime.queryWorld = world.worldId;
+            const shapeA = makeShapeId(world, a);
+            const shapeB = makeShapeId(world, b);
+            if (kind === 0) {
+                runtime.stepCallback = true;
+                const owner = world.ecsState;
+                if (world.worldCustomFilterCallback && owner)
+                    return Number(
+                        world.worldCustomFilterCallback(
+                            owner,
+                            ecsShapeReference(world, shapeA),
+                            ecsShapeReference(world, shapeB),
+                        ),
+                    );
+                return Number(world.customFilterCallback?.(shapeA, shapeB) ?? true);
+            }
+            const memory = kernel(world.ecsState).memory.buffer;
+            if (values.buffer !== memory) values = new Float32Array(memory);
+            const o = pointer >>> 2;
+            runtime.stepCallback = true;
+            const point = { x: values[o], y: values[o + 1], z: values[o + 2] };
+            const normal = { x: values[o + 3], y: values[o + 4], z: values[o + 5] };
+            const owner = world.ecsState;
+            if (world.worldPreSolveCallback && owner)
+                return Number(
+                    world.worldPreSolveCallback(
+                        owner,
+                        ecsShapeReference(world, shapeA),
+                        ecsShapeReference(world, shapeB),
+                        point,
+                        normal,
+                    ),
+                );
+            return Number(world.preSolveCallback?.(shapeA, shapeB, point, normal) ?? true);
+        } catch (error) {
+            runtime.queryFailed = true;
+            runtime.queryError = error;
+            return 0;
+        } finally {
+            --runtime.callbackDepth;
+            runtime.stepCallback = false;
+            runtime.queryWorld = previous;
+        }
+    };
+}
+
+function materialImport(runtime: KernelState) {
+    let values = new Float32Array(0);
+    return (
+        kind: number,
+        shapeA: number,
+        indexA: number,
+        shapeB: number,
+        indexB: number,
+        pointer: number,
+    ): void => {
+        if (runtime.queryFailed) return;
+        const previous = runtime.queryWorld;
+        ++runtime.callbackDepth;
+        try {
+            const world = runtime.materialWorld;
+            if (world === null) throw new Error("physics: material callback is not installed");
+            runtime.queryWorld = world.worldId;
+            const idA = world.shapeStore.userMaterialIdAt(shapeA, indexA);
+            const idB = world.shapeStore.userMaterialIdAt(shapeB, indexB);
+            const k = kernel(world.ecsState);
+            const memory = k.memory.buffer;
+            if (values.buffer !== memory) values = new Float32Array(memory);
+            const o = pointer >>> 2;
+            runtime.stepCallback = true;
+            const owner = world.ecsState;
+            if (kind === 0) {
+                values[o + 2] =
+                    owner && world.worldFrictionCallback
+                        ? world.worldFrictionCallback(owner, values[o], idA, values[o + 1], idB)
+                        : world.frictionCallback
+                          ? world.frictionCallback(values[o], idA, values[o + 1], idB)
+                          : k.materialMixDefault(0, values[o], values[o + 1]);
+            } else {
+                values[o + 2] =
+                    owner && world.worldRestitutionCallback
+                        ? world.worldRestitutionCallback(owner, values[o], idA, values[o + 1], idB)
+                        : world.restitutionCallback
+                          ? world.restitutionCallback(values[o], idA, values[o + 1], idB)
+                          : k.materialMixDefault(1, values[o], values[o + 1]);
+            }
+        } catch (error) {
+            runtime.queryFailed = true;
+            runtime.queryError = error;
+        } finally {
+            --runtime.callbackDepth;
+            runtime.stepCallback = false;
+            runtime.queryWorld = previous;
+        }
+    };
+}
+
+function queryImport(runtime: KernelState): QueryCallback {
+    return (kind, shape, data, count) => {
+        if (runtime.queryFailed) {
+            if (kind === 1) queryReturnView(runtime)[0] = 0;
+            return 0;
+        }
+        ++runtime.callbackDepth;
+        try {
+            if (runtime.queryCallback === null)
+                throw new Error("physics: query callback is not installed");
+            const value = runtime.queryCallback(kind, shape, data, count);
+            if (kind !== 1) return value;
+            if (runtime.queryReturnWritten) {
+                runtime.queryReturnWritten = false;
+                return 1;
+            }
+            queryReturnView(runtime)[0] = value;
+            return 1;
+        } catch (error) {
+            // Exceptions must not abandon Rust frames and leak the WASM shadow stack.
+            if (kind === 1) queryReturnView(runtime)[0] = 0;
+            runtime.queryFailed = true;
+            runtime.queryError = error;
+            return 0;
+        } finally {
+            --runtime.callbackDepth;
+        }
+    };
+}
+
+function decode(base64: string): Uint8Array<ArrayBuffer> {
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; ++i) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+}
+
+/** The one-time log a browser gets when it blocks multithreading for want of cross-origin isolation.
+ * The fix is the host's headers, not the caller's code. */
+export const COOP_COEP_HINT =
+    "physics: running single-threaded. Multithreading needs a cross-origin-isolated page — serve it with COOP and COEP headers (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp).";
+
+/** The resolved threading plan: `want` threads to attempt (counting the caller; 0 is single-thread), and
+ * whether a browser blocked multithreading (the one case {@link announce} logs). */
+export type Threading = { want: number; warn: boolean };
+
+/** The host signals {@link resolve} branches on. `shared` — can this host hold a shared
+ * `WebAssembly.Memory`: cross-origin isolation in a browser, `SharedArrayBuffer` existing standalone.
+ * `browser` picks whether a blocked host earns the COOP/COEP hint (headers only fix a page).
+ * `cores` is the host's logical core count, or 0 when unavailable. */
+export type Host = { browser: boolean; shared: boolean; cores: number };
+
+/**
+ * An explicit zero requests single-threading without a warning. Otherwise shared-memory hosts
+ * use the requested count; the automatic count is half the logical cores, clamped to 1–8. Non-shared hosts use
+ * single-threading; only a browser gets the header warning. The pool applies the link-time ceiling.
+ */
+export function resolve(threads: number | undefined, host: Host): Threading {
+    if (threads === 0) return { want: 0, warn: false };
+    // Box3D samples/main.cpp:116 counts the calling thread in half the logical cores, capped at 8.
+    const want = threads ?? Math.max(1, Math.min(8, Math.floor(host.cores / 2)));
+    if (host.shared) return { want, warn: false };
+    return { want: 0, warn: host.browser };
+}
+
+/** Logs the COOP/COEP hint when the plan requests it; the caller owns one-time emission. */
+export function announce(plan: Threading): void {
+    if (plan.warn) console.log(COOP_COEP_HINT);
+}
+
+/** Standalone detection uses `process.versions.node` (Node, Bun, Deno 2's Node compatibility),
+ * matching pool.ts's worker-spawn branch so resolution and spawning agree on the host. */
+function host(): Host {
+    const cores = globalThis.navigator?.hardwareConcurrency ?? 0;
+    const p = (globalThis as { process?: { versions?: { node?: unknown } } }).process;
+    if (p?.versions?.node != null) {
+        return { browser: false, shared: typeof SharedArrayBuffer !== "undefined", cores };
+    }
+    const g = globalThis as { crossOriginIsolated?: boolean };
+    return { browser: true, shared: g.crossOriginIsolated === true, cores };
+}
+
+/** The host functions every kernel instance imports, reading `memory` lazily. */
+export class KernelAllocationError extends Error {}
+
+function kernelImports(runtime: KernelState, memory: () => WebAssembly.Memory) {
+    return {
+        solverPause,
+        queryCallback: queryImport(runtime),
+        materialCallback: materialImport(runtime),
+        collisionCallback: collisionImport(runtime),
+        now: clockImport(memory),
+        kernelPanic: panicImport(memory),
+        allocationFailed: () => {
+            throw new KernelAllocationError(
+                `physics: shared kernel allocation failed at the ${runtime.maximumMemory} byte ceiling; increase PhysicsWorldDefinition.maximumMemory (up to 4294967296 bytes).`,
+            );
+        },
+    };
+}
+
+async function single(runtime: KernelState): Promise<void> {
+    const result = await WebAssembly.instantiate(decode(KERNEL_WASM_BASE64), {
+        env: kernelImports(runtime, () => instance.memory),
+    });
+    const instance = result.instance.exports as unknown as Kernel;
+    instance.installPanicHook?.();
+    runtime.instance ??= instance;
+}
+
+async function multi(runtime: KernelState, want: number): Promise<void> {
+    const { KERNEL_SHARED_WASM_BASE64, SHARED_INITIAL_PAGES, SHARED_STACK_SIZE } = await import(
+        "./kernel.shared.wasm"
+    );
+
+    // The module declares its own memory floor (data + shadow stack), so `initial` may not go below it;
+    // `maximum` is the link-time ceiling and a JS memory may only lower it.
+    const memory = new WebAssembly.Memory({
+        initial: SHARED_INITIAL_PAGES,
+        maximum: runtime.maximumMemory / 65536,
+        shared: true,
+    });
+    const module = await WebAssembly.compile(decode(KERNEL_SHARED_WASM_BASE64));
+    const exports = (
+        await WebAssembly.instantiate(module, {
+            env: { ...kernelImports(runtime, () => memory), memory },
+        })
+    ).exports as unknown as Kernel & {
+        // biome-ignore lint/style/useNamingConvention: LLD's global, exported under its own name.
+        __stack_pointer: WebAssembly.Global;
+    };
+    // A lazy `kernel(world)` can have run during those awaits; it wins rather than swapping memory out from
+    // under views already held by this world's solver.
+    if (runtime.instance) return;
+    exports.installPanicHook?.();
+
+    const count = Math.min(want, 1 + maxWorkers(SHARED_STACK_SIZE)) - 1;
+    // Instantiating ran the start function to completion on THIS thread, which is the ordering the pool
+    // depends on: it CAS-guards data init, and a thread that loses that CAS blocks on
+    // `memory.atomic.wait32` — which traps on a browser main thread. Workers may only spawn after it, and
+    // they take the main instance's exports as their argument, so they cannot spawn before it exists.
+    const spawned =
+        count > 0
+            ? await createPool(
+                  module,
+                  memory,
+                  count,
+                  (exports.__stack_pointer.value as number) >>> 0,
+                  SHARED_STACK_SIZE,
+                  exports,
+                  false,
+                  runtime.maximumMemory,
+              )
+            : null;
+
+    runtime.instance = { ...exports, memory } as Kernel;
+    runtime.sharedMemory = memory;
+    runtime.pool = spawned;
+    runtime.resolved = count + 1;
+}
+
+async function boot(runtime: KernelState, threads: number | undefined): Promise<void> {
+    if (runtime.instance) return;
+    const plan = resolve(threads, host());
+    announce(plan);
+    if (plan.want >= 1) {
+        const { SHARED_INITIAL_PAGES } = await import("./kernel.shared.wasm");
+        if (runtime.maximumMemory < SHARED_INITIAL_PAGES * 65536) {
+            throw new Error(
+                `PhysicsWorldDefinition.maximumMemory must be at least ${SHARED_INITIAL_PAGES * 65536} bytes.`,
+            );
+        }
+        try {
+            await multi(runtime, plan.want);
+            return;
+        } catch (e) {
+            // Worker startup can fail despite shared-memory support; log the fallback's performance cost.
+            console.log(
+                `physics: running single-threaded. The host blocked the worker pool: ${e instanceof Error ? e.message : String(e)}`,
+            );
+            await runtime.pool?.terminate();
+            runtime.pool = null;
+            runtime.sharedMemory = null;
+            runtime.instance = null;
+            runtime.resolved = 1;
+        }
+    }
+    await single(runtime);
+}
+
+/**
+ * Instantiate the given World's physics kernel, or the standalone kernel for explicit `undefined`.
+ * idempotent — subsequent calls resolve immediately, and the first call decides threading. await once before the first `step()`. required in a browser, where the main thread
+ * refuses to compile a wasm module this size synchronously; outside a browser (bun/node/deno) `step()`
+ * also instantiates lazily, so the await is optional there — but a lazy instance is single-threaded, so
+ * `init(world)` before you touch a `World` if you want threads.
+ *
+ * threading resolves itself: standalone and a cross-origin-isolated browser multithread; a browser without
+ * that isolation logs the missing COOP/COEP headers once and runs single-thread. Pass
+ * {@link InitOptions.threads} only to force single-thread (`0`) or override the count. the worker pool
+ * never holds the process open — a standalone script exits when its own work is done, no `shutdown(world)`
+ * needed.
+ */
+export function init(world: World | undefined, options?: InitOptions): Promise<void> {
+    const runtime = kernelState(world);
+    if (!runtime.booting) {
+        const maximum = options?.maximumMemory ?? 1073741824;
+        if (!Number.isInteger(maximum / 65536) || maximum < 65536 || maximum > 4294967296) {
+            throw new Error(
+                "PhysicsWorldDefinition.maximumMemory must be a multiple of 65536 bytes, at most 4294967296 bytes (4 GiB).",
+            );
+        }
+        runtime.maximumMemory = maximum;
+    }
+    runtime.booting ??= boot(runtime, normalizeThreads(options?.threads));
+    return runtime.booting;
+}
+
+/** Normalize the caller's `threads`: absent stays absent (auto-resolve), a non-finite value becomes 0
+ * (single-thread), everything else floors to a non-negative integer. */
+function normalizeThreads(v: number | undefined): number | undefined {
+    if (v === undefined) return undefined;
+    if (!Number.isFinite(v)) return 0;
+    return Math.max(0, Math.floor(v));
+}
+
+/** The initialized WASM artifact, including any startup fallback. */
+export function artifact(world: World | undefined): "shared" | "single" {
+    kernel(world);
+    return kernelState(world).sharedMemory === null ? "single" : "shared";
+}
+
+/** threads the kernel resolved to — 1 when it is running single-threaded. */
+export function threads(world: World | undefined): number {
+    return kernelState(world).resolved;
+}
+
+/** Releases the worker pool deterministically; the kernel keeps stepping single-threaded. */
+export async function shutdown(world: World | undefined): Promise<void> {
+    const runtime = kernelState(world);
+    await runtime.pool?.terminate();
+    runtime.pool = null;
+    runtime.resolved = 1;
+}
+
+/**
+ * The kernel instance. Lazily instantiates synchronously if `init(world)` hasn't run — fine in bun/node/
+ * deno; a browser main thread throws on a synchronous compile this large, so browser callers must
+ * `await init(world)` first.
+ */
+export function kernel(world: World | undefined): Kernel {
+    const runtime = kernelState(world);
+    assertEntry(runtime);
+    if (runtime.dead) {
+        throw new Error(
+            "physics kernel is dead: a worker trapped mid-step, so the shared columns hold a partial one",
+        );
+    }
+    if (!runtime.instance) {
+        if (runtime.booting) throw new Error("await init() before stepping");
+        const mod = new WebAssembly.Module(decode(KERNEL_WASM_BASE64));
+        const instance = new WebAssembly.Instance(mod, {
+            env: kernelImports(runtime, () => instance.memory),
+        }).exports as unknown as Kernel;
+        instance.installPanicHook?.();
+        runtime.instance = instance;
+    }
+    return runtime.instance;
+}
+
+/** The worker pool the solve may run on, or null when the kernel is single-threaded — or when a worker
+ * has faulted, which poisons the kernel. */
+export function workers(world: World | undefined): Pool | null {
+    const pool = kernelState(world).pool;
+    return pool?.alive ? pool : null;
+}
+
+/** A worker trap leaves partially written simulation state: poison rather than retry the step. */
+export function advanceStep(world: World | undefined): number {
+    const runtime = kernelState(world);
+    const k = kernel(world);
+    if (runtime.pool === null) return k.stepAdvance();
+    try {
+        const result = k.stepAdvance();
+        runtime.pool?.checkFault();
+        return result;
+    } catch (e) {
+        runtime.dead = true;
+        void runtime.pool?.terminate();
+        throw e;
+    }
+}

@@ -1,0 +1,1539 @@
+import type { TgpuBindGroupLayout, TgpuBuffer, TgpuRenderPipeline } from "typegpu";
+import { isBuffer, isUsableAsStorage, isUsableAsUniform } from "typegpu";
+import type { AnyData } from "typegpu/data";
+import * as d from "typegpu/data";
+import {
+    type MeshBinding,
+    Meshes,
+    type MeshHandle,
+    type MeshIndex,
+    MeshInstance,
+    MeshPlugin,
+    meshResourcesKey,
+} from "../../core/mesh";
+import type { View } from "../../core/rendering";
+import {
+    BeginFrameSystem,
+    Camera,
+    CorePipelinePlugin,
+    CULL_FRUSTUM,
+    CULL_VOLUME_FLOATS,
+    DepthPrepassRequests,
+    globalTransformTable,
+    imageSampler,
+    imageTexture,
+    initialStackedViews,
+    MainPassSystem,
+    NormalPrepassRequests,
+    PrepareViewsSystem,
+    PrepassSystem,
+    RenderContext,
+    RenderPhases,
+    readRenderGlobalTransform,
+    renderLayers,
+    type TransparentPhase,
+    Views,
+} from "../../core/rendering";
+import { GlobalTransform } from "../../core/transform";
+import type { Plugin, System, World } from "../../engine";
+import { component, u32 } from "../../engine";
+import { withPipelineOwner } from "../../engine/runtime";
+import {
+    cascadeRegather,
+    disposeShadowAtlas,
+    ensureCascadeAtlas,
+    ensurePointAtlas,
+    initializeShadowAtlasState,
+    pointRegather,
+    renderCascades,
+    renderPointShadows,
+    resetShadowAtlas,
+    setPointFrames,
+    setShadowView,
+    shadowGroup,
+    shadowLayout,
+    shadowReady,
+} from "./atlas";
+import { boundPipeline } from "./bound";
+import type { BundleDraw, PassBundle } from "./bundle";
+import { bundleChanged, bundleDraw, newPassBundle, recordBundle, replayBundle } from "./bundle";
+import {
+    CullLightsSystem,
+    initializeClusterState,
+    PackSpotAttenuationSystem,
+    UpdateLightClustersSystem,
+    warmClusters,
+    warmLightCull,
+} from "./cluster";
+import { type Background, Backgrounds, initializeBackgroundState } from "./contract";
+import { engineLayout } from "./engine";
+import { fogSource, sealFogSource } from "./fog";
+import { initializeIndirectLightSources, sealIndirectLightSources } from "./indirect";
+import { instanceDataTable } from "./instance-data";
+import {
+    initializeLightingState,
+    LIGHTING_UNIFORM_SIZE,
+    Lighting,
+    writeLighting,
+} from "./lighting";
+import { MaterialBatches, materialBatch } from "./material-batch";
+import { MeshMaterial } from "./material-data";
+import {
+    AlphaModeCode,
+    AlphaPipelineKey,
+    alphaPipelineKey,
+    CullModeCode,
+    EnrollTransparentTransformHistorySystem,
+    type MaterialType,
+    MaterialTypes,
+    materialSource,
+    observeTransparentHistoryAlpha,
+    PrepareTransparentTransformHistorySystem,
+    pipelineKey,
+    recoverTransparentTransformHistory,
+    registerMaterialType,
+    rethrowMaterialError,
+    TransparentMeshes,
+} from "./material-type";
+import { materialAttributeError } from "./mesh-attributes";
+import { publishTransparentCounts } from "./mesh-count";
+import {
+    type BindResource,
+    bgQuant,
+    type CompiledBackground,
+    type CompiledMaterial,
+    clearGroups,
+    compileBackground,
+    compileMaterial,
+    engineCache,
+    engineGroup,
+    ensureNormalPrepass,
+    ensureSingle,
+    ensureStacked,
+    getBackground,
+    getCompiledMaterial,
+    getGroup,
+    initializePipelineState,
+    type MaterialGroupEntry,
+    meshStreamMask,
+    prepareMaterialTypes,
+    resetPipelineCaches,
+    setGroup,
+} from "./pipelines";
+import {
+    disposePrepassTextures,
+    prepassTextures,
+    ResolvePrepassTexturesSystem,
+    warmPrepassTextures,
+} from "./prepass-textures";
+import {
+    isMeshInstanceDraw,
+    MeshDrawBuffers,
+    MeshPreprocessSystem,
+    meshInstanceTable,
+    meshKeyCount,
+} from "./preprocess";
+import { producerCapacity } from "./producer-pack";
+import { producerTables } from "./producer-table";
+import { initializeRegatherState, prepareRegather } from "./regather";
+import { type Draw, DrawIndexedIndirect, Draws, initializeDrawState } from "./registry";
+import {
+    cascadeCount,
+    destroyCascades,
+    destroyPointShadows,
+    MAX_CASCADES,
+    type PointShadowFrame,
+    pointCasters,
+    resetCascades,
+    resetPointShadows,
+    ShadowCamera,
+    updateCascades,
+    updatePointShadows,
+} from "./shadows";
+import { Materials, VertexMaterialType } from "./standard-material";
+
+interface StandardRendererState {
+    warned: Set<string>;
+    frameDraws: FrameDraw[];
+    frameCount: number;
+    warm: boolean;
+    depthReadLayers: number;
+    normalReadLayers: number;
+    frameDrawPairs: (FrameDraw | null)[];
+    framePairCount: number;
+    resolveCapacity: number;
+    resolveMeshCount: number;
+    resolveDrawCallback: ((draw: Draw) => void) | undefined;
+    materialBounds: Float32Array;
+    transparentEidsStage: ArrayBuffer;
+    transparentEidsU32: Uint32Array;
+    transparentArgsStage: ArrayBuffer;
+    transparentArgsU32: Uint32Array;
+    transparentRunStarts: number[];
+    transparentRunOffsets: number[];
+    transparentRunRecords: number[];
+    transparentCountOffsets: number[];
+    transparentRunDraws: (FrameDraw | undefined)[];
+    transparentRunCount: number;
+    transparentRunCursor: number;
+    lastTransparentPipeline: TgpuRenderPipeline<any> | null;
+    lastTransparentGroup0: GPUBindGroup | null;
+    lastTransparentGroup1: GPUBindGroup | null;
+    lastTransparentGroup2: GPUBindGroup | null;
+    colorBundles: Map<number, PassBundle>;
+    colorProgram: BundleDraw[];
+    prepassBundles: Map<number, PassBundle>;
+    prepassProgram: BundleDraw[];
+    pointFrames: PointShadowFrame[];
+}
+
+const standardRendererStateKey = {
+    create(world: World): StandardRendererState {
+        const state = createStandardRendererState();
+        state.resolveDrawCallback = (draw) =>
+            resolveDraw(world, draw, state.resolveCapacity, state.resolveMeshCount);
+        return state;
+    },
+};
+
+function createStandardRendererState(): StandardRendererState {
+    return {
+        warned: new Set(),
+        frameDraws: [],
+        frameCount: 0,
+        warm: false,
+        depthReadLayers: 0,
+        normalReadLayers: 0,
+        frameDrawPairs: [],
+        framePairCount: 0,
+        resolveCapacity: 0,
+        resolveMeshCount: 0,
+        resolveDrawCallback: undefined,
+        materialBounds: new Float32Array(4),
+        transparentEidsStage: new ArrayBuffer(0),
+        transparentEidsU32: new Uint32Array(0),
+        transparentArgsStage: new ArrayBuffer(0),
+        transparentArgsU32: new Uint32Array(0),
+        transparentRunStarts: [],
+        transparentRunOffsets: [],
+        transparentRunRecords: [],
+        transparentCountOffsets: [],
+        transparentRunDraws: [],
+        transparentRunCount: 0,
+        transparentRunCursor: 0,
+        lastTransparentPipeline: null,
+        lastTransparentGroup0: null,
+        lastTransparentGroup1: null,
+        lastTransparentGroup2: null,
+        colorBundles: new Map(),
+        colorProgram: [],
+        prepassBundles: new Map(),
+        prepassProgram: [],
+        pointFrames: [],
+    };
+}
+
+/**
+ * marker selecting StandardRenderer as the active renderer on a Camera entity. A camera carrying it renders through
+ * standard's opaque and transparent records, plus core's opt-in depth prepass.
+ */
+export const StandardRenderer = component("StandardRenderer", {});
+
+/**
+ * select a StandardRenderer camera's backdrop: the {@link Backgrounds} recipe drawn behind the scene as a fullscreen
+ * view-ray → color fill on the un-rendered pixels. Without it the camera shows the flat `Camera.clearColor`
+ * (the opt-in fallback). The recipe is registered in code with `registerBackground`; this picks one per
+ * camera by its World-local handle.
+ */
+export const CameraBackground = component("CameraBackground", {
+    /** The handle returned by registerBackground in this World. */
+    background: u32,
+});
+
+// A draw resolving to null is a silent skip — usually a typo'd binding or an
+// unpublished resource. Warn once per material/mesh pair so alpha variants do not repeat it.
+
+function warnSkip(world: World, draw: string, cause: string): null {
+    const _standardRendererState = world.resource(standardRendererStateKey);
+
+    if (!_standardRendererState.warned.has(draw)) {
+        _standardRendererState.warned.add(draw);
+        console.warn(`standard: draw "${draw}" skipped — ${cause}`);
+    }
+    return null;
+}
+
+type BufferEntry = {
+    storage?: (count: number) => d.WgslArray<d.AnyWgslData>;
+    uniform?: d.AnyData;
+};
+
+/**
+ * Validate a typed mesh override against the generated TypeGPU layout entry before the deliberately
+ * loose createBindGroup boundary. Raw GPUBuffer remains the explicit unchecked WebGPU escape.
+ * @internal
+ */
+export function validateMeshBindingOverrides(
+    layout: { entries: Record<string, object> },
+    overrides?: Record<string, unknown>,
+): void {
+    if (!overrides) return;
+    for (const [name, rawEntry] of Object.entries(layout.entries)) {
+        if (!rawEntry) continue;
+        const resource = overrides[name];
+        if (!resource || !isBuffer(resource)) continue;
+        const entry = rawEntry as BufferEntry;
+        if (entry.storage) {
+            if (!isUsableAsStorage(resource)) {
+                throw new Error(`mesh binding "${name}" is missing storage usage`);
+            }
+            const expected = entry.storage(1);
+            if (
+                !d.isWgslArray(resource.dataType) ||
+                !d.deepEqual(
+                    resource.dataType.elementType as AnyData,
+                    expected.elementType as AnyData,
+                )
+            ) {
+                throw new Error(`mesh binding "${name}" has the wrong storage schema`);
+            }
+        } else if (entry.uniform) {
+            if (!isUsableAsUniform(resource)) {
+                throw new Error(`mesh binding "${name}" is missing uniform usage`);
+            }
+            if (!d.deepEqual(resource.dataType as AnyData, entry.uniform)) {
+                throw new Error(`mesh binding "${name}" has the wrong uniform schema`);
+            }
+        } else {
+            throw new Error(`mesh binding "${name}" is not a buffer entry`);
+        }
+    }
+}
+
+// a draw resolved through its material type: the compiled pipeline set + the
+// per-draw group-2 state (engine group 0 resolves per slot at draw time via `engineGroup`;
+// group 1 is the pass's — `shadowGroup` for color, the atlas layouts' own for point/cascade)
+type RecordedMaterial = { t: CompiledMaterial; g: MaterialGroupEntry; index: MeshIndex };
+
+export type Recorded = RecordedMaterial;
+
+// one resolved draw of the frame: the entry-owned record `record` rewrites in place
+type FrameDraw = { draw: Draw; r: Recorded };
+
+/**
+ * Resolves a draw's pipelines and cached bind groups, or returns null to skip it. A pending staged
+ * mesh skips silently until its streams are ready. Unregistered material types, missing meshes or
+ * required streams/attributes, mismatched attribute schemas, unpublished bindings and failed on-demand
+ * compiles warn once per warning key. Binding-override validation errors still throw.
+ * Missing/stale compiled pipelines are compiled synchronously, not silently skipped.
+ */
+function record(world: World, draw: Draw, capacity: number): FrameDraw | null {
+    const typeId = draw.material.type;
+    const type = world.resource(MaterialTypes).types[typeId!];
+    if (!type) return warnSkip(world, draw.name, `material type ${typeId} is not registered`);
+    return recordMaterial(world, draw, type, capacity);
+}
+
+// Resolve a live resource, or return undefined when it is missing.
+function materialResource(
+    world: World,
+    name: string,
+    type?: MaterialType<any, any, any>,
+    bindings = type?.bindings?.(world),
+    row = 0,
+    typeId?: number,
+): BindResource | undefined {
+    if (type) {
+        const entry = world.resource(MaterialBatches).entries[typeId!];
+        const fields = entry?.fields;
+        for (let i = 0; fields && i < fields.length; i++) {
+            const field = fields[i];
+            if (name !== field.name && name !== field.sampler) continue;
+            const id = entry!.ids[row * fields.length + i]!;
+            return name === field.name
+                ? imageTexture(world, id, field)
+                : imageSampler(world, id, field);
+        }
+    }
+    switch (name) {
+        case "eids":
+            return world.resource(MeshDrawBuffers).packedEids ?? undefined;
+        case "globalTransforms":
+            return globalTransformTable(world).typed;
+        case "meshInstances":
+            // Entity layers occupy producer-row padding; material fields retain the producer layout.
+            return meshInstanceTable(world).buffer;
+        case "instanceData":
+            return instanceDataTable(world, meshInstanceTable(world)).buffer;
+        case "materialParameters":
+            return type ? materialSource(world, type).table.typed : undefined;
+        default:
+            return bindings?.[name];
+    }
+}
+
+function layoutResources(
+    world: World,
+    entries: Record<string, object>,
+    override?: Record<string, BindResource>,
+    materialType?: MaterialType<any, any, any>,
+    owned = false,
+    row = 0,
+    typeId?: number,
+):
+    | {
+          values: Record<string, unknown>;
+          resources: BindResource[];
+          names: string[];
+      }
+    | string {
+    const values: Record<string, unknown> = {};
+    const resources: BindResource[] = [];
+    const names: string[] = [];
+    const bindings = materialType?.bindings?.(world);
+    for (const [name, entry] of Object.entries(entries)) {
+        if (!entry || name === "vertices") continue;
+        const res =
+            override?.[name] ??
+            (owned
+                ? undefined
+                : materialResource(world, name, materialType, bindings, row, typeId));
+        if (!res) return name;
+        if (isBuffer(res)) validateMeshBindingOverrides({ entries }, { [name]: res });
+        resources.push(res);
+        names.push(name);
+        // a texture binds a view of the schema's own dimension; a storage texture binds mip 0
+        const schema =
+            "texture" in entry
+                ? entry.texture
+                : "storageTexture" in entry
+                  ? entry.storageTexture
+                  : undefined;
+        values[name] = schema
+            ? (res as GPUTexture).createView({
+                  dimension: (schema as { dimension: GPUTextureViewDimension }).dimension,
+                  ...("storageTexture" in entry && { mipLevelCount: 1 }),
+              })
+            : res;
+    }
+    return { values, resources, names };
+}
+
+// Compare resource identities in place so an unchanged frame needs no new list or binding revalidation.
+function sameResources(
+    world: World,
+    g: MaterialGroupEntry,
+    mesh: NonNullable<ReturnType<ReturnType<typeof Meshes.create>["get"]>>,
+    pointList: GPUBuffer | null,
+    cascadeList: GPUBuffer | null,
+    row: number,
+    typeId: number,
+): boolean {
+    const res = g.resources;
+    if (
+        res[0] !== mesh.vertices ||
+        res[1] !== mesh.position ||
+        res[2] !== mesh.quant ||
+        res[3] !== mesh.indices
+    )
+        return false;
+    const override = mesh.bindings as Record<string, BindResource> | undefined;
+    const bindings = g.owner.bindings?.(world);
+    const producer = g.producer;
+    let k = 4;
+    for (let i = 0; i < g.names.length; i++, k++) {
+        const name = g.names[i];
+        const live =
+            producer && name === "globalTransforms"
+                ? producer.placements
+                : producer && name === "meshInstances"
+                  ? producer.meshInstances
+                  : name in g.owner.layout.attributes
+                    ? mesh.attributes?.[name]
+                    : name === "materialParameters"
+                      ? materialSource(world, g.owner).table.typed
+                      : (override?.[name] ??
+                        materialResource(world, name, g.owner, bindings, row, typeId));
+        if (live !== res[k]) return false;
+    }
+    if (pointList && res[k++] !== pointList) return false;
+    if (cascadeList && res[k++] !== cascadeList) return false;
+    return k === res.length;
+}
+
+// one material bind group against `layout`: the resolved layout values, any override, and the vertex stream.
+// The two layout objects share one loose signature here — the color/depth `vertices` element split is real at
+// authoring time, but a bind group takes raw buffers either way (the `layout.$` cast class). A module function,
+// so the steady `recordMaterial` path captures nothing and opens no context
+function surfaceGroup(
+    world: World,
+    values: Record<string, unknown>,
+    layout: unknown,
+    vertices: TgpuBuffer<AnyData>,
+    override?: Record<string, BindResource>,
+): GPUBindGroup {
+    const root = world.gpu.root;
+    return root.unwrap(
+        root.createBindGroup(
+            layout as TgpuBindGroupLayout,
+            {
+                ...values,
+                ...override,
+                vertices,
+            } as never,
+        ),
+    );
+}
+
+// Built only on a skip: a steady frame must not allocate the name.
+function materialWarning(
+    surface: MaterialType<any, any, any>,
+    draw: Draw,
+    meshName?: string,
+): string {
+    return `mesh:material:${surface.name}:${meshName ?? draw.mesh}:${draw.mesh}`;
+}
+
+/**
+ * Resolves compiled pipelines and caches group-2 state by draw name. Reuses the groups while the
+ * material type, layout and bound resource identities are unchanged.
+ * Group 0 is cached per view slot and shared by draws using the same quant buffer; atlas passes
+ * bind the camera the shadows are fit to for every tile, not the light's view.
+ */
+function recordMaterial(
+    world: World,
+    draw: Draw,
+    surface: MaterialType<any, any, any>,
+    capacity: number,
+): FrameDraw | null {
+    const mesh = world.resource(Meshes).get(draw.mesh);
+    if (!mesh)
+        return warnSkip(
+            world,
+            materialWarning(surface, draw),
+            `mesh handle ${draw.mesh} not registered`,
+        );
+    if (!mesh.position || !mesh.quant) {
+        // Meshes.add staged it after this frame's pack; it draws from the next frame
+        if (mesh.pending) return null;
+        return warnSkip(
+            world,
+            materialWarning(surface, draw, mesh.name),
+            `mesh "${mesh.name}" has no quantized position/quant stream`,
+        );
+    }
+    const prev = getGroup(world, draw.name, surface);
+    const cullMode = draw.cullMode ?? CullModeCode.Back;
+    const mask = meshStreamMask(surface, mesh);
+    let t = prev?.item.r.t;
+    if (t?.args.mask !== mask) t = undefined;
+    t ??= getCompiledMaterial(world, surface.name, draw.alphaPipelineKey, cullMode, mask);
+    if (!t || t.owner !== surface || t.layout !== surface.layout) {
+        // registered after warm (`preparePipelines` compiles the rest) — sync, so no skip frame; a
+        // throwing compile (a contract guard, or shader/device validation) must not take down the frame
+        // loop, so it degrades to the warn-once skip
+        try {
+            t = compileMaterial(world, surface, capacity, draw.alphaPipelineKey, cullMode, mask);
+        } catch (e) {
+            return warnSkip(
+                world,
+                materialWarning(surface, draw, mesh.name),
+                `material type "${surface.name}" failed to compile: ${e}`,
+            );
+        }
+    }
+
+    const pointList = world.resource(pointRegather).eids();
+    const cascadeList = world.resource(cascadeRegather).eids();
+    // a steady frame compares the cached entry's identities in place; only a changed resource re-resolves,
+    // re-validates the overrides and rebuilds the groups
+    if (
+        prev &&
+        sameResources(
+            world,
+            prev,
+            mesh,
+            pointList,
+            cascadeList,
+            draw.material.material,
+            draw.material.type,
+        )
+    ) {
+        prev.item.draw = draw;
+        prev.item.r.t = t;
+        return prev.item;
+    }
+
+    const attributeError = materialAttributeError(mesh, surface);
+    if (attributeError)
+        return warnSkip(world, materialWarning(surface, draw, mesh.name), attributeError);
+    const overrides = { ...mesh.bindings } as Record<string, MeshBinding>;
+    const producer = world.resource(producerTables).draws.get(draw.name) ?? null;
+    if (producer) {
+        overrides.globalTransforms = producer.placements;
+        overrides.meshInstances = producer.meshInstances;
+    }
+    for (const name of Object.keys(surface.layout.attributes))
+        overrides[name] = mesh.attributes![name];
+    const resolved = layoutResources(
+        world,
+        surface.layout.entries as Record<string, object>,
+        overrides,
+        surface,
+        false,
+        draw.material.material,
+        draw.material.type,
+    );
+    if (typeof resolved === "string")
+        return warnSkip(
+            world,
+            materialWarning(surface, draw, mesh.name),
+            `binding "${resolved}" not published`,
+        );
+    // geometry + the atlas packed lists join the identity check (a re-gather realloc also clears the
+    // whole cache via `clearGroups` — the lists here make the entry self-consistent even without it)
+    const resources: BindResource[] = [
+        mesh.vertices,
+        mesh.position,
+        mesh.quant,
+        mesh.indices,
+        ...resolved.resources,
+    ];
+    if (pointList) resources.push(pointList);
+    if (cascadeList) resources.push(cascadeList);
+
+    const root = world.gpu.root;
+    const quant = root.unwrap(mesh.quant);
+    const clip =
+        draw.alphaPipelineKey === AlphaPipelineKey.Mask ||
+        draw.alphaPipelineKey === AlphaPipelineKey.AlphaToCoverage;
+    const transparent =
+        draw.alphaPipelineKey === AlphaPipelineKey.Blend ||
+        draw.alphaPipelineKey === AlphaPipelineKey.Premultiplied ||
+        draw.alphaPipelineKey === AlphaPipelineKey.Multiply;
+    // A vertex function reads the mesh normal and uv, which only the main stream carries.
+    const mainDepth = clip || !!surface.vertex;
+    const depthLayout = mainDepth ? surface.layout : surface.layout.depthVariant;
+    const depthVertices = mainDepth ? mesh.vertices : mesh.position;
+    const entry: MaterialGroupEntry = {
+        owner: surface,
+        producer,
+        layout: surface.layout,
+        quant,
+        color: surfaceGroup(world, resolved.values, surface.layout, mesh.vertices),
+        transparentColor: null,
+        transparentEids: null,
+        values: resolved.values,
+        // Blended modes compile no depth-side pipelines, so they need no depth-shape groups
+        depth: transparent
+            ? null
+            : surfaceGroup(world, resolved.values, depthLayout, depthVertices),
+        point:
+            t.point && pointList
+                ? surfaceGroup(world, resolved.values, depthLayout, depthVertices, {
+                      eids: pointList,
+                  })
+                : null,
+        cascade:
+            t.cascade && cascadeList
+                ? surfaceGroup(world, resolved.values, depthLayout, depthVertices, {
+                      eids: cascadeList,
+                  })
+                : null,
+        eids: resolved.values.eids
+            ? root.unwrap(resolved.values.eids as TgpuBuffer<AnyData>)
+            : null,
+        engineCache: engineCache(world, quant),
+        resources,
+        names: resolved.names,
+        bound: new Map(),
+        item: null!,
+    };
+    entry.item = { draw, r: { t, g: entry, index: mesh.indices } };
+    setGroup(world, draw.name, entry);
+    return entry.item;
+}
+
+// Resolve camera-independent resources once so prepass, atlas and color passes reuse the same draw list.
+function resolveDraws(world: World, capacity: number): void {
+    const state = world.resource(standardRendererStateKey);
+    const meshCount = world.resource(meshResourcesKey).meshes.capacity;
+    const keyCount = meshKeyCount(world);
+    const pairCount = world.resource(MaterialBatches).types.length * keyCount * meshCount;
+    state.frameCount = 0;
+    state.depthReadLayers = 0;
+    state.normalReadLayers = 0;
+    // null, not undefined: V8 can hold undefined in a double array, so each refill would reallocate it twice
+    state.frameDrawPairs.fill(null, 0, state.framePairCount);
+    state.framePairCount = pairCount;
+    while (state.frameDrawPairs.length < pairCount) state.frameDrawPairs.push(null);
+    state.resolveCapacity = capacity;
+    state.resolveMeshCount = meshCount;
+    world.resource(Draws).forEach(state.resolveDrawCallback!);
+    const types = world.resource(MaterialTypes).types;
+    let declared = false;
+    for (let i = 0; i < types.length; i++)
+        if (types[i]?.readsPrepass) {
+            declared = true;
+            break;
+        }
+    if (!declared) return;
+    const materials = world.storage(MeshMaterial);
+    const instances = world.storage(MeshInstance);
+    const meshes = world.resource(meshResourcesKey).meshes;
+    for (const eid of world.query(PREPASS_READERS)) {
+        const type = materials.type.get(eid);
+        const reads = types[type]?.readsPrepass;
+        if (!reads) continue;
+        const index = meshes.index(instances.mesh.get(eid));
+        if (index === undefined) continue;
+        const source = world.resource(MaterialTypes).sources[type];
+        const row = materials.material.get(eid);
+        const alpha = source?.alphaMode(row) ?? materials.alphaMode.get(eid);
+        const cull = source ? (source.cullMode?.(row) ?? 0) : materials.cullMode.get(eid);
+        const batch = materialBatch(world, type, row);
+        const pair =
+            (batch * keyCount + pipelineKey(alphaPipelineKey(alpha), cull)) * meshCount + index;
+        if (!state.frameDrawPairs[pair]) continue;
+        const layers = renderLayers(world, eid);
+        if (reads.depth) state.depthReadLayers |= layers;
+        if (reads.normal) state.normalReadLayers |= layers;
+    }
+}
+
+function resolveDraw(world: World, draw: Draw, capacity: number, meshCount: number): void {
+    const state = world.resource(standardRendererStateKey);
+    const item = record(world, draw, capacity);
+    if (!item) return;
+    state.frameDraws[state.frameCount++] = item;
+    const reads = item.r.t.owner.readsPrepass;
+    if (reads && !isMeshInstanceDraw(world, draw)) {
+        // Public indirect draws have no CPU visibility/layer contract. GPU-only producers use layer 0.
+        const layers = item.r.g.producer ? 1 : -1;
+        if (reads.depth) state.depthReadLayers |= layers;
+        if (reads.normal) state.normalReadLayers |= layers;
+    }
+    const pair =
+        (materialBatch(world, draw.material.type, draw.material.material) * meshKeyCount(world) +
+            pipelineKey(draw.alphaPipelineKey, draw.cullMode ?? CullModeCode.Back)) *
+            meshCount +
+        world.resource(meshResourcesKey).meshes.index(draw.mesh)!;
+    if (!item.r.g.producer && pair < state.framePairCount) state.frameDrawPairs[pair] = item;
+}
+
+/** Records opaque, masked and alpha-to-coverage materials into core's shared depth prepass.
+ * Blended modes write no depth; an empty draw list still clears the depth target. */
+function renderPrepass(
+    world: World,
+    eid: number,
+    view: View,
+    items: FrameDraw[],
+    count: number,
+    pass: GPURenderPassEncoder,
+): void {
+    const _standardRendererState = world.resource(standardRendererStateKey);
+
+    if (!view.framebuffer) return;
+    const antialias = world.storage(Camera).antialias.get(eid) !== 0;
+    if (!antialias) {
+        for (let i = 0; i < count; i++) {
+            const material = items[i]!.r.t;
+            if (material.prepass) ensureSingle(world, material);
+        }
+    }
+
+    let draws = 0;
+    const shadow = shadowGroup(world);
+    for (let i = 0; i < count; i++) {
+        const { draw, r } = items[i];
+        const pipe = view.normal
+            ? ensureNormalPrepass(world, r.t, !antialias)
+            : antialias
+              ? r.t.prepass
+              : r.t.prepassSingle;
+        const group = view.normal ? r.g.color : r.g.depth;
+        if (pipe && group) {
+            const step = bundleDraw(_standardRendererState.prepassProgram, draws);
+            step.material = r.t.owner.name;
+            step.pipeline = boundPipeline(r.g, pipe, group, !view.normal, r.index) as never;
+            step.layout0 = engineLayout;
+            step.group0 = engineGroup(world, r.g.engineCache, view.slot, r.g.quant, true);
+            step.layout1 = shadowLayout;
+            step.group1 = shadow;
+            step.layout2 = null;
+            step.group2 = null;
+            step.indirect = draw.args.indirect;
+            step.offset = (draw.args.offset ?? 0) + view.slot * (draw.args.viewStride ?? 0);
+            draws++;
+        }
+    }
+    // Each camera's view slot selects its own indirect range and engine group.
+    let bundle = _standardRendererState.prepassBundles.get(eid);
+    if (!bundle) {
+        bundle = newPassBundle();
+        _standardRendererState.prepassBundles.set(eid, bundle);
+    }
+    if (bundleChanged(bundle, _standardRendererState.prepassProgram, draws))
+        recordBundle(world, bundle, _standardRendererState.prepassProgram, draws);
+    replayBundle(pass, bundle);
+    world.gpu.indirect?.("standard:prepass", draws);
+}
+
+function backdrop(world: World, eid: number): Background | null {
+    const _backgrounds = world.resource(Backgrounds);
+
+    if (!world.has(eid, CameraBackground)) return null;
+    const id = world.storage(CameraBackground).background.get(eid);
+    const bg = _backgrounds.get(id);
+    if (!bg) return null;
+    return bg;
+}
+
+// build (and cache on the CompiledBackground) a background's own group-2 bind group — slot-invariant
+// (the per-slot View rides the engine group 0). Returns null while a binding is unpublished (skip); a
+// binding-free background carries no group at all (its empty layout never enters the pipeline layout)
+function backgroundGroup(
+    world: World,
+    bg: Background,
+    ct: CompiledBackground,
+): GPUBindGroup | null | "none" {
+    const entries = bg.layout.entries as Record<string, object>;
+    const bindings = bg.bindings?.(world);
+    let count = 0;
+    let same = ct.group2 !== null;
+    for (const name in entries) {
+        if (ct.group2?.resources[count] !== bindings?.[name]) same = false;
+        count++;
+    }
+    if (count === 0) return "none";
+    if (same) return ct.group2!.group;
+    const resolved = layoutResources(world, entries, bindings, undefined, true);
+    if (typeof resolved === "string") {
+        return warnSkip(world, `background:${bg.name}`, `binding "${resolved}" not published`);
+    }
+    const group = world.gpu.root.unwrap(
+        world.gpu.root.createBindGroup(bg.layout, resolved.values as never),
+    );
+    ct.group2 = { group, resources: resolved.resources };
+    return group;
+}
+
+// one opaque, masked, alpha-to-coverage or blended material draw in a camera's color pass at its view slot, written into the
+// camera's bundle program at `at`
+function drawColor(
+    world: World,
+    program: BundleDraw[],
+    at: number,
+    item: FrameDraw,
+    pipe: TgpuRenderPipeline<any>,
+    slot: number,
+    shadow: GPUBindGroup,
+): void {
+    const { draw, r } = item;
+    const step = bundleDraw(program, at);
+    step.material = r.t.owner.name;
+    step.pipeline = boundPipeline(r.g, pipe, r.g.color, false, r.index) as never;
+    step.layout0 = engineLayout;
+    step.group0 = engineGroup(world, r.g.engineCache, slot, r.g.quant);
+    step.layout1 = shadowLayout;
+    step.group1 = shadow;
+    step.layout2 = null;
+    step.group2 = null;
+    step.indirect = draw.args.indirect;
+    step.offset = (draw.args.offset ?? 0) + slot * (draw.args.viewStride ?? 0);
+}
+
+// One HDR color target avoids paying MRT bandwidth on every pixel, especially on tile-based GPUs.
+// Opaque geometry and the far-plane background share a pass because nothing reads scene color between
+// them. The background depth-tests without writing depth, so only uncovered pixels receive it and
+// later transparent geometry composites over it. A missing background leaves the flat clear color;
+// even an empty draw list clears the framebuffer. Camera.antialias selects 4x MSAA with resolve or
+// single-sample rendering directly into the offscreen, using ensureSingle's lazy pipeline variants.
+function renderColor(
+    world: World,
+    eid: number,
+    view: View,
+    items: FrameDraw[],
+    count: number,
+    encoded: GPURenderPassEncoder,
+    bg: Background | null = null,
+): void {
+    const _render = world.resource(RenderContext);
+    const _standardRendererState = world.resource(standardRendererStateKey);
+
+    if (!view.framebuffer) return;
+    // per-camera AA: 4× MSAA when `Camera.antialias` is on (the Camera component default), else
+    // single-sample. `world.storage(Camera).antialias.set(eid, 0)` flips it live
+    const aa = world.storage(Camera).antialias.get(eid) !== 0;
+    const stacked = aa && !!view.sortedIndexForTarget;
+
+    const shadow = shadowGroup(world);
+    // Each phase has its own bundle: opaque plus backdrop, or blend. Building it reads only cached
+    // identities, so a steady frame allocates nothing here and the compare below reports no transition
+    let draws = 0;
+    let indirect = 0;
+    for (let i = 0; i < count; i++) {
+        const item = items[i];
+        if (!aa) ensureSingle(world, item.r.t);
+        const pipe =
+            stacked && item.r.t.args.alphaPipelineKey === AlphaPipelineKey.AlphaToCoverage
+                ? ensureStacked(world, item.r.t)
+                : aa
+                  ? item.r.t.color
+                  : item.r.t.single?.color;
+        if (pipe) {
+            drawColor(
+                world,
+                _standardRendererState.colorProgram,
+                draws++,
+                item,
+                pipe,
+                view.slot,
+                shadow,
+            );
+            indirect++;
+        }
+    }
+    // The backdrop is masked to far-plane pixels, after opaque geometry and before the shared
+    // transparent phase. Its group 1 is declared but unread, matching the color pipeline layout.
+    if (bg) {
+        // a backdrop: the shared engine group 0 (a never-read `bgQuant()` fills the meshQuant
+        // slot — a background pulls no mesh), the shadow group 1 (declared-but-unused, the
+        // group-count-compatibility reason `compileBackground` documents), and its own group 2
+        const ct = getBackground(world, bg) ?? compileBackground(world, bg);
+        const group = backgroundGroup(world, bg, ct);
+        if (group) {
+            const step = bundleDraw(_standardRendererState.colorProgram, draws++);
+            step.material = null;
+            step.pipeline = (aa ? ct.color : ct.single) as never;
+            step.layout0 = engineLayout;
+            step.group0 = engineGroup(world, ct.engineCache, view.slot, bgQuant(world));
+            step.layout1 = shadowLayout;
+            step.group1 = shadow;
+            step.layout2 = group === "none" ? null : bg.layout;
+            step.group2 = group === "none" ? null : group;
+            step.indirect = null;
+            step.offset = 3;
+        }
+    }
+    const bundleKey = eid * 2;
+    let pass = _standardRendererState.colorBundles.get(bundleKey);
+    if (!pass) {
+        pass = newPassBundle();
+        _standardRendererState.colorBundles.set(bundleKey, pass);
+    }
+    if (bundleChanged(pass, _standardRendererState.colorProgram, draws))
+        recordBundle(world, pass, _standardRendererState.colorProgram, draws);
+    replayBundle(encoded, pass);
+
+    // tally this camera's opaque indirect draws so the profiler derives the injected validation floor;
+    // the honest count is post the `if (pipe)` skip, and excludes the backdrop's
+    // three-vertex draw, which is not indirect
+    world.gpu.indirect?.("standard:color", indirect);
+}
+
+const EIDS_BYTES = 16;
+const INDIRECT_BYTES = d.sizeOf(DrawIndexedIndirect);
+
+function transparentAlpha(alphaMode: number): boolean {
+    return (
+        alphaMode === AlphaModeCode.Blend ||
+        alphaMode === AlphaModeCode.Premultiplied ||
+        alphaMode === AlphaModeCode.Add ||
+        alphaMode === AlphaModeCode.Multiply
+    );
+}
+
+function sphereVisible(
+    planes: Float32Array,
+    base: number,
+    x: number,
+    y: number,
+    z: number,
+    radius: number,
+): boolean {
+    if (planes[base] !== CULL_FRUSTUM) return true;
+    for (let i = 0; i < 6; i++) {
+        const at = base + 4 + i * 4;
+        if (planes[at] * x + planes[at + 1] * y + planes[at + 2] * z + planes[at + 3] < -radius)
+            return false;
+    }
+    return true;
+}
+
+const transparentPlacement = new Float32Array(12);
+
+/** Queue one standard item per visible blended MeshInstance, not per GPU-compacted pair. */
+function queueTransparent(world: World, eid: number, view: View, phase: TransparentPhase): void {
+    const buffers = world.resource(MeshDrawBuffers);
+    if (!world.has(eid, StandardRenderer) || !buffers.transparentEids) return;
+    const state = world.resource(standardRendererStateKey);
+    const meshRegistry = world.resource(Meshes);
+    const meshCount = world.resource(meshResourcesKey).meshes.capacity;
+    const instances = world.storage(MeshInstance);
+    const materials = world.storage(MeshMaterial);
+    const placement = transparentPlacement;
+    const planes = world.resource(RenderContext).cullVolumeStaging;
+    const planeBase = view.slot * CULL_VOLUME_FLOATS;
+    const position = phase.positionScratch;
+    const sources = world.resource(MaterialTypes).sources;
+    const keyCount = meshKeyCount(world);
+    const cameraLayers = renderLayers(world, eid);
+    for (const instanceEid of world.resource(TransparentMeshes).candidates) {
+        if ((renderLayers(world, instanceEid) & cameraLayers) === 0) continue;
+        const source = sources[materials.type.get(instanceEid)];
+        const row = materials.material.get(instanceEid);
+        const alphaMode = source?.alphaMode(row) ?? materials.alphaMode.get(instanceEid);
+        observeTransparentHistoryAlpha(world, instanceEid, alphaMode);
+        if (!transparentAlpha(alphaMode)) continue;
+        const meshId = instances.mesh.get(instanceEid);
+        const mesh = meshRegistry.get(meshId as MeshHandle);
+        if (!mesh || mesh.pending) continue;
+        const type = materials.type.get(instanceEid);
+        const cull = source ? (source.cullMode?.(row) ?? 0) : materials.cullMode.get(instanceEid);
+        const key = pipelineKey(alphaPipelineKey(alphaMode), cull);
+        const batch = materialBatch(world, type, row);
+        const pair =
+            (batch * keyCount + key) * meshCount +
+            world.resource(meshResourcesKey).meshes.index(meshId)!;
+        if (!state.frameDrawPairs[pair]) continue;
+
+        // Typed locals: an optional-chained default leaves each one untyped, so the override
+        // branch's floats would box on every item.
+        const bounds = mesh.bounds;
+        let bx = 0;
+        let by = 0;
+        let bz = 0;
+        let radius = 1e30;
+        if (bounds) {
+            bx = bounds[0];
+            by = bounds[1];
+            bz = bounds[2];
+            radius = bounds[3];
+        }
+        const override = instances.cullBounds;
+        const overrideRadius = override.w.get(instanceEid);
+        if (overrideRadius >= 0) {
+            bx = override.x.get(instanceEid);
+            by = override.y.get(instanceEid);
+            bz = override.z.get(instanceEid);
+            radius = overrideRadius;
+        }
+
+        if (source?.cullBounds) {
+            source.cullBounds(materials.material.get(instanceEid), state.materialBounds);
+            bx = state.materialBounds[0];
+            by = state.materialBounds[1];
+            bz = state.materialBounds[2];
+            radius = state.materialBounds[3];
+        }
+
+        readRenderGlobalTransform(world, instanceEid, placement);
+        const sx = placement[8]!;
+        const sy = placement[9]!;
+        const sz = placement[10]!;
+        const lx = bx * sx;
+        const ly = by * sy;
+        const lz = bz * sz;
+        const qx = placement[4]!;
+        const qy = placement[5]!;
+        const qz = placement[6]!;
+        const qw = placement[7]!;
+        const tx = 2 * (qy * lz - qz * ly);
+        const ty = 2 * (qz * lx - qx * lz);
+        const tz = 2 * (qx * ly - qy * lx);
+        const x = placement[0]! + lx + qw * tx + qy * tz - qz * ty;
+        const y = placement[1]! + ly + qw * ty + qz * tx - qx * tz;
+        const z = placement[2]! + lz + qw * tz + qx * ty - qy * tx;
+        const worldRadius = radius * Math.max(Math.abs(sx), Math.abs(sy), Math.abs(sz));
+        if (!sphereVisible(planes, planeBase, x, y, z, worldRadius)) continue;
+        position[0] = x;
+        position[1] = y;
+        position[2] = z;
+        phase.addFromScratch(instanceEid, pair, instanceEid, 0);
+    }
+}
+
+function ensureTransparentStages(
+    world: World,
+    state: StandardRendererState,
+    draws: MeshDrawBuffers,
+): void {
+    const eids = draws.transparentEids!;
+    const args = draws.transparentArgs!;
+    const eidSize = world.gpu.root.unwrap(eids).size;
+    if (state.transparentEidsStage.byteLength < eidSize) {
+        state.transparentEidsStage = new ArrayBuffer(eidSize);
+        state.transparentEidsU32 = new Uint32Array(state.transparentEidsStage);
+    }
+    if (state.transparentArgsStage.byteLength < args.size) {
+        state.transparentArgsStage = new ArrayBuffer(args.size);
+        state.transparentArgsU32 = new Uint32Array(state.transparentArgsStage);
+    }
+}
+
+function ensureTransparentRunCapacity(state: StandardRendererState, required: number): void {
+    if (required <= state.transparentRunStarts.length) return;
+    let capacity = Math.max(32, state.transparentRunStarts.length * 2);
+    while (capacity < required) capacity *= 2;
+    state.transparentRunStarts.length = capacity;
+    state.transparentRunOffsets.length = capacity;
+    state.transparentRunRecords.length = capacity;
+    state.transparentCountOffsets.length = capacity;
+    state.transparentRunDraws.length = capacity;
+}
+
+function transparentPipeline(
+    world: World,
+    item: FrameDraw,
+    eids: NonNullable<MeshDrawBuffers["transparentEids"]>,
+    antialias: boolean,
+): TgpuRenderPipeline<any> | null {
+    const { r } = item;
+    const pipe = antialias ? r.t.transparent : r.t.single?.transparent;
+    if (!pipe) return null;
+    if (r.g.transparentEids !== eids || !r.g.transparentColor) {
+        r.g.transparentEids = eids;
+        const mesh = world.resource(Meshes).get(item.draw.mesh);
+        if (!mesh) return null;
+        r.g.transparentColor = surfaceGroup(world, r.g.values, r.g.layout, mesh.vertices, {
+            eids: eids as unknown as BindResource,
+        });
+    }
+    return pipe;
+}
+
+/** Build the per-view sorted identity lane and one indirect record per compatible consecutive run. */
+function prepareTransparent(
+    world: World,
+    eid: number,
+    view: View,
+    phase: TransparentPhase,
+    renderer: number,
+): void {
+    if (!world.has(eid, StandardRenderer)) return;
+    const state = world.resource(standardRendererStateKey);
+    const draws = world.resource(MeshDrawBuffers);
+    const eids = draws.transparentEids;
+    const args = draws.transparentArgs;
+    if (!eids || !args) return;
+    ensureTransparentStages(world, state, draws);
+    const rowCapacity = meshInstanceTable(world).capacity;
+    const transforms = globalTransformTable(world);
+    const instances = meshInstanceTable(world);
+    const eidsBase = view.slot * rowCapacity;
+    const argsBase = view.slot * rowCapacity;
+    let itemStart = 0;
+    let eidCount = 0;
+    let runCount = 0;
+    let counted = 0;
+    const antialias = world.storage(Camera).antialias.get(eid) !== 0;
+    state.lastTransparentPipeline = null;
+    state.lastTransparentGroup0 = null;
+    state.lastTransparentGroup1 = null;
+    state.lastTransparentGroup2 = null;
+
+    while (itemStart < phase.length) {
+        const item = phase.item(itemStart);
+        if (item.renderer !== renderer) {
+            itemStart++;
+            continue;
+        }
+        let end = itemStart + 1;
+        while (end < phase.length) {
+            const next = phase.item(end);
+            if (next.renderer !== renderer || next.batch !== item.batch) break;
+            end++;
+        }
+        const draw = state.frameDrawPairs[item.batch];
+        if (!draw) {
+            itemStart = end;
+            continue;
+        }
+        const mesh = world.resource(Meshes).get(draw.draw.mesh);
+        if (!mesh) {
+            itemStart = end;
+            continue;
+        }
+        if (!antialias) ensureSingle(world, draw.r.t);
+        const bound = transparentPipeline(world, draw, eids, antialias);
+        if (!bound) {
+            itemStart = end;
+            continue;
+        }
+        const count = end - itemStart;
+        if (eidCount + count > rowCapacity || runCount >= rowCapacity)
+            throw new Error(
+                `standard transparent phase exceeds per-view MeshInstance capacity ${rowCapacity}`,
+            );
+        ensureTransparentRunCapacity(state, runCount + 1);
+        state.transparentRunStarts[runCount] = itemStart;
+        state.transparentRunOffsets[runCount] = (argsBase + runCount) * INDIRECT_BYTES;
+        state.transparentRunDraws[runCount] = draw;
+        if (mesh.indirectIndexCount) {
+            state.transparentRunRecords[counted] = draw.draw.args.offset! / INDIRECT_BYTES;
+            state.transparentCountOffsets[counted] = (argsBase + runCount) * INDIRECT_BYTES;
+            counted++;
+        }
+        const firstInstance = eidsBase + eidCount;
+        for (let i = itemStart; i < end; i++) {
+            const instanceEid = phase.item(i).draw;
+            const transformRow = transforms.rowIndex(instanceEid);
+            const instanceRow = instances.rowIndex(instanceEid);
+            if (transformRow < 0 || instanceRow < 0)
+                throw new Error(`standard transparent item ${instanceEid} lost its GPU table row`);
+            const at = (firstInstance + i - itemStart) * 4;
+            state.transparentEidsU32[at] = instanceEid;
+            state.transparentEidsU32[at + 1] = transformRow;
+            state.transparentEidsU32[at + 2] = instanceRow + 1;
+            state.transparentEidsU32[at + 3] = 0;
+        }
+        const argAt = (argsBase + runCount) * 5;
+        state.transparentArgsU32[argAt] = mesh.indexCount;
+        state.transparentArgsU32[argAt + 1] = count;
+        state.transparentArgsU32[argAt + 2] = mesh.indexBase;
+        state.transparentArgsU32[argAt + 3] = 0;
+        state.transparentArgsU32[argAt + 4] = firstInstance;
+        runCount++;
+        eidCount += count;
+        itemStart = end;
+    }
+
+    state.transparentRunCount = runCount;
+    state.transparentRunCursor = 0;
+    if (eidCount) {
+        const bytes = eidCount * EIDS_BYTES;
+        const offset = eidsBase * EIDS_BYTES;
+        const started = phase.measureTimings ? performance.now() : 0;
+        world.uploadGpuTable(
+            world.gpu.root.unwrap(eids),
+            offset,
+            state.transparentEidsStage,
+            bytes,
+        );
+        phase.recordUpload(bytes, phase.measureTimings ? performance.now() - started : 0);
+    }
+    if (runCount) {
+        const bytes = runCount * INDIRECT_BYTES;
+        const offset = argsBase * INDIRECT_BYTES;
+        const started = phase.measureTimings ? performance.now() : 0;
+        world.uploadGpuTable(args, offset, state.transparentArgsStage, bytes);
+        if (counted)
+            publishTransparentCounts(
+                world,
+                world.gpu.root.unwrap(draws.drawArgs!),
+                args,
+                state.transparentRunRecords,
+                state.transparentCountOffsets,
+                counted,
+            );
+        phase.recordUpload(bytes, phase.measureTimings ? performance.now() - started : 0);
+    }
+}
+
+/** Draw one sorted compatible run without moving it across another renderer's item. */
+function drawTransparent(
+    world: World,
+    eid: number,
+    view: View,
+    phase: TransparentPhase,
+    start: number,
+    end: number,
+    pass: GPURenderPassEncoder,
+    renderer: number,
+): void {
+    if (!world.has(eid, StandardRenderer)) return;
+    const state = world.resource(standardRendererStateKey);
+    const run = state.transparentRunCursor++;
+    if (
+        run >= state.transparentRunCount ||
+        state.transparentRunStarts[run] !== start ||
+        phase.item(start).renderer !== renderer
+    )
+        throw new Error(`standard transparent run ${start}..${end} was not prepared`);
+    const item = state.transparentRunDraws[run]!;
+    const previous = start > 0 ? phase.item(start - 1) : undefined;
+    if (previous?.renderer !== renderer) {
+        state.lastTransparentPipeline = null;
+        state.lastTransparentGroup0 = null;
+        state.lastTransparentGroup1 = null;
+        state.lastTransparentGroup2 = null;
+    }
+    const eids = world.resource(MeshDrawBuffers).transparentEids!;
+    const antialias = world.storage(Camera).antialias.get(eid) !== 0;
+    const pipeline = transparentPipeline(world, item, eids, antialias)!;
+    const group0 = engineGroup(world, item.r.g.engineCache, view.slot, item.r.g.quant);
+    const group1 = shadowGroup(world);
+    let rawPipeline: GPURenderPipeline;
+    try {
+        rawPipeline = world.gpu.root.unwrap(pipeline);
+    } catch (error) {
+        rethrowMaterialError(item.r.t.owner.name, error);
+    }
+    pass.setPipeline(rawPipeline);
+    pass.setBindGroup(0, group0);
+    pass.setBindGroup(1, group1);
+    pass.setBindGroup(2, item.r.g.transparentColor!);
+    const fog = fogSource(world);
+    if (fog) pass.setBindGroup(3, fog.bindGroup(world, eid, view));
+    pass.setIndexBuffer(world.gpu.root.unwrap(item.r.index), "uint32");
+    pass.drawIndexedIndirect(
+        world.resource(MeshDrawBuffers).transparentArgs!,
+        state.transparentRunOffsets[run],
+    );
+    if (state.lastTransparentPipeline !== pipeline) phase.metrics.pipelineChanges++;
+    if (state.lastTransparentGroup0 !== group0) phase.metrics.bindGroupChanges++;
+    if (state.lastTransparentGroup1 !== group1) phase.metrics.bindGroupChanges++;
+    if (state.lastTransparentGroup2 !== item.r.g.transparentColor) phase.metrics.bindGroupChanges++;
+    state.lastTransparentPipeline = pipeline;
+    state.lastTransparentGroup0 = group0;
+    state.lastTransparentGroup1 = group1;
+    state.lastTransparentGroup2 = item.r.g.transparentColor;
+    phase.metrics.draws++;
+}
+
+// the StandardRenderer camera query terms, and the point caster frames `ShadowCameraSystem` ranks into (a capacity
+// `updatePointShadows` grows and rewrites in place)
+const STANDARD_RENDERER_CAMERAS = [Camera, StandardRenderer];
+const PREPASS_READERS = [MeshInstance, MeshMaterial, GlobalTransform];
+
+/** Compile registered material keys and mesh stream sets, backgrounds, and current camera variants.
+ * Before StandardRenderingPlugin finishes warm, resolves without compiling; the build owns preparation.
+ * Await before spawning draws using newly registered assets after warm. Unprepared keys and later
+ * camera reconfiguration still compile synchronously at draw and warn. During warm, the build drains
+ * compilation. Like three.js compileAsync, late preparation awaits asynchronous native compilation. */
+export function preparePipelines(world: World): Promise<void> {
+    if (!world.resource(standardRendererStateKey).warm) return Promise.resolve();
+    return prepareRegisteredPipelines(world);
+}
+
+function prepareRegisteredPipelines(world: World): Promise<void> {
+    const singleSample = [...world.query(STANDARD_RENDERER_CAMERAS)].some(
+        (eid) => world.storage(Camera).antialias.get(eid) === 0,
+    );
+    const stacked = initialStackedViews(world).some((view) => {
+        const eid = world.resolve(view.camera);
+        return world.has(eid, StandardRenderer) && world.storage(Camera).antialias.get(eid) !== 0;
+    });
+    return prepareMaterialTypes(world, meshInstanceTable(world).capacity, singleSample, stacked);
+}
+
+// Reset owned resources before compilation so layouts and buffers belong to this warm.
+async function prepareStandardRenderer(
+    world: World,
+    device: GPUDevice,
+    capacity: number,
+): Promise<void> {
+    resetPipelineCaches(world);
+    const state = world.resource(standardRendererStateKey);
+    state.warned.clear();
+    resetShadowAtlas(world, device);
+    // the lazily-allocated packed list binds at each atlas pipeline's `eids` lane, so allocating it clears
+    // the resolved-bind-group cache to rebuild with it
+    world.resource(pointRegather).reset(() => clearGroups(world));
+    world.resource(cascadeRegather).reset(() => clearGroups(world));
+    // Compile material types and the shared re-gather pipelines before the first draw.
+    await Promise.all([
+        prepareRegather(world, device, capacity),
+        prepareRegisteredPipelines(world),
+    ]);
+    state.warm = true;
+}
+
+// Resolve once, after the pack registers draws and replaces their args buffer and before core's prepass;
+// the prepass, shadow maps and main pass share this draw list.
+const ResolveDrawsSystem: System = {
+    group: "draw",
+    after: [BeginFrameSystem, CullLightsSystem, MeshPreprocessSystem],
+    before: [PrepassSystem],
+    update(world) {
+        resolveDraws(world, world.entityHighWater);
+    },
+};
+
+// Shadow cameras are posed from the frame's derived light and camera placement, including simulation
+// writes, and before BeginFrameSystem packs this frame's view projections.
+const ShadowCameraSystem: System = {
+    name: "shadow-camera",
+    group: "draw",
+    first: true,
+    after: [PrepareViewsSystem],
+    before: [BeginFrameSystem],
+    update(world) {
+        const _standardRendererState = world.resource(standardRendererStateKey);
+
+        let main = -1;
+        for (const eid of world.query(STANDARD_RENDERER_CAMERAS)) {
+            main = eid;
+            break;
+        }
+        const casters = updatePointShadows(world, main, _standardRendererState.pointFrames);
+        setPointFrames(world, _standardRendererState.pointFrames, casters);
+        setShadowView(world, world.resource(Views).get(main) ?? null);
+        updateCascades(world, main);
+        // Allocate re-gather lists before record() caches the groups that bind them. Allocation clears
+        // that cache, so the first casting frame binds the new list without a one-frame delay.
+        // Allocate/resize atlas textures here too: the prepass binds them before the shadow pass,
+        // and destroying an already-bound texture would invalidate submission. Later ensure calls
+        // are idempotent when dimensions are unchanged.
+        if (casters > 0 && shadowReady(world)) {
+            world
+                .resource(pointRegather)
+                .ensure(pointCasters(world) * 6, world.entityHighWater + producerCapacity(world));
+            ensurePointAtlas(world);
+        }
+        if (cascadeCount(world) > 0 && shadowReady(world)) {
+            world
+                .resource(cascadeRegather)
+                .ensure(MAX_CASCADES, world.entityHighWater + producerCapacity(world));
+            ensureCascadeAtlas(world);
+        }
+    },
+};
+
+// Run after PrepassSystem so position-writing producers have emitted and this frame's draws are
+// resolved; run before MainPassSystem so atlas depth and receiver parameters are ready for shading.
+// With no casting light, record no shadow pass and use the fully-lit fallback.
+export const ShadowMapSystem: System = {
+    name: "shadowmap",
+    group: "draw",
+    after: [PrepassSystem],
+    before: [MainPassSystem],
+    update(world) {
+        const _standardRendererState = world.resource(standardRendererStateKey);
+
+        renderPointShadows(
+            world,
+            _standardRendererState.frameDraws,
+            _standardRendererState.frameCount,
+            world.entityHighWater,
+        );
+        renderCascades(
+            world,
+            _standardRendererState.frameDraws,
+            _standardRendererState.frameCount,
+            world.entityHighWater,
+        );
+    },
+};
+
+// Standard owns shadow atlases and their params; core releases view targets.
+// destroyCascades tears down the off-screen Camera entities separately.
+function disposeStandardRenderer(world: World): void {
+    disposeShadowAtlas(world);
+}
+
+const PackLightingSystem: System = {
+    group: "draw",
+    after: [BeginFrameSystem],
+    before: [UpdateLightClustersSystem],
+    update: writeLighting,
+};
+
+/** Clustered forward mesh renderer recording into core's prepass and main pass.
+ * Includes CorePipelinePlugin; cameras opt in with StandardRenderer. Shadows are
+ * sampled inline, and presentation follows the color resolve in core's tonemapping pass.
+ */
+export const StandardRenderingPlugin: Plugin = {
+    gpu: {
+        features: ["indirect-first-instance"],
+    },
+    name: "StandardRendering",
+    recovery: recoverTransparentTransformHistory,
+    components: [StandardRenderer, CameraBackground, ShadowCamera],
+    systems: [
+        EnrollTransparentTransformHistorySystem,
+        PrepareTransparentTransformHistorySystem,
+        PackLightingSystem,
+        PackSpotAttenuationSystem,
+        UpdateLightClustersSystem,
+        CullLightsSystem,
+        ResolveDrawsSystem,
+        ShadowCameraSystem,
+        ShadowMapSystem,
+        ResolvePrepassTexturesSystem,
+    ],
+    dependencies: [CorePipelinePlugin, MeshPlugin],
+
+    initialize(world) {
+        const requests = (world: World, eid: number, read: "depth" | "normal") => {
+            if (!world.has(eid, StandardRenderer)) return false;
+            const state = world.resource(standardRendererStateKey);
+            return (
+                ((read === "depth" ? state.depthReadLayers : state.normalReadLayers) &
+                    renderLayers(world, eid)) !==
+                0
+            );
+        };
+        world.resource(DepthPrepassRequests).push((world, eid) => requests(world, eid, "depth"));
+        world.resource(NormalPrepassRequests).push((world, eid) => requests(world, eid, "normal"));
+        world.resource(prepassTextures).requested = (world, eid) =>
+            requests(world, eid, "depth") || requests(world, eid, "normal");
+        world.resource(RenderPhases).push({
+            prepass(world, eid, view, pass) {
+                if (!world.has(eid, StandardRenderer)) return;
+                const state = world.resource(standardRendererStateKey);
+                renderPrepass(world, eid, view, state.frameDraws, state.frameCount, pass);
+            },
+            opaque(world, eid, view, pass) {
+                if (!world.has(eid, StandardRenderer)) return;
+                const state = world.resource(standardRendererStateKey);
+                renderColor(
+                    world,
+                    eid,
+                    view,
+                    state.frameDraws,
+                    state.frameCount,
+                    pass,
+                    backdrop(world, eid),
+                );
+            },
+            transparent: queueTransparent,
+            prepareTransparent,
+            drawTransparent,
+        });
+        initializeClusterState(world);
+        initializeLightingState(world);
+        initializeIndirectLightSources(world);
+        world.resource(Lighting).buffer = world.gpu.device.createBuffer({
+            label: "shallot-lighting",
+            size: LIGHTING_UNIFORM_SIZE,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        initializeBackgroundState(world);
+        registerMaterialType(world, Materials as never, true);
+        world.resource(Materials);
+        registerMaterialType(world, VertexMaterialType as never);
+        world.resource(VertexMaterialType);
+        initializeDrawState(world);
+        world.resource(Draws).clear();
+        world.resource(standardRendererStateKey);
+        initializeShadowAtlasState(world);
+        initializePipelineState(world);
+        initializeRegatherState(world);
+        // a fresh World recreates its own off-screen shadow cameras lazily — drop any eids cached by
+        // a prior build so this re-run never aliases recycled entities (the module-scope contract)
+        resetPointShadows(world);
+        resetCascades(world);
+    },
+
+    async warm(world) {
+        world.resource(standardRendererStateKey).warm = false;
+        sealIndirectLightSources(world);
+        sealFogSource(world);
+        if (!world.gpu.device) return;
+        warmPrepassTextures(world);
+        warmClusters(world);
+        await withPipelineOwner(world.gpu.device, "StandardRendering", () => warmLightCull(world));
+        await withPipelineOwner(world.gpu.device, "StandardRendering", () =>
+            prepareStandardRenderer(world, world.gpu.device!, world.entityHighWater),
+        );
+    },
+
+    dispose(world) {
+        disposePrepassTextures(world);
+        destroyPointShadows(world);
+        destroyCascades(world);
+        disposeStandardRenderer(world);
+    },
+};

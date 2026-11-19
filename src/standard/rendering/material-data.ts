@@ -1,0 +1,189 @@
+import * as d from "typegpu/data";
+import { component, f32, u32, vec4 } from "../../engine";
+
+/**
+ * One instance's mesh, material and culling row, read by preprocess and the material shaders.
+ * Standard fills entity rows from MeshInstance, MeshMaterial and NotShadowCaster; a producer table
+ * writes every field of its rows itself, and a wrong value renders wrong without an error:
+ * - `mesh`: a MeshHandle the table declared. An undeclared or unknown handle draws nothing.
+ * - `materialType`, `material`: a declared MaterialHandle's `type` and `material`. Another pair draws
+ *   nothing; another row of the same type draws with that row's parameters.
+ * - `alphaMode`: that handle's `alphaMode`, an AlphaModeCode. It selects the pipeline: a code no
+ *   declared handle of the type holds draws nothing, as does any code but Opaque, Mask and
+ *   AlphaToCoverage.
+ * - `alphaCutoff`: that handle's `alphaCutoff`, an alpha in [0, 1]. Mask, and AlphaToCoverage on
+ *   single-sample views, discard fragments whose alpha is below the row's value.
+ * - `flags`: bit 0 set keeps the row out of shadow passes, as NotShadowCaster does; write 0 to cast.
+ *   Other bits are reserved and must be 0.
+ * - `cullMode`: that handle's `cullMode`, a CullModeCode; 0 culls back faces. With `alphaMode` it
+ *   selects the pipeline: a pair no declared handle of the type holds, or a code above 2, draws nothing.
+ * - `cullBounds`: a local-space culling sphere `(center.xyz, radius)` in mesh units, scaled by the
+ *   placement's largest absolute scale; a negative radius uses the mesh's bounds. A radius of 0
+ *   culls the row once its center leaves a view, so write `(0, 0, 0, -1)` unless you supply a sphere.
+ */
+export const MeshInstanceInput = d
+    .struct({
+        mesh: d.u32,
+        materialType: d.u32,
+        material: d.u32,
+        alphaMode: d.u32,
+        alphaCutoff: d.f32,
+        flags: d.u32,
+        cullMode: d.u32,
+        cullBounds: d.vec4f,
+    })
+    .$name("MeshInstanceInput");
+
+const { cullBounds, ...instanceFields } = MeshInstanceInput.propTypes;
+/** Entity input consumes producer-row padding without changing its stride or material-field offsets.
+ * Bit 1 of flags marks RenderLayers presence; without it the effective layer mask is 1.
+ * @internal */
+export const EntityMeshInstanceInput = d.struct({ ...instanceFields, layers: d.u32, cullBounds });
+
+/**
+ * Selects one material row from one World-local material type. `type` identifies the shader and typed
+ * parameter table; `material` is a row in that table. `alphaMode`, `alphaCutoff` and `cullMode` copy that
+ * row's alpha and cull mode into the dense mesh table; the row owns them, and marked copies reconcile immediately before that
+ * table gathers fields for upload. A direct write to any of them is replaced at the next upload, including
+ * frames without a fixed tick. Writes after upload reconcile next frame. External parameter sources
+ * instead publish alpha and cull directly into the GPU mesh table; their CPU copy is not authoritative.
+ * Draws group by `(type, alpha pipeline key, cull mode, mesh)`. Missing MeshMaterial selects StandardMaterial
+ * type 0, row 0 with Opaque mode.
+ */
+export const MeshMaterial = component(
+    "MeshMaterial",
+    { type: u32, material: u32, alphaMode: u32, alphaCutoff: f32, cullMode: u32 },
+    { defaults: () => ({ type: 0, material: 0, alphaMode: 0, alphaCutoff: 0.5, cullMode: 0 }) },
+);
+
+/** Texture coordinates are scaled, rotated counter-clockwise in radians, then offset.
+ * Omitted members are identity. The channel is selected before this transform. */
+export interface TextureTransform {
+    offset?: readonly [number, number];
+    rotation?: number;
+    scale?: readonly [number, number];
+}
+
+const UvTransform = d.struct({
+    offsetX: d.f32,
+    offsetY: d.f32,
+    scaleX: d.f32,
+    scaleY: d.f32,
+    rotation: d.f32,
+});
+function uvTransform(value?: TextureTransform): d.Infer<typeof UvTransform> {
+    return {
+        offsetX: value?.offset?.[0] ?? 0,
+        offsetY: value?.offset?.[1] ?? 0,
+        scaleX: value?.scale?.[0] ?? 1,
+        scaleY: value?.scale?.[1] ?? 1,
+        rotation: value?.rotation ?? 0,
+    };
+}
+
+/** Standard forward PBR parameters, stored as one typed row per StandardMaterial instance. */
+export const StandardMaterialInput = d
+    .struct({
+        baseColor: d.vec4f,
+        baseColorTexture: d.i32,
+        baseColorChannel: d.u32,
+        normalMapTexture: d.i32,
+        normalMapChannel: d.u32,
+        normalMapScale: d.f32,
+        metallicRoughnessTexture: d.i32,
+        metallicRoughnessChannel: d.u32,
+        occlusionTexture: d.i32,
+        occlusionChannel: d.u32,
+        occlusionStrength: d.f32,
+        emissiveTexture: d.i32,
+        emissiveChannel: d.u32,
+        metallic: d.f32,
+        perceptualRoughness: d.f32,
+        emissive: d.vec3f,
+        occlusion: d.f32,
+        unlit: d.u32,
+        doubleSided: d.u32,
+        baseColorTransform: UvTransform,
+        normalMapTransform: UvTransform,
+        metallicRoughnessTransform: UvTransform,
+        occlusionTransform: UvTransform,
+        emissiveTransform: UvTransform,
+    })
+    .$name("StandardMaterialInput");
+
+export type StandardMaterial = d.Infer<typeof StandardMaterialInput>;
+type StandardMaterialOptions = {
+    baseColor?: readonly [number, number, number, number];
+    /** Image id from registerImage, registered before warm; multiplies baseColor RGBA at mesh UVs. */
+    baseColorTexture?: number;
+    /** UV set: 0 uses uv, 1 uses uv1 (which falls back to uv when absent). */
+    baseColorChannel?: 0 | 1;
+    baseColorTransform?: TextureTransform;
+    /** Linear data image id; tangent-space RGB normal, +Y, with tangent.w handedness. */
+    normalMapTexture?: number;
+    normalMapChannel?: 0 | 1;
+    normalMapTransform?: TextureTransform;
+    /** Multiplies tangent-space normal X and Y before normalization. */
+    normalMapScale?: number;
+    /** Linear data image id; G multiplies roughness, B multiplies metallic. */
+    metallicRoughnessTexture?: number;
+    metallicRoughnessChannel?: 0 | 1;
+    metallicRoughnessTransform?: TextureTransform;
+    /** Linear data image id; R supplies ambient occlusion. */
+    occlusionTexture?: number;
+    occlusionChannel?: 0 | 1;
+    occlusionTransform?: TextureTransform;
+    /** Mixes unoccluded (0) with sampled occlusion (1). */
+    occlusionStrength?: number;
+    /** Color image id; linearized RGB multiplies emissive. */
+    emissiveTexture?: number;
+    emissiveChannel?: 0 | 1;
+    emissiveTransform?: TextureTransform;
+    metallic?: number;
+    perceptualRoughness?: number;
+    emissive?: readonly [number, number, number];
+    occlusion?: number;
+    unlit?: boolean;
+    /** Shade back faces with the flipped normal, as glTF's doubleSided; pair it with the row's
+     * `cullMode: "none"` so back faces draw. VertexMaterial ignores it. */
+    doubleSided?: boolean;
+};
+
+/** Per-instance linear RGBA replacing StandardMaterial's baseColor, including alpha.
+ * Textures and vertex colors still multiply it. Extended standard materials inherit it;
+ * removing it restores the material's value on the next frame. */
+export const BaseColor = component("BaseColor", { color: vec4 });
+
+/**
+ * Linear colors; emissive is independent of baseColor. BaseColor overrides baseColor per entity.
+ * baseColorTexture is an id from registerImage before warm; its sampled RGBA multiplies baseColor
+ * at mesh UVs. Omit it to leave baseColor untextured, without sampling an image.
+ */
+export function StandardMaterial(values: StandardMaterialOptions = {}): StandardMaterial {
+    return {
+        baseColor: d.vec4f(...(values.baseColor ?? [1, 1, 1, 1])),
+        baseColorTexture: values.baseColorTexture ?? -1,
+        baseColorChannel: values.baseColorChannel ?? 0,
+        normalMapTexture: values.normalMapTexture ?? -1,
+        normalMapChannel: values.normalMapChannel ?? 0,
+        normalMapScale: values.normalMapScale ?? 1,
+        metallicRoughnessTexture: values.metallicRoughnessTexture ?? -1,
+        metallicRoughnessChannel: values.metallicRoughnessChannel ?? 0,
+        occlusionTexture: values.occlusionTexture ?? -1,
+        occlusionChannel: values.occlusionChannel ?? 0,
+        occlusionStrength: values.occlusionStrength ?? 1,
+        emissiveTexture: values.emissiveTexture ?? -1,
+        emissiveChannel: values.emissiveChannel ?? 0,
+        metallic: values.metallic ?? 0,
+        perceptualRoughness: values.perceptualRoughness ?? 0.5,
+        emissive: d.vec3f(...(values.emissive ?? [0, 0, 0])),
+        occlusion: values.occlusion ?? 1,
+        unlit: values.unlit ? 1 : 0,
+        doubleSided: values.doubleSided ? 1 : 0,
+        baseColorTransform: uvTransform(values.baseColorTransform),
+        normalMapTransform: uvTransform(values.normalMapTransform),
+        metallicRoughnessTransform: uvTransform(values.metallicRoughnessTransform),
+        occlusionTransform: uvTransform(values.occlusionTransform),
+        emissiveTransform: uvTransform(values.emissiveTransform),
+    };
+}

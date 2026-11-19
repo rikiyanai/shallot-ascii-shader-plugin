@@ -1,0 +1,114 @@
+/// <reference types="@webgpu/types" />
+
+export { ShadowFilteringMethod, ShadowFilteringMethodMode } from "../../core/rendering";
+export {
+    pointAtlasView,
+    pointShadowCasters,
+    pointShadowRects,
+    shadowSampler,
+    sunShadowParams,
+    sunShadowView,
+} from "./atlas";
+export { Clusters, clusterCell, LightClusters, LightCull } from "./cluster";
+export type { Background, BackgroundHandle } from "./contract";
+export { BackgroundContext, Backgrounds, backgroundLayout, registerBackground } from "./contract";
+export {
+    engineLayout,
+    lit,
+    prepassDepth,
+    prepassNormal,
+    SurfaceOcclusion,
+    surfaceOcclusion,
+} from "./engine";
+export type { FogSource } from "./fog";
+export { FogInput, registerFogSource } from "./fog";
+export {
+    CameraBackground,
+    preparePipelines,
+    ShadowMapSystem,
+    StandardRenderer,
+    StandardRenderingPlugin,
+} from "./forward";
+export type { IndirectLightSource } from "./indirect";
+export {
+    IndirectLightInput,
+    indirectLight,
+    indirectLightSlot,
+    indirectLightSources,
+    registerIndirectLightSource,
+} from "./indirect";
+export { type InstanceData, instanceData } from "./instance-data";
+export {
+    DirectionalLightGpu,
+    distanceAttenuation,
+    Lighting,
+    LightingGpu,
+    MAX_DIRECTIONAL_LIGHTS,
+    PointLightGpu,
+    spotFactor,
+} from "./lighting";
+export {
+    AlphaMode,
+    AlphaModeCode,
+    AlphaPipelineKey,
+    CullModeCode,
+    MaterialPlugin,
+    Materials,
+    MaterialTypes,
+    MeshMaterial,
+    materialType,
+    materialTypeId,
+    StandardMaterial,
+    VertexMaterialType,
+} from "./material";
+export {
+    BaseColor,
+    MeshInstanceInput,
+    StandardMaterialInput,
+    type TextureTransform,
+} from "./material-data";
+export type {
+    MaterialBinding,
+    MaterialFragmentFn,
+    MaterialHandle,
+    MaterialLayout,
+    MaterialRowOptions,
+    MaterialSource,
+    MaterialType,
+    MaterialVertexFn,
+} from "./material-type";
+export { alphaPipelineKey, MaterialAssets, materialLayout, pipelineKey } from "./material-type";
+export { MeshRenderPlugin } from "./mesh-render";
+export { MeshPreprocessSystem, meshInstanceTable } from "./preprocess";
+export { type ProducerTable, registerProducerTable } from "./producer-table";
+export type { Draw } from "./registry";
+export { DrawIndexedIndirect, Draws } from "./registry";
+export {
+    pointCastersSchema,
+    pointShadowRef,
+    SunShadow,
+    sampleSunShadow,
+    tileRectsSchema,
+} from "./shade";
+export {
+    cascadeComboEids,
+    DirectionalLightShadowMap,
+    MAX_CASCADES,
+    MAX_POINT_CASTERS,
+    PointShadows,
+    pointComboEids,
+} from "./shadows";
+export {
+    ScreenSpaceAmbientOcclusion,
+    ScreenSpaceAmbientOcclusionPlugin,
+    ScreenSpaceAmbientOcclusionQualityLevel,
+} from "./ssao";
+export {
+    applyPbrLighting,
+    type ExtensionLayout,
+    extendedMaterial,
+    extensionLayout,
+    PbrInput,
+    pbrInputFromMaterial,
+    pbrInputFromStandardMaterial,
+} from "./standard-material";

@@ -1,0 +1,1232 @@
+import type {
+    StorageFlag,
+    TgpuBindGroup,
+    TgpuBuffer,
+    TgpuComputePipeline,
+    UniformFlag,
+} from "typegpu";
+import * as d from "typegpu/data";
+import {
+    type Mesh,
+    Meshes,
+    type MeshHandle,
+    MeshInstance,
+    meshResourcesKey,
+} from "../../core/mesh";
+import {
+    BeginFrameSystem,
+    globalTransformTable,
+    MAX_SLOTS,
+    NotShadowCaster,
+    RenderContext,
+    RenderLayers,
+} from "../../core/rendering";
+import { ClearChangeMarksSystem, type System, type World } from "../../engine";
+import {
+    beginComputePass,
+    dispatchWorkgroups,
+    dispatchWorkgroups2,
+    endComputePass,
+    precompile,
+    setComputeBindGroup,
+    setComputePipeline,
+} from "../../engine/runtime";
+import { uploadInstanceData } from "./instance-data";
+import { MaterialTypes } from "./material";
+import { MaterialBatches, materialBatch, syncMaterialBatches } from "./material-batch";
+import { EntityMeshInstanceInput, MeshMaterial } from "./material-data";
+import {
+    ALPHA_PIPELINE_KEY_COUNT,
+    alphaPipelineKey,
+    CullModeCode,
+    copyMeshAlpha,
+    type MaterialSource,
+    pipelineKey,
+    pipelineKeyCount,
+    TransparentMeshes,
+} from "./material-type";
+import { materialAttributeError } from "./mesh-attributes";
+import { publishMeshCounts, rebuildMeshCounts, warmTransparentCounts } from "./mesh-count";
+import {
+    CullParams,
+    countKernel,
+    countLayout,
+    cullLayout,
+    MeshBounds,
+    scanKernel,
+    scanLayout,
+    scatterKernel,
+    scatterLayout,
+    tileScanKernel,
+    tileSumKernel,
+} from "./pack";
+import {
+    countProducers,
+    producerCapacity,
+    scatterProducers,
+    syncProducerPack,
+} from "./producer-pack";
+import { producerTables } from "./producer-table";
+import { type Draw, DrawIndexedIndirect, Draws } from "./registry";
+
+const DRAW_ARG_STRIDE = d.sizeOf(DrawIndexedIndirect);
+// Every (alpha pipeline key, cull mode) pair, for CPU lookups that must not move as the key stride grows.
+const PIPELINE_KEY_LIMIT = ALPHA_PIPELINE_KEY_COUNT * 3;
+const MESH_INSTANCES = [MeshInstance];
+type InstanceBuffer = TgpuBuffer<d.WgslArray<d.Vec4u>> & StorageFlag;
+type AtomicU32Buffer = TgpuBuffer<d.WgslArray<d.Atomic<d.U32>>> & StorageFlag;
+type MeshBoundsBuffer = TgpuBuffer<d.WgslArray<typeof MeshBounds>> & StorageFlag;
+type DrawBuffer = TgpuBuffer<d.WgslArray<typeof DrawIndexedIndirect>> &
+    StorageFlag & { usableAsIndirect: true };
+
+// Culling during per-view compaction keeps invisible instances out of indirect draws.
+
+/**
+ * GPU draw publication. drawArgs is slot-major at `slot*pairCount+pair`, with 20-byte indirect records.
+ * registerDraws seeds indexCount/firstIndex/baseVertex; the GPU pack writes instanceCount/firstInstance
+ * each frame. packedEids holds one row-capacity-sized region per slot, compacted into pair slices for
+ * instance_index. pairCount is table count (entity table plus producer tables) * material-type count *
+ * key count * mesh count, where the key count is ALPHA_PIPELINE_KEY_COUNT per cull mode up to the
+ * highest any type's rows have held, and a pair's key is pipelineKey(alpha pipeline key, cull mode).
+ * Buffers grow with mesh registration, table capacity and active views; Draw.args.viewStride selects a slot.
+ */
+export interface MeshDrawBuffers {
+    /** `DrawIndexedIndirect` records, slot-major (`slot * pairCount + pair`); null until the first frame's `syncBuffers` */
+    drawArgs: DrawBuffer | null;
+    /** packed entity identities, one dense list per view slot; null until `warmMeshPreprocess` */
+    packedEids: InstanceBuffer | null;
+    /** sorted transparent identities, bound in place of `eids` for the transparent draw */
+    transparentEids: InstanceBuffer | null;
+    /** per-view transparent indirect records, CPU-staged after sorting */
+    transparentArgs: GPUBuffer | null;
+}
+
+interface MeshPreprocessState {
+    meshDraws: MeshDrawBuffers;
+    counts: AtomicU32Buffer | null;
+    meshBounds: MeshBoundsBuffer | null;
+    cullParams: (TgpuBuffer<typeof CullParams> & UniformFlag) | null;
+    cullGroup: TgpuBindGroup<(typeof cullLayout)["entries"]> | null;
+    countPipe: TgpuComputePipeline | null;
+    scanPipe: TgpuComputePipeline | null;
+    scatterPipe: TgpuComputePipeline | null;
+    countBound: { pipeline: GPUComputePipeline; groups: GPUBindGroup[] } | null;
+    scanBound: {
+        pipeline: GPUComputePipeline;
+        tileSum: GPUComputePipeline;
+        tileScan: GPUComputePipeline;
+        groups: GPUBindGroup[];
+    } | null;
+    tileSumPipe: TgpuComputePipeline | null;
+    tileScanPipe: TgpuComputePipeline | null;
+    scatterBound: { pipeline: GPUComputePipeline; groups: GPUBindGroup[] } | null;
+    batchCount: number;
+    /** each material type's pipelineKeys when draws were last registered */
+    pipelineKeys: Int32Array;
+    /** keys per material batch in pair indices; see {@link pipelineKeyCount} */
+    keyCount: number;
+    invalidPairs: Map<number, Map<number, { name: string; cause: string }>>;
+    pairingMeshes: (Mesh | undefined)[][];
+    recheckInstances: boolean;
+    warnedPairs: Set<string>;
+    meshCount: number;
+    meshVersion: number;
+    producerCount: number;
+    drawSlots: DrawSlot[];
+    drawLookup: DrawSlot[][][];
+    boundsData: Float32Array<ArrayBuffer>;
+    boundsWords: Uint32Array<ArrayBuffer>;
+    drawData: Uint32Array<ArrayBuffer>;
+    pairCount: number;
+    viewDim: number;
+    packPass: GPUComputePassDescriptor;
+    countsUnwrapped: AtomicU32Buffer | null;
+    countsRaw: GPUBuffer | null;
+    paramsTarget: (TgpuBuffer<typeof CullParams> & UniformFlag) | null;
+    paramsViewCount: number;
+    paramsPairCount: number;
+    paramsInstanceCount: number;
+    paramsInstanceCapacity: number;
+    rowCapacity: number;
+    inputGeneration: Int32Array;
+}
+
+/** @internal */
+export const meshPreprocessKey = { create: createMeshPreprocessState };
+const meshInstanceTableKey = { create: createMeshInstanceTable };
+
+/** Dense MeshInstance records shared by preprocessing and surface stages.
+ * External material sources may publish alphaMode, alphaCutoff, cullMode and cullBounds after table upload and
+ * before MeshPreprocessSystem. Preserve the other fields; address an entity through rowIndex(eid),
+ * or iterate activeRowsTyped's [eid, row] pairs. GPU writes do not change the CPU component columns. */
+export function meshInstanceTable(world: World) {
+    return world.resource(meshInstanceTableKey);
+}
+
+type MeshPair = {
+    eid: number;
+    owner: number;
+    mesh: number;
+    source: number;
+    row: number;
+    position: number;
+    queued: boolean;
+};
+type SourcePairs = {
+    source: MaterialSource;
+    consumers: (MeshPair[] | undefined)[];
+    absent: boolean[];
+};
+const meshPairsKey = {
+    create: () => ({
+        entities: [] as (MeshPair | undefined)[],
+        bins: new Map<number, number[]>(),
+        sources: [] as (SourcePairs | undefined)[],
+        pending: [] as MeshPair[],
+        pendingCount: 0,
+        changed: false,
+    }),
+};
+
+function detachSource(world: World, pair: MeshPair): void {
+    if (pair.source < 0) return;
+    const consumers = world.resource(meshPairsKey).sources[pair.source]!.consumers[pair.row]!;
+    const last = consumers.pop()!;
+    if (last !== pair) {
+        consumers[pair.position] = last;
+        last.position = pair.position;
+    }
+    pair.source = -1;
+}
+
+function queueMeshPair(world: World, pair: MeshPair): void {
+    if (pair.queued) return;
+    pair.queued = true;
+    const state = world.resource(meshPairsKey);
+    state.pending[state.pendingCount++] = pair;
+}
+
+function sourcePairs(world: World, type: number): SourcePairs {
+    const state = world.resource(meshPairsKey);
+    let entry = state.sources[type];
+    if (entry) return entry;
+    const source = world.resource(MaterialTypes).sources[type]!;
+    entry = { source, consumers: [], absent: [] };
+    state.sources[type] = entry;
+    const rows = entry;
+    world.onDispose(
+        source.table.observeRows((row, present) => {
+            rows.absent[row] = !present;
+            const consumers = rows.consumers[row];
+            if (consumers)
+                for (let i = 0; i < consumers.length; i++) queueMeshPair(world, consumers[i]!);
+        }),
+    );
+    return entry;
+}
+
+function setMeshPair(world: World, pair: MeshPair, owner: number): void {
+    const state = world.resource(meshPairsKey);
+    const index = world
+        .resource(meshResourcesKey)
+        .meshes.index(world.storage(MeshInstance).mesh.get(pair.eid));
+    if (index !== undefined && pair.owner === owner && pair.mesh === index) return;
+    removeMeshPair(world, pair.eid);
+    if (index === undefined) return;
+    let bin = state.bins.get(owner);
+    if (!bin) state.bins.set(owner, (bin = []));
+    const count = bin[index] ?? 0;
+    bin[index] = count + 1;
+    if (!count) state.changed = true;
+    pair.owner = owner;
+    pair.mesh = index;
+}
+
+function queueMaterialRow(world: World, type: number, row: number): void {
+    const consumers = world.resource(meshPairsKey).sources[type]?.consumers[row];
+    if (consumers) for (let i = 0; i < consumers.length; i++) queueMeshPair(world, consumers[i]!);
+}
+
+function syncBatches(world: World): void {
+    const buffer = world.resource(MaterialBatches).buffer;
+    if (!syncMaterialBatches(world, queueMaterialRow)) return;
+    if (world.resource(MaterialBatches).buffer !== buffer) unbind(world);
+    world.resource(meshPairsKey).changed = true;
+}
+
+function settleSourcePairs(world: World): void {
+    syncBatches(world);
+    const state = world.resource(meshPairsKey);
+    for (let i = 0; i < state.pendingCount; i++) {
+        const pair = state.pending[i]!;
+        pair.queued = false;
+        if (pair.source < 0 || !world.has(pair.eid, MeshInstance)) continue;
+        const entry = state.sources[pair.source]!;
+        if (entry.absent[pair.row]) {
+            removeMeshPair(world, pair.eid);
+            continue;
+        }
+        const source = entry.source;
+        const external = world.resource(MaterialTypes).types[pair.source]?.source;
+        const material = world.storage(MeshMaterial);
+        setMeshPair(
+            world,
+            pair,
+            materialBatch(world, pair.source, pair.row) * PIPELINE_KEY_LIMIT +
+                pipelineKey(
+                    alphaPipelineKey(
+                        external ? source.alphaMode(pair.row) : material.alphaMode.get(pair.eid),
+                    ),
+                    external
+                        ? (source.cullMode?.(pair.row) ?? CullModeCode.Back)
+                        : material.cullMode.get(pair.eid),
+                ),
+        );
+    }
+    state.pendingCount = 0;
+}
+
+function removeMeshPair(world: World, eid: number): void {
+    const state = world.resource(meshPairsKey);
+    const old = state.entities[eid];
+    if (!old || old.owner < 0) return;
+    const bin = state.bins.get(old.owner)!;
+    if (--bin[old.mesh]! === 0) state.changed = true;
+    old.owner = -1;
+}
+
+function prepareMeshPairs(world: World): void {
+    copyMeshAlpha(world);
+    const state = world.resource(meshPairsKey);
+    const material = world.storage(MeshMaterial);
+    const meshes = world.fieldStorage(MeshInstance, "mesh").dirty;
+    const types = world.fieldStorage(MeshMaterial, "type").dirty;
+    const materials = world.fieldStorage(MeshMaterial, "material").dirty;
+    const alpha = world.fieldStorage(MeshMaterial, "alphaMode").dirty;
+    const cull = world.fieldStorage(MeshMaterial, "cullMode").dirty;
+    const words = (world.entityHighWater + 31) >>> 5;
+    for (let word = 0; word < words; word++) {
+        let bits =
+            (meshes[word] ?? 0) |
+            (types[word] ?? 0) |
+            (materials[word] ?? 0) |
+            (alpha[word] ?? 0) |
+            (cull[word] ?? 0);
+        while (bits) {
+            const bit = bits & -bits;
+            bits ^= bit;
+            const eid = (word << 5) + 31 - Math.clz32(bit);
+            if (!world.has(eid, MeshInstance)) continue;
+            const type = material.type.get(eid);
+            let pair = state.entities[eid];
+            if (!pair)
+                state.entities[eid] = pair = {
+                    eid,
+                    owner: -1,
+                    mesh: 0,
+                    source: -1,
+                    row: -1,
+                    position: -1,
+                    queued: false,
+                };
+            if (world.resource(MaterialTypes).sources[type]) {
+                const row = material.material.get(eid);
+                if (pair.source !== type || pair.row !== row) {
+                    detachSource(world, pair);
+                    const entry = sourcePairs(world, type);
+                    let consumers = entry.consumers[row];
+                    if (!consumers) entry.consumers[row] = consumers = [];
+                    pair.source = type;
+                    pair.row = row;
+                    pair.position = consumers.length;
+                    consumers.push(pair);
+                }
+                queueMeshPair(world, pair);
+            } else {
+                detachSource(world, pair);
+                setMeshPair(
+                    world,
+                    pair,
+                    materialBatch(world, type, material.material.get(eid)) * PIPELINE_KEY_LIMIT +
+                        pipelineKey(
+                            alphaPipelineKey(material.alphaMode.get(eid)),
+                            material.cullMode.get(eid),
+                        ),
+                );
+            }
+        }
+    }
+}
+
+function createMeshInstanceTable(world: World) {
+    const table = world.table("meshInstances", EntityMeshInstanceInput);
+    table.setUploadPreparation(prepareMeshPairs);
+    table.enableEidLookup();
+    return table;
+}
+
+function createMeshPreprocessState(): MeshPreprocessState {
+    return {
+        meshDraws: {
+            drawArgs: null,
+            packedEids: null,
+            transparentEids: null,
+            transparentArgs: null,
+        },
+        counts: null,
+        meshBounds: null,
+        cullParams: null,
+        cullGroup: null,
+        countPipe: null,
+        scanPipe: null,
+        scatterPipe: null,
+        countBound: null,
+        scanBound: null,
+        tileSumPipe: null,
+        tileScanPipe: null,
+        scatterBound: null,
+        batchCount: 0,
+        pipelineKeys: new Int32Array(0),
+        keyCount: ALPHA_PIPELINE_KEY_COUNT,
+        invalidPairs: new Map(),
+        pairingMeshes: [],
+        recheckInstances: false,
+        warnedPairs: new Set(),
+        meshCount: 0,
+        meshVersion: -1,
+        producerCount: 0,
+        drawSlots: [],
+        drawLookup: [],
+        boundsData: new Float32Array(0),
+        boundsWords: new Uint32Array(0),
+        drawData: new Uint32Array(0),
+        pairCount: 0,
+        viewDim: 1,
+        packPass: { label: "shallot-mesh-preprocess" },
+        countsUnwrapped: null,
+        countsRaw: null,
+        paramsTarget: null,
+        paramsViewCount: -1,
+        paramsPairCount: -1,
+        paramsInstanceCount: -1,
+        paramsInstanceCapacity: -1,
+        rowCapacity: 0,
+        inputGeneration: new Int32Array(4).fill(-1),
+    };
+}
+
+export function initializeMeshPreprocess(world: World): void {
+    world.resource(meshPreprocessKey);
+    const table = meshInstanceTable(world);
+    table.bindComponent(MeshInstance, { mesh: "mesh", cullBounds: "cullBounds" });
+    table.bindFields(MeshMaterial, {
+        material: "material",
+        materialType: "type",
+        alphaMode: "alphaMode",
+        alphaCutoff: "alphaCutoff",
+        cullMode: "cullMode",
+    });
+    table.bindPresence(NotShadowCaster, "flags", 1);
+    table.bindFields(RenderLayers, { layers: "mask" });
+    table.bindPresence(RenderLayers, "flags", 2);
+    const seedDefault = (eid: number) => {
+        if (!world.has(eid, MeshMaterial)) {
+            world.storage(MeshMaterial).material.set(eid, 0);
+            world.storage(MeshMaterial).type.set(eid, 0);
+            world.storage(MeshMaterial).alphaMode.set(eid, 0);
+            world.storage(MeshMaterial).alphaCutoff.set(eid, 0.5);
+            world.storage(MeshMaterial).cullMode.set(eid, CullModeCode.Back);
+        }
+    };
+    world.onDispose(
+        world.observeMembership(MeshInstance, (eid, present) => {
+            if (present) seedDefault(eid);
+            else {
+                const pair = world.resource(meshPairsKey).entities[eid];
+                if (pair) detachSource(world, pair);
+                removeMeshPair(world, eid);
+            }
+        }),
+    );
+    for (const eid of world.query([MeshInstance])) seedDefault(eid);
+}
+
+export const MeshDrawBuffers: import("../../engine").Resource<MeshDrawBuffers> = {
+    create: (world) => world.resource(meshPreprocessKey).meshDraws,
+};
+
+// Count and scatter use the same visibility test so their per-pair ranges agree.
+export const MeshPreprocessSystem: System = {
+    group: "draw",
+    after: [BeginFrameSystem],
+    update(world) {
+        uploadInstanceData(world);
+        const _render = world.resource(RenderContext);
+        const _meshPreprocess = world.resource(meshPreprocessKey);
+
+        if (!_meshPreprocess.countPipe || !_meshPreprocess.scanPipe || !_meshPreprocess.scatterPipe)
+            return;
+        syncBuffers(world);
+        if (_meshPreprocess.pairCount === 0) return;
+        publishMeshCounts(world, world.gpu.root.unwrap(_meshPreprocess.meshDraws.drawArgs!));
+        const count = bindCount(world);
+        const scan = bindScan(world);
+        const scatter = bindScatter(world);
+        if (!count || !scan || !scatter) return;
+
+        // viewCount + pairCount let the cull shader find a view's frustum and
+        // index its slot's slice; slot ≥ viewCount means no frustum (headless),
+        // packed unculled. The engine submits after this pass.
+        const views = Math.max(1, _render.viewCount);
+        const instanceCount = meshInstanceTable(world).count;
+        if (
+            _meshPreprocess.paramsTarget !== _meshPreprocess.cullParams ||
+            _meshPreprocess.paramsViewCount !== _render.viewCount ||
+            _meshPreprocess.paramsPairCount !== _meshPreprocess.pairCount ||
+            _meshPreprocess.paramsInstanceCount !== instanceCount ||
+            _meshPreprocess.paramsInstanceCapacity !== _meshPreprocess.rowCapacity
+        ) {
+            _meshPreprocess.cullParams!.write({
+                viewCount: _render.viewCount,
+                pairCount: _meshPreprocess.pairCount,
+                meshCount: _meshPreprocess.meshCount,
+                keyCount: _meshPreprocess.keyCount,
+                instanceCount,
+                instanceCapacity: _meshPreprocess.rowCapacity,
+            });
+            _meshPreprocess.paramsTarget = _meshPreprocess.cullParams;
+            _meshPreprocess.paramsViewCount = _render.viewCount;
+            _meshPreprocess.paramsPairCount = _meshPreprocess.pairCount;
+            _meshPreprocess.paramsInstanceCount = instanceCount;
+            _meshPreprocess.paramsInstanceCapacity = _meshPreprocess.rowCapacity;
+        }
+
+        if (_meshPreprocess.countsUnwrapped !== _meshPreprocess.counts) {
+            _meshPreprocess.countsUnwrapped = _meshPreprocess.counts;
+            _meshPreprocess.countsRaw = world.gpu.root.unwrap(_meshPreprocess.counts!);
+        }
+        prepareProducerPack(world);
+        const encoder = world.frameEncoder()!;
+        encoder.clearBuffer(_meshPreprocess.countsRaw!);
+        _meshPreprocess.packPass.timestampWrites = world.gpu.span?.("mesh:preprocess");
+        const pass = beginComputePass(encoder, _meshPreprocess.packPass);
+        const rows = Math.ceil(instanceCount / 64);
+        if (rows > 0) {
+            setBound(pass, count);
+            dispatchWorkgroups2(pass, rows, views);
+        }
+        countProducers(world, pass);
+        // Only live view slots are scanned; a slot that becomes live again is scanned before its draw.
+        const tiles = Math.ceil(_meshPreprocess.pairCount / 256);
+        setComputePipeline(pass, scan.tileSum);
+        for (let i = 0; i < scan.groups.length; i++) setComputeBindGroup(pass, i, scan.groups[i]!);
+        dispatchWorkgroups2(pass, tiles, views);
+        setComputePipeline(pass, scan.tileScan);
+        dispatchWorkgroups(pass, views);
+        setComputePipeline(pass, scan.pipeline);
+        dispatchWorkgroups2(pass, tiles, views);
+        if (rows > 0) {
+            setBound(pass, scatter);
+            dispatchWorkgroups2(pass, rows, views);
+        }
+        scatterProducers(world, pass);
+        endComputePass(pass);
+    },
+};
+
+function setBound(
+    pass: GPUComputePassEncoder,
+    bound: { pipeline: GPUComputePipeline; groups: GPUBindGroup[] },
+): void {
+    setComputePipeline(pass, bound.pipeline);
+    for (let i = 0; i < bound.groups.length; i++) setComputeBindGroup(pass, i, bound.groups[i]!);
+}
+
+// Bind dense MeshInstance and Transform tables, replacing groups only when one of their GPU buffers grows.
+function cullGroup(world: World): TgpuBindGroup<(typeof cullLayout)["entries"]> | null {
+    const _meshPreprocess = world.resource(meshPreprocessKey);
+
+    if (!_meshPreprocess.cullParams || !_meshPreprocess.meshBounds) return null;
+    const meshInstances = meshInstanceTable(world);
+    const globalTransforms = globalTransformTable(world);
+    const generation = _meshPreprocess.inputGeneration;
+    if (
+        generation[0] !== meshInstances.generation ||
+        generation[1] !== meshInstances.activeGeneration ||
+        generation[2] !== globalTransforms.generation ||
+        generation[3] !== globalTransforms.mapGeneration
+    ) {
+        unbind(world);
+        generation[0] = meshInstances.generation;
+        generation[1] = meshInstances.activeGeneration;
+        generation[2] = globalTransforms.generation;
+        generation[3] = globalTransforms.mapGeneration;
+    }
+    if (_meshPreprocess.cullGroup) return _meshPreprocess.cullGroup;
+    const cullVolumes = world.resource(RenderContext).cullVolumes;
+    const instanceRows = meshInstances.activeRowsBuffer;
+    const globalTransformRows = globalTransforms.eidToRowBuffer;
+    if (!cullVolumes || !instanceRows || !globalTransformRows) {
+        throw new Error(
+            "[mesh-preprocess] dense table inputs missing: cull volumes, MeshInstance rows or GlobalTransform row lookup",
+        );
+    }
+    _meshPreprocess.cullGroup = world.gpu.root.createBindGroup(cullLayout, {
+        instanceRows,
+        instances: meshInstances.buffer,
+        globalTransforms: globalTransforms.buffer,
+        globalTransformRows,
+        meshBounds: _meshPreprocess.meshBounds,
+        materialBatches: world.resource(MaterialBatches).buffer!,
+        cullVolumes,
+        params: _meshPreprocess.cullParams,
+    });
+    return _meshPreprocess.cullGroup;
+}
+
+function bindCount(world: World): { pipeline: GPUComputePipeline; groups: GPUBindGroup[] } | null {
+    const _meshPreprocess = world.resource(meshPreprocessKey);
+
+    const cull = cullGroup(world);
+    if (_meshPreprocess.countBound) return _meshPreprocess.countBound;
+    if (!_meshPreprocess.countPipe || !cull || !_meshPreprocess.counts) return null;
+    _meshPreprocess.countBound = {
+        pipeline: world.gpu.root.unwrap(_meshPreprocess.countPipe),
+        groups: [
+            world.gpu.root.unwrap(cull),
+            world.gpu.root.unwrap(
+                world.gpu.root.createBindGroup(countLayout, { counts: _meshPreprocess.counts }),
+            ),
+        ],
+    };
+    return _meshPreprocess.countBound;
+}
+
+function bindScan(world: World): MeshPreprocessState["scanBound"] {
+    const _meshPreprocess = world.resource(meshPreprocessKey);
+    const _meshDraws = world.resource(MeshDrawBuffers);
+
+    if (_meshPreprocess.scanBound) return _meshPreprocess.scanBound;
+    if (
+        !_meshPreprocess.scanPipe ||
+        !_meshPreprocess.counts ||
+        !_meshDraws.drawArgs ||
+        !_meshPreprocess.cullParams
+    )
+        return null;
+    _meshPreprocess.scanBound = {
+        pipeline: world.gpu.root.unwrap(_meshPreprocess.scanPipe),
+        tileSum: world.gpu.root.unwrap(_meshPreprocess.tileSumPipe!),
+        tileScan: world.gpu.root.unwrap(_meshPreprocess.tileScanPipe!),
+        groups: [
+            world.gpu.root.unwrap(
+                world.gpu.root.createBindGroup(scanLayout, {
+                    counts: _meshPreprocess.counts,
+                    drawArgs: _meshDraws.drawArgs,
+                    params: _meshPreprocess.cullParams,
+                }),
+            ),
+        ],
+    };
+    return _meshPreprocess.scanBound;
+}
+
+function bindScatter(
+    world: World,
+): { pipeline: GPUComputePipeline; groups: GPUBindGroup[] } | null {
+    const _meshPreprocess = world.resource(meshPreprocessKey);
+    const _meshDraws = world.resource(MeshDrawBuffers);
+
+    const cull = cullGroup(world);
+    if (_meshPreprocess.scatterBound) return _meshPreprocess.scatterBound;
+    if (
+        !_meshPreprocess.scatterPipe ||
+        !cull ||
+        !_meshPreprocess.counts ||
+        !_meshDraws.drawArgs ||
+        !_meshDraws.packedEids
+    )
+        return null;
+    _meshPreprocess.scatterBound = {
+        pipeline: world.gpu.root.unwrap(_meshPreprocess.scatterPipe),
+        groups: [
+            world.gpu.root.unwrap(cull),
+            world.gpu.root.unwrap(
+                world.gpu.root.createBindGroup(scatterLayout, {
+                    drawArgs: world.gpu.root.unwrap(_meshDraws.drawArgs),
+                    packedEids: _meshDraws.packedEids,
+                }),
+            ),
+        ],
+    };
+    return _meshPreprocess.scatterBound;
+}
+
+// every bound pipeline names at least one buffer `syncBuffers` can reallocate, so growth drops all of
+// them together rather than tracking which buffer each one holds
+function unbind(world: World): void {
+    const _meshPreprocess = world.resource(meshPreprocessKey);
+
+    _meshPreprocess.cullGroup = null;
+    _meshPreprocess.countBound = null;
+    _meshPreprocess.scanBound = null;
+    _meshPreprocess.scatterBound = null;
+}
+
+// Mesh growth changes pair strides, requiring draw-record republication. drawArgs/counts scale with
+// view capacity * pairCount; packed lists with view capacity * row capacity; mesh bounds with mesh count.
+// Pipelines read cullParams/arrayLength, so growing any axis replaces buffers without recompilation.
+// Submitted work retains old backing storage.
+function syncBuffers(world: World): void {
+    const _meshPreprocess = world.resource(meshPreprocessKey);
+    const _meshDraws = world.resource(MeshDrawBuffers);
+
+    settleSourcePairs(world);
+    const batchCount = world.resource(MaterialBatches).types.length;
+    const changedBatches = batchCount !== _meshPreprocess.batchCount;
+    _meshPreprocess.batchCount = batchCount;
+    if (batchCount === 0) return;
+    const meshes = world.resource(meshResourcesKey).meshes;
+    const meshCount = meshes.capacity;
+    const changedMeshes = meshes.version !== _meshPreprocess.meshVersion;
+    if (changedMeshes) {
+        const entities = world.resource(meshPairsKey).entities;
+        const column = world.storage(MeshInstance).mesh;
+        for (let eid = 0; eid < entities.length; eid++) {
+            const pair = entities[eid];
+            if (pair && pair.owner >= 0 && meshes.index(column.get(eid)) === undefined)
+                removeMeshPair(world, eid);
+        }
+    }
+    const viewCount = Math.max(1, world.resource(RenderContext).viewCount);
+    const producers = world.resource(producerTables).tables.length;
+    const growProducers = producers !== _meshPreprocess.producerCount;
+    const rowCapacity = meshInstanceTable(world).capacity + producerCapacity(world);
+    const growMesh = meshCount > _meshPreprocess.meshCount;
+    const growView = viewCount > _meshPreprocess.viewDim;
+    const growRows = rowCapacity > _meshPreprocess.rowCapacity;
+    const pairs = world.resource(meshPairsKey);
+    const changedPairs = pairs.changed;
+    const growKeys = pipelineKeysChanged(world);
+    const keyCount = Math.max(
+        _meshPreprocess.keyCount,
+        pipelineKeyCount(world.resource(MaterialTypes).sources),
+    );
+    const growStride = keyCount > _meshPreprocess.keyCount;
+    if (changedMeshes || growMesh || growView || growKeys || growProducers || changedBatches) {
+        const meshDim = Math.max(_meshPreprocess.meshCount, meshCount);
+        const viewDim = growView
+            ? Math.min(MAX_SLOTS, Math.max(viewCount, _meshPreprocess.viewDim * 2))
+            : _meshPreprocess.viewDim;
+        rebuildMeshCounts(
+            world,
+            meshDim,
+            (1 + producers) * _meshPreprocess.batchCount * keyCount * meshDim,
+            viewDim,
+        );
+    }
+    if (
+        !changedMeshes &&
+        !changedBatches &&
+        !growMesh &&
+        !growView &&
+        !growRows &&
+        !growProducers &&
+        !growStride &&
+        _meshDraws.drawArgs
+    ) {
+        if (growKeys || changedPairs) registerDraws(world);
+        return;
+    }
+
+    const device = world.gpu.device;
+    _meshPreprocess.meshCount = Math.max(_meshPreprocess.meshCount, meshCount);
+    // Geometric growth bounds reallocations when cameras arrive one at a time.
+    if (growView)
+        _meshPreprocess.viewDim = Math.min(
+            MAX_SLOTS,
+            Math.max(viewCount, _meshPreprocess.viewDim * 2),
+        );
+    _meshPreprocess.rowCapacity = Math.max(_meshPreprocess.rowCapacity, rowCapacity);
+    _meshPreprocess.producerCount = producers;
+    _meshPreprocess.keyCount = keyCount;
+    _meshPreprocess.pairCount =
+        (1 + producers) * _meshPreprocess.batchCount * keyCount * _meshPreprocess.meshCount;
+    const records = _meshPreprocess.viewDim * _meshPreprocess.pairCount;
+
+    let staleArgs: DrawBuffer | null = null;
+    let staleCounts: AtomicU32Buffer | null = null;
+    const replaceArgs =
+        !_meshDraws.drawArgs ||
+        d.sizeOf(_meshDraws.drawArgs.dataType) !== records * DRAW_ARG_STRIDE;
+    if (replaceArgs) {
+        staleArgs = _meshDraws.drawArgs;
+        staleCounts = _meshPreprocess.counts;
+        _meshDraws.drawArgs = world.gpu.root
+            .createBuffer(d.arrayOf(DrawIndexedIndirect, records))
+            .$usage("storage", "indirect")
+            .$name("shallot-draw-args");
+        _meshPreprocess.counts = world.gpu.root
+            .createBuffer(
+                d.arrayOf(
+                    d.atomic(d.u32),
+                    records + _meshPreprocess.viewDim * Math.ceil(_meshPreprocess.pairCount / 256),
+                ),
+            )
+            .$usage("storage")
+            .$name("shallot-mesh-preprocess-counts");
+    }
+
+    let stalePacked: InstanceBuffer | null = null;
+    let staleTransparentEids: InstanceBuffer | null = null;
+    let staleTransparentArgs: GPUBuffer | null = null;
+    if (growView || growRows || !_meshDraws.packedEids) {
+        stalePacked = _meshDraws.packedEids;
+        const listCapacity = _meshPreprocess.viewDim * _meshPreprocess.rowCapacity;
+        _meshDraws.packedEids = world.gpu.root
+            .createBuffer(d.arrayOf(d.vec4u, listCapacity))
+            .$usage("storage")
+            .$name("shallot-packed-eids");
+
+        const transparentCapacity = _meshPreprocess.viewDim * meshInstanceTable(world).capacity;
+        staleTransparentEids = _meshDraws.transparentEids;
+        _meshDraws.transparentEids = world.gpu.root
+            .createBuffer(d.arrayOf(d.vec4u, transparentCapacity))
+            .$usage("storage")
+            .$name("shallot-transparent-eids");
+        staleTransparentArgs = _meshDraws.transparentArgs;
+        _meshDraws.transparentArgs = device.createBuffer({
+            label: "shallot-transparent-args",
+            size: Math.max(20, transparentCapacity * d.sizeOf(DrawIndexedIndirect)),
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE,
+        });
+        world.own(_meshDraws.transparentArgs);
+    }
+
+    // Bounds follow membership even when a freed index is reused without growth.
+    let staleBounds: MeshBoundsBuffer | null = null;
+    if (growMesh || !_meshPreprocess.meshBounds) {
+        staleBounds = _meshPreprocess.meshBounds;
+        _meshPreprocess.meshBounds = world.gpu.root
+            .createBuffer(d.arrayOf(MeshBounds, _meshPreprocess.meshCount))
+            .$usage("storage")
+            .$name("shallot-mesh-bounds");
+    }
+    if (changedMeshes || staleBounds) writeMeshBounds(world, device);
+
+    if (replaceArgs || growView || growRows || staleBounds) unbind(world);
+    if (changedMeshes || replaceArgs || growKeys || changedPairs) registerDraws(world);
+    _meshPreprocess.meshVersion = meshes.version;
+
+    // Replaced bindings cannot be used by this frame; submitted work retains its backing storage.
+    staleArgs?.destroy();
+    staleCounts?.destroy();
+    stalePacked?.destroy();
+    staleTransparentEids?.destroy();
+    staleBounds?.destroy();
+    staleTransparentArgs?.destroy();
+}
+
+function prepareProducerPack(world: World): void {
+    if (!world.resource(producerTables).tables.length) return;
+    const state = world.resource(meshPreprocessKey);
+    syncProducerPack(
+        world,
+        world.gpu.root.unwrap(state.meshBounds!),
+        world.gpu.root.unwrap(state.cullParams!),
+        world.gpu.root.unwrap(state.counts!),
+        world.gpu.root.unwrap(state.meshDraws.drawArgs!),
+        world.gpu.root.unwrap(state.meshDraws.packedEids!),
+        world.gpu.root.unwrap(world.resource(MaterialBatches).buffer!),
+        state.batchCount * state.keyCount * state.meshCount,
+    );
+}
+
+function pipelineKeysChanged(world: World): boolean {
+    world.resource(TransparentMeshes).growSources();
+    const known = world.resource(meshPreprocessKey).pipelineKeys;
+    const sources = world.resource(MaterialTypes).sources;
+    for (let type = 0; type < known.length; type++)
+        if ((sources[type]?.pipelineKeys ?? 0) !== known[type]) return true;
+    return false;
+}
+
+/** Keys per material batch in this World's pair indices, as last sized for draw publication. @internal */
+export function meshKeyCount(world: World): number {
+    return world.resource(meshPreprocessKey).keyCount;
+}
+
+/**
+ * Fill the dense per-mesh table with a live handle and local bounding sphere
+ * (`xyz` center, `w` radius). A mesh without `bounds` (a procedural
+ * producer that didn't supply one) gets a sentinel radius so the cull keeps it
+ * always-visible rather than wrongly culling it
+ */
+function writeMeshBounds(world: World, device: GPUDevice): void {
+    const _meshPreprocess = world.resource(meshPreprocessKey);
+    const _meshes = world.resource(meshResourcesKey).meshes;
+
+    const buffer = _meshPreprocess.meshBounds!;
+    if (_meshPreprocess.boundsData.length < _meshPreprocess.meshCount * 8) {
+        _meshPreprocess.boundsData = new Float32Array(
+            Math.max(_meshPreprocess.meshCount * 8, _meshPreprocess.boundsData.length * 2),
+        );
+        _meshPreprocess.boundsWords = new Uint32Array(_meshPreprocess.boundsData.buffer);
+    }
+    const data = _meshPreprocess.boundsData;
+    const words = _meshPreprocess.boundsWords;
+    data.fill(0);
+    for (let index = 0; index < _meshPreprocess.meshCount; index++) {
+        words[index * 8 + 4] = 0xffffffff;
+        const handle = _meshes.handleAt(index);
+        const mesh = handle === undefined ? undefined : _meshes.get(handle);
+        if (!mesh) continue;
+        words[index * 8 + 4] = handle!;
+        if (mesh.bounds) data.set(mesh.bounds, index * 8);
+        else data[index * 8 + 3] = 1e30; // never-cull sentinel
+    }
+    device.queue.writeBuffer(
+        world.gpu.root.unwrap(buffer),
+        0,
+        data,
+        0,
+        _meshPreprocess.meshCount * 8,
+    );
+}
+
+type DrawSlot = {
+    draw: Draw;
+    material: { type: number; material: number };
+    active: boolean;
+    seen: boolean;
+};
+
+/** Whether this exact draw is a reserved entity-pair recipe, including pairs with no live rows. @internal */
+export function isMeshInstanceDraw(world: World, draw: Draw): boolean {
+    const state = world.resource(meshPreprocessKey);
+    const index = world.resource(meshResourcesKey).meshes.index(draw.mesh);
+    return (
+        index !== undefined &&
+        state.drawLookup[0]?.[
+            materialBatch(world, draw.material.type, draw.material.material) * PIPELINE_KEY_LIMIT +
+                pipelineKey(draw.alphaPipelineKey, draw.cullMode ?? CullModeCode.Back)
+        ]?.[index]?.draw === draw
+    );
+}
+
+function publishDraw(
+    world: World,
+    table: number,
+    batch: number,
+    alpha: number,
+    cull: number,
+    handle: number,
+    pair: number,
+    indirect: DrawBuffer,
+): void {
+    const state = world.resource(meshPreprocessKey);
+    const type = world.resource(MaterialBatches).types[batch]!;
+    const owner = batch * PIPELINE_KEY_LIMIT + pipelineKey(alpha, cull);
+    let tableLookup = state.drawLookup[table];
+    if (!tableLookup) state.drawLookup[table] = tableLookup = [];
+    let lookup = tableLookup[owner];
+    if (!lookup) tableLookup[owner] = lookup = [];
+    const index = world.resource(meshResourcesKey).meshes.index(handle)!;
+    let slot = lookup[index];
+    const producers = world.resource(producerTables);
+    if (!slot) {
+        const key = cull === CullModeCode.Back ? `${alpha}` : `${alpha}:cull${cull}`;
+        const name =
+            table === 0
+                ? `mesh:material:${world.resource(MaterialTypes).types[type]!.name}:batch${batch}:${key}:${index}`
+                : `producer:${producers.tables[table - 1]!.table.name}:${batch}:${key}:${index}`;
+        const material = {
+            type,
+            material: world.resource(MaterialBatches).representatives[batch]!,
+        };
+        slot = {
+            material,
+            draw: {
+                name,
+                material,
+                alphaPipelineKey: alpha,
+                ...(cull === CullModeCode.Back ? {} : { cullMode: cull }),
+                mesh: handle as MeshHandle,
+                args: { indirect, offset: 0, viewStride: 0 },
+            },
+            active: false,
+            seen: false,
+        };
+        lookup[index] = slot;
+        state.drawSlots.push(slot);
+    }
+    if (slot.seen) return;
+    slot.seen = true;
+    const draw = slot.draw;
+    const row = world.resource(MaterialBatches).representatives[batch]!;
+    slot.material.type = type;
+    slot.material.material = row;
+    draw.mesh = handle as MeshHandle;
+    draw.args.indirect = indirect;
+    draw.args.offset = pair * DRAW_ARG_STRIDE;
+    draw.args.viewStride = state.pairCount * DRAW_ARG_STRIDE;
+    const mesh = world.resource(Meshes).get(handle as MeshHandle)!;
+    const offset = pair * 5;
+    state.drawData[offset] = mesh.indexCount;
+    state.drawData[offset + 2] = mesh.indexBase;
+    if (!slot.active) {
+        world.resource(Draws).register(draw);
+        if (table !== 0) producers.draws.set(draw.name, producers.tables[table - 1]!.table);
+        slot.active = true;
+    }
+}
+
+/**
+ * Publishes occupied (material batch, pipeline key, mesh) draw pairs.
+ * Source-backed keys resolve through alphaMode/cullMode after table upload; the table's row
+ * notifications invalidate only that row's live mesh consumers. pipelineKeys reserves compilation
+ * variants, not draws.
+ * Reuses one CPU record per pair and publishes the current slot image. @internal
+ */
+export function publishMeshInstanceDraws(
+    world: World,
+    drawArgs: DrawBuffer,
+    pairCount: number,
+): void {
+    const { types: materialTypes } = world.resource(MaterialTypes);
+    const meshes = world.resource(meshResourcesKey).meshes;
+    const state = world.resource(meshPreprocessKey);
+    const invalidPairs = state.invalidPairs;
+    const batches = world.resource(MaterialBatches).types;
+    for (let batch = 0; batch < batches.length; batch++) {
+        const materialType = batches[batch]!;
+        const definition = materialTypes[materialType];
+        if (!definition) continue;
+        let known = state.pairingMeshes[materialType];
+        if (!known) state.pairingMeshes[materialType] = known = [];
+        let rejected = invalidPairs.get(materialType);
+        for (let index = 0; index < state.meshCount; index++) {
+            const handle = meshes.handleAt(index);
+            const mesh = handle === undefined ? undefined : meshes.get(handle);
+            if (known[index] === mesh) continue;
+            known[index] = mesh;
+            const cause = mesh ? materialAttributeError(mesh, definition) : null;
+            if (cause) {
+                if (!rejected) invalidPairs.set(materialType, (rejected = new Map()));
+                rejected.set(index, {
+                    name: `mesh:material:${definition.name}:${mesh!.name}:${index}`,
+                    cause,
+                });
+                state.recheckInstances = true;
+            } else rejected?.delete(index);
+        }
+        for (let key = 0; key < state.keyCount; key++) {
+            const occupied = world
+                .resource(meshPairsKey)
+                .bins.get(batch * PIPELINE_KEY_LIMIT + key);
+            if (!occupied) continue;
+            const alpha = key % ALPHA_PIPELINE_KEY_COUNT;
+            const cull = (key - alpha) / ALPHA_PIPELINE_KEY_COUNT;
+            for (let index = 0; index < state.meshCount; index++) {
+                const handle = meshes.handleAt(index);
+                const m = handle === undefined ? undefined : meshes.get(handle);
+                if (!m || !occupied[index]) continue;
+                if (rejected?.has(index)) continue;
+                const pair =
+                    (batch * state.keyCount + key) *
+                        (pairCount / (batches.length * state.keyCount)) +
+                    index;
+                publishDraw(world, 0, batch, alpha, cull, handle!, pair, drawArgs);
+            }
+        }
+    }
+}
+
+function publishProducerDraws(world: World, basePairs: number): void {
+    const state = world.resource(meshPreprocessKey);
+    const producers = world.resource(producerTables);
+    const types = world.resource(MaterialTypes).types;
+    const meshes = world.resource(meshResourcesKey).meshes;
+    for (let tableIndex = 0; tableIndex < producers.tables.length; tableIndex++) {
+        const entry = producers.tables[tableIndex]!;
+        for (const material of entry.materials) {
+            const definition = types[material.type];
+            if (!definition) continue;
+            const batch = materialBatch(world, material.type, material.material);
+            if (batch === 0xffffffff) continue;
+            const alphaKey = alphaPipelineKey(material.alphaMode);
+            for (const handle of entry.meshes) {
+                const mesh = meshes.get(handle);
+                if (!mesh || materialAttributeError(mesh, definition)) continue;
+                const pair =
+                    (tableIndex + 1) * basePairs +
+                    (batch * state.keyCount + pipelineKey(alphaKey, material.cullMode)) *
+                        state.meshCount +
+                    meshes.index(handle)!;
+                publishDraw(
+                    world,
+                    tableIndex + 1,
+                    batch,
+                    alphaKey,
+                    material.cullMode,
+                    handle,
+                    pair,
+                    state.meshDraws.drawArgs!,
+                );
+            }
+        }
+    }
+}
+
+function warnInvalidInstance(world: World, eid: number): void {
+    if (!world.has(eid, MeshInstance)) return;
+    const { invalidPairs, warnedPairs } = world.resource(meshPreprocessKey);
+    const rejected = invalidPairs
+        .get(world.storage(MeshMaterial).type.get(eid))
+        ?.get(
+            world
+                .resource(meshResourcesKey)
+                .meshes.index(world.storage(MeshInstance).mesh.get(eid))!,
+        );
+    if (!rejected || warnedPairs.has(rejected.name)) return;
+    warnedPairs.add(rejected.name);
+    console.warn(`standard: draw "${rejected.name}" skipped — ${rejected.cause}`);
+}
+
+export const MeshPairingSystem: System = {
+    group: "draw",
+    first: true,
+    before: [ClearChangeMarksSystem],
+    update(world) {
+        if (world.resource(meshPreprocessKey).invalidPairs.size === 0) return;
+        const meshes = world.fieldStorage(MeshInstance, "mesh").dirty;
+        const types = world.fieldStorage(MeshMaterial, "type").dirty;
+        const words = (world.entityHighWater + 31) >>> 5;
+        for (let word = 0; word < words; word++) {
+            let bits = (meshes[word] ?? 0) | (types[word] ?? 0);
+            while (bits) {
+                const bit = bits & -bits;
+                warnInvalidInstance(world, (word << 5) + 31 - Math.clz32(bit));
+                bits ^= bit;
+            }
+        }
+    },
+};
+
+function registerDraws(world: World): void {
+    const _meshDraws = world.resource(MeshDrawBuffers);
+    const _meshPreprocess = world.resource(meshPreprocessKey);
+
+    if (!world.gpu.device || !_meshDraws.drawArgs || _meshPreprocess.pairCount === 0) return;
+    const viewStride = _meshPreprocess.pairCount * DRAW_ARG_STRIDE;
+    // One slot image is retained across membership changes; absent pairs are zero records.
+    if (_meshPreprocess.drawData.byteLength < viewStride)
+        _meshPreprocess.drawData = new Uint32Array(
+            Math.max(viewStride / 4, _meshPreprocess.drawData.length * 2),
+        );
+    const slot = _meshPreprocess.drawData;
+    slot.fill(0);
+    for (let i = 0; i < _meshPreprocess.drawSlots.length; i++)
+        _meshPreprocess.drawSlots[i]!.seen = false;
+    const basePairs =
+        _meshPreprocess.batchCount * _meshPreprocess.keyCount * _meshPreprocess.meshCount;
+    _meshPreprocess.recheckInstances = false;
+    publishMeshInstanceDraws(world, _meshDraws.drawArgs, basePairs);
+    publishProducerDraws(world, basePairs);
+    for (let i = 0; i < _meshPreprocess.drawSlots.length; i++) {
+        const entry = _meshPreprocess.drawSlots[i]!;
+        if (entry.active && !entry.seen) {
+            world.resource(Draws).delete(entry.draw.name);
+            const producers = world.resource(producerTables).draws;
+            if (producers.has(entry.draw.name)) producers.set(entry.draw.name, null);
+            entry.active = false;
+        }
+    }
+    // A new rejection can affect unchanged instances; ordinary frames check only marked pairings.
+    if (_meshPreprocess.recheckInstances)
+        for (const eid of world.query(MESH_INSTANCES)) warnInvalidInstance(world, eid);
+    const target = world.gpu.root.unwrap(_meshDraws.drawArgs);
+    for (let view = 0; view < _meshPreprocess.viewDim; view++)
+        world.gpu.device.queue.writeBuffer(target, view * viewStride, slot, 0, viewStride / 4);
+    const sources = world.resource(MaterialTypes).sources;
+    for (let type = 0; type < _meshPreprocess.pipelineKeys.length; type++)
+        _meshPreprocess.pipelineKeys[type] = sources[type]?.pipelineKeys ?? 0;
+    world.resource(meshPairsKey).changed = false;
+}
+
+export function initMeshPreprocess(world: World): void {
+    unbind(world);
+}
+
+// Warm runs after material registration. Mesh/view dimensions remain dynamic in cullParams.
+export function warmMeshPreprocess(world: World): void {
+    const _meshPreprocess = world.resource(meshPreprocessKey);
+    const _meshDraws = world.resource(MeshDrawBuffers);
+
+    if (!world.gpu.device) return;
+    const root = world.gpu.root;
+    syncMaterialBatches(world);
+    _meshPreprocess.batchCount = world.resource(MaterialBatches).types.length;
+    _meshPreprocess.pipelineKeys = new Int32Array(world.resource(MaterialTypes).types.length);
+    _meshPreprocess.keyCount = ALPHA_PIPELINE_KEY_COUNT;
+    _meshPreprocess.meshCount = 0;
+    _meshPreprocess.pairCount = 0;
+    _meshPreprocess.viewDim = 1;
+    _meshDraws.drawArgs = null;
+    _meshDraws.packedEids = null;
+    _meshDraws.transparentEids = null;
+    _meshDraws.transparentArgs = null;
+    _meshPreprocess.counts = null;
+    _meshPreprocess.meshBounds = null;
+    _meshPreprocess.rowCapacity = 0;
+    _meshPreprocess.inputGeneration.fill(-1);
+    _meshPreprocess.paramsViewCount = -1;
+    _meshPreprocess.paramsPairCount = -1;
+    _meshPreprocess.paramsInstanceCount = -1;
+    _meshPreprocess.paramsInstanceCapacity = -1;
+    unbind(world);
+
+    _meshPreprocess.cullParams = root
+        .createBuffer(CullParams)
+        .$usage("uniform")
+        .$name("shallot-mesh-preprocess-cull-params");
+    if (_meshPreprocess.batchCount === 0) return;
+
+    _meshPreprocess.countPipe = root
+        .createComputePipeline({ compute: countKernel() })
+        .$name("shallot-mesh-preprocess-count");
+    _meshPreprocess.scanPipe = root
+        .createComputePipeline({ compute: scanKernel() })
+        .$name("shallot-mesh-preprocess-scan");
+    _meshPreprocess.tileSumPipe = root
+        .createComputePipeline({ compute: tileSumKernel() })
+        .$name("shallot-mesh-preprocess-tile-sum");
+    _meshPreprocess.tileScanPipe = root
+        .createComputePipeline({ compute: tileScanKernel() })
+        .$name("shallot-mesh-preprocess-tile-scan");
+    _meshPreprocess.scatterPipe = root
+        .createComputePipeline({ compute: scatterKernel() })
+        .$name("shallot-mesh-preprocess-scatter");
+
+    // Warm hooks run concurrently under Promise.all. Defer allocation and binding to the precompile
+    // drain after all hooks resolve, when meshes, dense tables, transform lookup and cull volumes are
+    // published. Separate forcers give each pipeline its own compile-report row.
+    precompile(world, "shallot-mesh-preprocess-count", () => {
+        syncBuffers(world);
+        const bound = bindCount(world);
+        return bound && [bound.pipeline];
+    });
+    precompile(world, "shallot-mesh-preprocess-scan", () => {
+        const bound = bindScan(world);
+        return bound && [bound.tileSum, bound.tileScan, bound.pipeline];
+    });
+    precompile(world, "shallot-mesh-preprocess-scatter", () => {
+        const bound = bindScatter(world);
+        return bound && [bound.pipeline];
+    });
+    precompile(world, "transparent-mesh-count", () => warmTransparentCounts(world));
+    precompile(world, "shallot-producer-preprocess", () => {
+        prepareProducerPack(world);
+        return [];
+    });
+}

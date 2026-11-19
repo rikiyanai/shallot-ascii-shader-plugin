@@ -1,0 +1,1075 @@
+//! Box3D solver.c: b3SolverStage, b3SolverBlock, b3SyncBlock, b3ExecuteBlock,
+//! b3ExecuteStage, b3ExecuteMainStage and b3SolverTask.
+//!
+//! Parallel blocks must be write-disjoint: graph colors separate body writes;
+//! prepare/store blocks own their transient rows and persistent manifolds.
+//! Overflow constraints share bodies and run serially in their stored order
+//! between stages. No reduction may depend on worker identity.
+//!
+//! Without +atomics, worker_count must be one: atomic loads and stores lower to
+//! plain accesses in the single-thread artifact.
+
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
+/// Solve iterations per sub-step (box3d `ITERATIONS`).
+pub const ITERATIONS: usize = 1;
+/// Relax iterations per sub-step (box3d `RELAX_ITERATIONS`).
+pub const RELAX_ITERATIONS: usize = 1;
+
+/// Graph colors (`GRAPH_COLOR_COUNT` in `src/standard/physics/common/constants.ts`); the last is the serial overflow color, so at
+/// most `MAX_COLORS - 1` colors can be active.
+pub const MAX_COLORS: usize = 24;
+
+/// A block that belongs to no color (box3d's `UINT8_MAX` color tag).
+const NULL_COLOR: u8 = u8::MAX;
+
+/// Every block of one stage is claimed and run before the next stage starts (b3SolverStageType).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum StageType {
+    PrepareJoints,
+    PrepareWideContacts,
+    PrepareContacts,
+    IntegrateVelocities,
+    WarmStart,
+    Solve,
+    IntegratePositions,
+    Relax,
+    Restitution,
+    StoreWideImpulses,
+    StoreImpulses,
+}
+
+/// What a block's index range indexes (b3SolverBlockType). The tag rides the block, not the stage,
+/// so a color stage can mix joint, wide-contact, and mesh-contact blocks and run them concurrently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum BlockType {
+    Body,
+    Joint,
+    WideContact,
+    Contact,
+    GraphJoint,
+    GraphWideContact,
+    GraphContact,
+}
+
+/// One unit of work: a `[start, start + count)` range of the column the block's type names
+/// (b3SolverBlock).
+#[derive(Clone, Copy, Debug)]
+pub struct Block {
+    pub start: usize,
+    pub count: usize,
+    pub block_type: BlockType,
+    pub color: u8,
+}
+
+/// b3SyncBlock's immutable work descriptor. Keep it separate from the mutable
+/// claim atomic so copying work never aliases concurrent atomic writes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SolverBlock {
+    start: i32,
+    count: u16,
+    block_type: BlockType,
+    color: u8,
+}
+
+impl SolverBlock {
+    const EMPTY: Self = Self {
+        start: 0,
+        count: 0,
+        block_type: BlockType::Body,
+        color: NULL_COLOR,
+    };
+    fn work(self) -> Block {
+        Block {
+            start: self.start as usize,
+            count: self.count as usize,
+            block_type: self.block_type,
+            color: self.color,
+        }
+    }
+}
+
+#[repr(C)]
+pub struct SyncBlock {
+    block: SolverBlock,
+    sync_index: AtomicI32,
+}
+
+impl SyncBlock {
+    /// Each use creates a fresh claim atomic; const permits static WASM buffers.
+    #[allow(clippy::declare_interior_mutable_const)]
+    pub const EMPTY: SyncBlock = SyncBlock {
+        block: SolverBlock::EMPTY,
+        sync_index: AtomicI32::new(0),
+    };
+}
+
+/// A stage: a slice of the shared block array, plus the counter its barrier spins on (b3SolverStage).
+/// Iterative stages (warm start / solve / relax / restitution of one color) re-use one block slice
+/// every sub-step; the blocks' sync indices grow monotonically across those re-uses.
+#[repr(C)]
+pub struct Stage {
+    block_start: usize,
+    ty: StageType,
+    block_count: i32,
+    color: u8,
+    completion: AtomicI32,
+}
+
+impl Stage {
+    /// As [`SyncBlock::EMPTY`].
+    #[allow(clippy::declare_interior_mutable_const)]
+    pub const EMPTY: Stage = Stage {
+        ty: StageType::PrepareJoints,
+        block_start: 0,
+        block_count: 0,
+        color: NULL_COLOR,
+        completion: AtomicI32::new(0),
+    };
+}
+
+/// One active graph color's contact-column ranges and local joint-array range.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColorSpan {
+    pub color: u8,
+    pub wide_start: usize,
+    pub wide_count: usize,
+    pub mesh_start: usize,
+    pub mesh_count: usize,
+    pub joint_start: usize,
+    pub joint_count: usize,
+}
+
+impl ColorSpan {
+    /// The initializer for a caller's span buffer (`Default` isn't `const`).
+    pub const EMPTY: ColorSpan = ColorSpan {
+        color: NULL_COLOR,
+        wide_start: 0,
+        wide_count: 0,
+        mesh_start: 0,
+        mesh_count: 0,
+        joint_start: 0,
+        joint_count: 0,
+    };
+}
+
+/// Excludes the overflow color; StageWork owns that range and runs it serially.
+#[derive(Clone, Copy, Debug)]
+pub struct Plan<'a> {
+    pub body_count: usize,
+    /// Flat wide (convex) record range: prepare + store sweep `[0, wide_total)`.
+    pub wide_total: usize,
+    /// Flat colored scalar (mesh) record range: prepare + store sweep `[mesh_start, +mesh_total)`.
+    pub mesh_start: usize,
+    pub mesh_total: usize,
+    /// Total joint count swept through the joint-prepare spans.
+    pub joint_total: usize,
+    pub colors: &'a [ColorSpan],
+    pub sub_step_count: usize,
+    pub restitution_iterations: usize,
+    pub worker_count: usize,
+}
+
+/// Blocks run concurrently and must obey the module's write-disjointness contract.
+/// The `_overflow` methods run alone on the orchestrator between stages.
+/// Whole-column handles must permit aliasing, as [`Col`](crate::col::Col) does;
+/// disjoint writes do not make overlapping `&mut` column references sound.
+pub trait StageWork: Sync {
+    fn ticks(&self) -> f64 {
+        0.0
+    }
+    fn profile(&self, _field: usize, _start: f64) {}
+    fn has_restitution(&self) -> bool;
+    fn prepare_wide(&self, block: Block);
+    fn prepare_mesh(&self, block: Block);
+    fn integrate_velocities(&self, block: Block);
+    fn warm_start_mesh(&self, block: Block);
+    fn solve_mesh(&self, block: Block, use_bias: bool);
+    fn integrate_positions(&self, block: Block);
+    fn restitution_mesh(&self, block: Block);
+    fn warm_start_wide(&self, block: Block);
+    fn solve_wide(&self, block: Block, use_bias: bool);
+    fn restitution_wide(&self, block: Block);
+    // Worker indices select task-owned event bits; publication happens after the parallel phase.
+    fn store_wide(&self, block: Block, worker_index: usize);
+    fn store_mesh(&self, block: Block, worker_index: usize);
+
+    /// Finalizes poses in per-body write-disjoint blocks after the staged solve.
+    fn finalize(&self, block: Block, worker: usize);
+
+    fn prepare_overflow(&self);
+    fn warm_start_overflow(&self);
+    fn solve_overflow(&self, use_bias: bool);
+    fn restitution_overflow(&self);
+    fn store_overflow(&self);
+
+    // Jointless plans invoke none of these methods.
+    fn prepare_joints(&self, _block: Block) {}
+    fn warm_start_joints(&self, _block: Block) {}
+    fn solve_joints(&self, _block: Block, _use_bias: bool, _worker_index: usize) {}
+
+    // Box3D b3*Joints_Overflow.
+    fn prepare_overflow_joints(&self) {}
+    fn warm_start_overflow_joints(&self) {}
+    fn solve_overflow_joints(&self, _use_bias: bool) {}
+}
+
+/// Blocks per worker, so a worker that finishes early can steal without unbounded per-block sync overhead.
+const BLOCKS_PER_WORKER: usize = 4;
+/// Minimum bodies per body block (box3d `minBodiesPerBlock`).
+const MIN_BODIES_PER_BLOCK: usize = 32;
+/// Minimum constraints per contact/joint block (box3d `minContactsPerBlock` / `minJointsPerBlock`).
+const MIN_CONSTRAINTS_PER_BLOCK: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BlockDim {
+    size: usize,
+    count: usize,
+}
+
+/// b3ComputeBlockCount. Caps the total block count at max_block_count.
+fn compute_block_count(item_count: usize, min_size: usize, max_block_count: usize) -> BlockDim {
+    if item_count == 0 {
+        return BlockDim::default();
+    }
+
+    let size = if item_count <= min_size * max_block_count {
+        min_size
+    } else {
+        item_count.div_ceil(max_block_count)
+    };
+
+    BlockDim {
+        size,
+        count: item_count.div_ceil(size),
+    }
+}
+
+/// b3InitBlocks. `base` addresses a color's range in the flat columns.
+/// The first stage must claim these blocks with sync index 1.
+fn init_blocks(
+    blocks: &mut [SyncBlock],
+    dim: BlockDim,
+    base: usize,
+    item_count: usize,
+    block_type: BlockType,
+    color: u8,
+) {
+    for (i, sb) in blocks.iter_mut().enumerate().take(dim.count) {
+        sb.block = SolverBlock {
+            start: i32::try_from(base + i * dim.size)
+                .expect("solver block start exceeds Box3D int"),
+            count: u16::try_from(dim.size).expect("solver block size exceeds Box3D UINT16_MAX"),
+            block_type,
+            color,
+        };
+        sb.sync_index.store(0, Ordering::SeqCst);
+    }
+    if dim.count > 0 {
+        blocks[dim.count - 1].block.count = u16::try_from(item_count - (dim.count - 1) * dim.size)
+            .expect("solver tail block exceeds Box3D UINT16_MAX");
+    }
+}
+
+/// The block dims of one plan, in the order they are laid out in the shared block array.
+struct Dims {
+    body: BlockDim,
+    wide: BlockDim,
+    mesh: BlockDim,
+    joint: BlockDim,
+    color_joint: [BlockDim; MAX_COLORS],
+    color_wide: [BlockDim; MAX_COLORS],
+    color_mesh: [BlockDim; MAX_COLORS],
+    graph_block_count: usize,
+}
+
+fn dims(plan: &Plan) -> Dims {
+    let max_block_count = BLOCKS_PER_WORKER * plan.worker_count;
+    let contacts = |n| compute_block_count(n, MIN_CONSTRAINTS_PER_BLOCK, max_block_count);
+
+    let mut d = Dims {
+        body: compute_block_count(plan.body_count, MIN_BODIES_PER_BLOCK, max_block_count),
+        wide: contacts(plan.wide_total),
+        mesh: contacts(plan.mesh_total),
+        joint: contacts(plan.joint_total),
+        color_joint: [BlockDim::default(); MAX_COLORS],
+        color_wide: [BlockDim::default(); MAX_COLORS],
+        color_mesh: [BlockDim::default(); MAX_COLORS],
+        graph_block_count: 0,
+    };
+
+    for (i, span) in plan.colors.iter().enumerate() {
+        d.color_joint[i] = contacts(span.joint_count);
+        d.color_wide[i] = contacts(span.wide_count);
+        d.color_mesh[i] = contacts(span.mesh_count);
+        d.graph_block_count +=
+            d.color_joint[i].count + d.color_wide[i].count + d.color_mesh[i].count;
+    }
+
+    d
+}
+
+/// Storage a plan needs. The caller owns the buffers (no allocator in the live wasm path).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizes {
+    pub stages: usize,
+    pub blocks: usize,
+}
+
+/// Upper bound for fixed buffers with at most max_workers threads.
+/// Accounts for four flat dimensions and three per non-overflow color.
+pub const fn max_sizes(max_workers: usize) -> Sizes {
+    let colors = MAX_COLORS - 1; // the last color is the serial overflow, which never becomes blocks
+    Sizes {
+        stages: 7 + colors * (2 + ITERATIONS + RELAX_ITERATIONS),
+        blocks: (4 + 3 * colors) * BLOCKS_PER_WORKER * max_workers,
+    }
+}
+
+pub fn sizes(plan: &Plan) -> Sizes {
+    let d = dims(plan);
+    let colors = plan.colors.len();
+    Sizes {
+        // prepare joints/wide/mesh + integrate velocities + integrate positions + store wide/mesh +
+        // one stage per color for warm start, each solve iteration, each relax iteration, and restitution.
+        stages: 7 + colors * (2 + ITERATIONS + RELAX_ITERATIONS),
+        blocks: d.body.count + d.wide.count + d.mesh.count + d.joint.count + d.graph_block_count,
+    }
+}
+
+/// Stage descriptors and block ranges stay fixed until every worker has joined.
+pub struct Context<'a> {
+    stages: &'a [Stage],
+    blocks: core::marker::PhantomData<&'a [SyncBlock]>,
+    colors: &'a [ColorSpan],
+    sub_step_count: usize,
+    restitution_iterations: usize,
+    worker_count: usize,
+    /// `(syncIndex << 16) | stageIndex`; `u32::MAX` is the finish sentinel.
+    /// Keep the frequently read sync bits off the line containing the orchestrator claim.
+    sync_bits: Line<AtomicU32>,
+    /// The queued worker-zero task races the caller for orchestration, as in solver.c.
+    main_claimed: AtomicU32,
+    /// Set when a worker dies inside the solve — see [`Context::fault`].
+    fault: AtomicU32,
+}
+
+/// Separates fields by at least 64 bytes.
+#[repr(align(64))]
+struct Line<T>(T);
+
+impl Context<'_> {
+    /// Abandon the solver barriers when a task cannot complete its claimed blocks.
+    pub fn fault(&self) {
+        self.fault.store(1, Ordering::SeqCst);
+    }
+
+    #[inline]
+    fn faulted(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        if crate::solve::SCHEDULER.faulted() {
+            return true;
+        }
+        self.fault.load(Ordering::SeqCst) != 0
+    }
+}
+
+/// b3InitStage.
+fn init_stage(
+    stages: &mut [Stage],
+    s: &mut usize,
+    ty: StageType,
+    block_start: usize,
+    block_count: usize,
+    color: u8,
+) {
+    stages[*s] = Stage {
+        ty,
+        block_start,
+        block_count: i32::try_from(block_count)
+            .expect("solver stage block count exceeds Box3D int"),
+        color,
+        completion: AtomicI32::new(0),
+    };
+    *s += 1;
+}
+
+/// b3InitColorStages: one stage per color per iteration. Every iteration of a color re-uses that
+/// color's one block slice, so its blocks' sync indices grow monotonically across the iterations.
+fn init_color_stages(
+    stages: &mut [Stage],
+    s: &mut usize,
+    ty: StageType,
+    iterations: usize,
+    plan: &Plan,
+    color_at: &[usize],
+    color_blocks: &[usize],
+) {
+    for _ in 0..iterations {
+        for (i, span) in plan.colors.iter().enumerate() {
+            init_stage(stages, s, ty, color_at[i], color_blocks[i], span.color);
+        }
+    }
+}
+
+/// Lay out the blocks and the stage list for `plan` in caller-owned storage. `stages` and `blocks`
+/// must be at least [`sizes`] long.
+pub fn build<'a>(
+    plan: &Plan<'a>,
+    stages: &'a mut [Stage],
+    blocks: &'a mut [SyncBlock],
+) -> Context<'a> {
+    assert!(plan.colors.len() < MAX_COLORS);
+    assert!(plan.worker_count >= 1);
+
+    let need = sizes(plan);
+    assert!(stages.len() >= need.stages && blocks.len() >= need.blocks);
+    // The sync bits pack the sync index and the stage index into 16 bits each. The graph blocks are
+    // re-swept once per warm-start / solve / relax group, so their sync index is the one that grows.
+    assert!(need.stages < 0x10000);
+    assert!(1 + (1 + ITERATIONS + RELAX_ITERATIONS) * plan.sub_step_count < 0x10000);
+
+    let d = dims(plan);
+
+    let body_at = 0;
+    let wide_at = body_at + d.body.count;
+    let mesh_at = wide_at + d.wide.count;
+    let joint_at = mesh_at + d.mesh.count;
+    let graph_at = joint_at + d.joint.count;
+
+    init_blocks(
+        &mut blocks[body_at..],
+        d.body,
+        0,
+        plan.body_count,
+        BlockType::Body,
+        NULL_COLOR,
+    );
+    init_blocks(
+        &mut blocks[wide_at..],
+        d.wide,
+        0,
+        plan.wide_total,
+        BlockType::WideContact,
+        NULL_COLOR,
+    );
+    init_blocks(
+        &mut blocks[mesh_at..],
+        d.mesh,
+        plan.mesh_start,
+        plan.mesh_total,
+        BlockType::Contact,
+        NULL_COLOR,
+    );
+    init_blocks(
+        &mut blocks[joint_at..],
+        d.joint,
+        0,
+        plan.joint_total,
+        BlockType::Joint,
+        NULL_COLOR,
+    );
+
+    // A color stage shares one contiguous run across all three constraint kinds.
+    let mut color_at = [0usize; MAX_COLORS];
+    let mut color_blocks = [0usize; MAX_COLORS];
+    let mut at = graph_at;
+    for (i, span) in plan.colors.iter().enumerate() {
+        color_at[i] = at;
+
+        init_blocks(
+            &mut blocks[at..],
+            d.color_joint[i],
+            span.joint_start,
+            span.joint_count,
+            BlockType::GraphJoint,
+            span.color,
+        );
+        at += d.color_joint[i].count;
+
+        init_blocks(
+            &mut blocks[at..],
+            d.color_wide[i],
+            span.wide_start,
+            span.wide_count,
+            BlockType::GraphWideContact,
+            span.color,
+        );
+        at += d.color_wide[i].count;
+
+        init_blocks(
+            &mut blocks[at..],
+            d.color_mesh[i],
+            span.mesh_start,
+            span.mesh_count,
+            BlockType::GraphContact,
+            span.color,
+        );
+        at += d.color_mesh[i].count;
+
+        color_blocks[i] = at - color_at[i];
+    }
+    debug_assert_eq!(at - graph_at, d.graph_block_count);
+
+    let mut s = 0;
+    init_stage(
+        stages,
+        &mut s,
+        StageType::PrepareJoints,
+        joint_at,
+        d.joint.count,
+        NULL_COLOR,
+    );
+    init_stage(
+        stages,
+        &mut s,
+        StageType::PrepareWideContacts,
+        wide_at,
+        d.wide.count,
+        NULL_COLOR,
+    );
+    init_stage(
+        stages,
+        &mut s,
+        StageType::PrepareContacts,
+        mesh_at,
+        d.mesh.count,
+        NULL_COLOR,
+    );
+    init_stage(
+        stages,
+        &mut s,
+        StageType::IntegrateVelocities,
+        body_at,
+        d.body.count,
+        NULL_COLOR,
+    );
+    init_color_stages(
+        stages,
+        &mut s,
+        StageType::WarmStart,
+        1,
+        plan,
+        &color_at,
+        &color_blocks,
+    );
+    init_color_stages(
+        stages,
+        &mut s,
+        StageType::Solve,
+        ITERATIONS,
+        plan,
+        &color_at,
+        &color_blocks,
+    );
+    init_stage(
+        stages,
+        &mut s,
+        StageType::IntegratePositions,
+        body_at,
+        d.body.count,
+        NULL_COLOR,
+    );
+    init_color_stages(
+        stages,
+        &mut s,
+        StageType::Relax,
+        RELAX_ITERATIONS,
+        plan,
+        &color_at,
+        &color_blocks,
+    );
+    init_color_stages(
+        stages,
+        &mut s,
+        StageType::Restitution,
+        1,
+        plan,
+        &color_at,
+        &color_blocks,
+    );
+    init_stage(
+        stages,
+        &mut s,
+        StageType::StoreWideImpulses,
+        wide_at,
+        d.wide.count,
+        NULL_COLOR,
+    );
+    init_stage(
+        stages,
+        &mut s,
+        StageType::StoreImpulses,
+        mesh_at,
+        d.mesh.count,
+        NULL_COLOR,
+    );
+
+    debug_assert_eq!(s, need.stages);
+    for stage in &mut stages[..need.stages] {
+        stage.block_start = blocks.as_ptr().wrapping_add(stage.block_start) as usize;
+    }
+
+    Context {
+        stages: &stages[..need.stages],
+        blocks: core::marker::PhantomData,
+        colors: plan.colors,
+        sub_step_count: plan.sub_step_count,
+        restitution_iterations: plan.restitution_iterations,
+        worker_count: plan.worker_count,
+        sync_bits: Line(AtomicU32::new(0)),
+        main_claimed: AtomicU32::new(0),
+        fault: AtomicU32::new(0),
+    }
+}
+
+/// b3ExecuteBlock: stage type + block type → phase.
+fn execute_block<W: StageWork>(work: &W, ty: StageType, block: Block, worker_index: usize) {
+    match ty {
+        StageType::PrepareJoints => work.prepare_joints(block),
+        StageType::PrepareWideContacts => work.prepare_wide(block),
+        StageType::PrepareContacts => work.prepare_mesh(block),
+        StageType::IntegrateVelocities => work.integrate_velocities(block),
+        StageType::WarmStart => match block.block_type {
+            BlockType::GraphJoint => work.warm_start_joints(block),
+            BlockType::GraphWideContact => work.warm_start_wide(block),
+            _ => work.warm_start_mesh(block),
+        },
+        StageType::Solve => match block.block_type {
+            BlockType::GraphJoint => work.solve_joints(block, true, worker_index),
+            BlockType::GraphWideContact => work.solve_wide(block, true),
+            _ => work.solve_mesh(block, true),
+        },
+        StageType::IntegratePositions => work.integrate_positions(block),
+        StageType::Relax => match block.block_type {
+            BlockType::GraphJoint => work.solve_joints(block, false, worker_index),
+            BlockType::GraphWideContact => work.solve_wide(block, false),
+            _ => work.solve_mesh(block, false),
+        },
+        StageType::Restitution => match block.block_type {
+            BlockType::GraphWideContact => work.restitution_wide(block),
+            BlockType::GraphContact => work.restitution_mesh(block),
+            // Joints have no restitution pass.
+            _ => {}
+        },
+        StageType::StoreWideImpulses => work.store_wide(block, worker_index),
+        StageType::StoreImpulses => work.store_mesh(block, worker_index),
+    }
+}
+
+/// GetWorkerStartIndex: stagger the workers' home blocks so they don't all start on block 0. `None`
+/// when there are more workers than blocks and this worker has nothing to start on.
+fn worker_start_index(
+    worker_index: usize,
+    block_count: usize,
+    worker_count: usize,
+) -> Option<usize> {
+    if block_count <= worker_count {
+        return (worker_index < block_count).then_some(worker_index);
+    }
+
+    let blocks_per_worker = block_count / worker_count;
+    let remainder = block_count - blocks_per_worker * worker_count;
+    Some(blocks_per_worker * worker_index + remainder.min(worker_index))
+}
+
+/// b3ExecuteStage. Claims blocks at previous_sync and adds completed work to the barrier.
+fn execute_stage<W: StageWork>(
+    ctx: &Context,
+    work: &W,
+    stage: &Stage,
+    previous_sync: i32,
+    sync: i32,
+    worker_index: usize,
+) {
+    let block_count = stage.block_count as usize;
+    let Some(start) = worker_start_index(worker_index, block_count, ctx.worker_count) else {
+        return;
+    };
+
+    let mut completed = 0;
+    let mut i = start;
+    for _ in 0..block_count {
+        let sb = unsafe { &*(stage.block_start as *const SyncBlock).add(i) };
+        if sb
+            .sync_index
+            .compare_exchange(previous_sync, sync, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            execute_block(work, stage.ty, sb.block.work(), worker_index);
+            completed += 1;
+        }
+
+        i += 1;
+        if i >= block_count {
+            i = 0;
+        }
+    }
+
+    stage.completion.fetch_add(completed, Ordering::SeqCst);
+}
+
+/// b3ExecuteMainStage. Single-block stages never publish or advance their block's
+/// sync index; their block count must stay fixed across reuse.
+/// Returns None on a worker fault because the barrier can no longer complete.
+fn execute_main_stage<W: StageWork>(
+    ctx: &Context,
+    work: &W,
+    stage_index: usize,
+    sync_bits: u32,
+) -> Option<()> {
+    let stage = &ctx.stages[stage_index];
+    let block_count = stage.block_count as usize;
+    if block_count == 0 {
+        return Some(());
+    }
+
+    if block_count == 1 {
+        execute_block(
+            work,
+            stage.ty,
+            unsafe { (*(stage.block_start as *const SyncBlock)).block.work() },
+            ORCHESTRATOR,
+        );
+        return Some(());
+    }
+
+    ctx.sync_bits.0.store(sync_bits, Ordering::SeqCst);
+
+    let sync = ((sync_bits >> 16) & 0xFFFF) as i32;
+    debug_assert!(sync > 0);
+    execute_stage(ctx, work, stage, sync - 1, sync, ORCHESTRATOR);
+
+    // Overflow work and the next stage require every block's writes to be complete.
+    while stage.completion.load(Ordering::SeqCst) != block_count as i32 {
+        if ctx.faulted() {
+            return None;
+        }
+        pause(1);
+    }
+
+    stage.completion.store(0, Ordering::SeqCst);
+    Some(())
+}
+
+#[inline]
+fn sync_bits(sync_index: u32, stage_index: usize) -> u32 {
+    (sync_index << 16) | (stage_index as u32)
+}
+
+/// The finish sentinel the orchestrator publishes when the stage list is done.
+const FINISH: u32 = u32::MAX;
+
+/// The orchestrator's worker index: the thread that drives the step.
+const ORCHESTRATOR: usize = 0;
+
+/// Worker zero orchestrates; the caller may also enter as worker zero, with only
+/// one entrant winning the orchestration claim. Other workers steal blocks.
+/// Finish every scheduled handle before rebuilding the context: an old thief
+/// must never see reset block sync indices.
+/// A worker_index at or past worker_count faults the solve.
+pub fn run<W: StageWork>(ctx: &Context, work: &W, worker_index: usize) {
+    if worker_index >= ctx.worker_count {
+        ctx.fault();
+        return;
+    }
+    if worker_index == ORCHESTRATOR {
+        if ctx
+            .main_claimed
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        orchestrate(ctx, work);
+    } else {
+        steal(ctx, work, worker_index);
+    }
+}
+
+fn orchestrate<W: StageWork>(ctx: &Context, work: &W) {
+    // Publish the sentinel even on fault so surviving thieves can leave their spins.
+    let _ = walk(ctx, work);
+
+    ctx.sync_bits.0.store(FINISH, Ordering::SeqCst);
+}
+
+/// The stage list, in order. `None` if a worker faulted partway.
+fn walk<W: StageWork>(ctx: &Context, work: &W) -> Option<()> {
+    let colors = ctx.colors.len();
+    let mut stage_index = 0;
+
+    // Each shared block array needs its own increasing claim sequence to prevent stale claims.
+    let mut body_sync = 1;
+    // PrepareJoints uses this array once; colored joint work uses the graph blocks.
+    let joint_sync = 1;
+    let mut convex_sync = 1;
+    let mut mesh_sync = 1;
+    let mut graph_sync = 1;
+
+    let start = work.ticks();
+    execute_main_stage(ctx, work, stage_index, sync_bits(joint_sync, stage_index))?;
+    stage_index += 1;
+
+    execute_main_stage(ctx, work, stage_index, sync_bits(convex_sync, stage_index))?;
+    stage_index += 1;
+    convex_sync += 1;
+
+    execute_main_stage(ctx, work, stage_index, sync_bits(mesh_sync, stage_index))?;
+    stage_index += 1;
+    mesh_sync += 1;
+
+    // b3PrepareJoints_Overflow must precede b3PrepareContacts_Overflow.
+    work.prepare_overflow_joints();
+    work.prepare_overflow();
+    work.profile(6, start);
+
+    for _ in 0..ctx.sub_step_count {
+        // Reused stages retain increasing per-array sync indices across substeps.
+        let mut i = stage_index;
+
+        let start = work.ticks();
+        execute_main_stage(ctx, work, i, sync_bits(body_sync, i))?;
+        i += 1;
+        body_sync += 1;
+        work.profile(7, start);
+
+        let start = work.ticks();
+        work.warm_start_overflow_joints();
+        work.warm_start_overflow();
+        for _ in 0..colors {
+            execute_main_stage(ctx, work, i, sync_bits(graph_sync, i))?;
+            i += 1;
+        }
+        graph_sync += 1;
+        work.profile(8, start);
+
+        let start = work.ticks();
+        for _ in 0..ITERATIONS {
+            // Overflow constraints have lower priority than the colored ones: solved first.
+            work.solve_overflow_joints(true);
+            work.solve_overflow(true);
+            for _ in 0..colors {
+                execute_main_stage(ctx, work, i, sync_bits(graph_sync, i))?;
+                i += 1;
+            }
+            graph_sync += 1;
+        }
+
+        work.profile(9, start);
+        let start = work.ticks();
+        execute_main_stage(ctx, work, i, sync_bits(body_sync, i))?;
+        i += 1;
+        body_sync += 1;
+        work.profile(10, start);
+
+        let start = work.ticks();
+        for _ in 0..RELAX_ITERATIONS {
+            work.solve_overflow_joints(false);
+            work.solve_overflow(false);
+            for _ in 0..colors {
+                execute_main_stage(ctx, work, i, sync_bits(graph_sync, i))?;
+                i += 1;
+            }
+            graph_sync += 1;
+        }
+        work.profile(11, start);
+    }
+
+    stage_index += 2 + colors * (1 + ITERATIONS + RELAX_ITERATIONS);
+
+    let start = work.ticks();
+    if work.has_restitution() {
+        for _ in 0..ctx.restitution_iterations {
+            work.restitution_overflow();
+            for color in 0..colors {
+                let i = stage_index + color;
+                execute_main_stage(ctx, work, i, sync_bits(graph_sync, i))?;
+            }
+            graph_sync += 1;
+        }
+    }
+    stage_index += colors;
+
+    work.profile(12, start);
+    let start = work.ticks();
+    work.store_overflow();
+
+    execute_main_stage(ctx, work, stage_index, sync_bits(convex_sync, stage_index))?;
+    stage_index += 1;
+
+    execute_main_stage(ctx, work, stage_index, sync_bits(mesh_sync, stage_index))?;
+    stage_index += 1;
+
+    work.profile(13, start);
+    debug_assert_eq!(stage_index, ctx.stages.len());
+    Some(())
+}
+
+use crate::scheduler::pause;
+
+fn steal<W: StageWork>(ctx: &Context, work: &W, worker_index: usize) {
+    let mut last = 0;
+    loop {
+        let mut bits = ctx.sync_bits.0.load(Ordering::SeqCst);
+        let mut spins = 1;
+        while bits == last {
+            // A sibling trapped: no further stage is guaranteed to be published.
+            if ctx.faulted() {
+                return;
+            }
+            pause(spins);
+            spins = (spins * 2).min(64);
+            bits = ctx.sync_bits.0.load(Ordering::SeqCst);
+        }
+
+        if bits == FINISH {
+            return;
+        }
+
+        let stage_index = (bits & 0xFFFF) as usize;
+        let sync = ((bits >> 16) & 0xFFFF) as i32;
+
+        // A late worker may see an old stage. Increasing per-array sync indices
+        // make its claims against already-advanced blocks fail.
+        execute_stage(
+            ctx,
+            work,
+            &ctx.stages[stage_index],
+            sync - 1,
+            sync,
+            worker_index,
+        );
+
+        last = bits;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// b3ComputeBlockCount at its boundaries: the minimum-size branch, the exact crossover, and the
+    /// grown-size branch past it. A block count over the cap would overflow the caller's buffer,
+    /// which `sizes` promises it cannot.
+    #[test]
+    fn block_count_boundaries() {
+        assert_eq!(
+            compute_block_count(0, 4, 16),
+            BlockDim { size: 0, count: 0 }
+        );
+        assert_eq!(
+            compute_block_count(1, 4, 16),
+            BlockDim { size: 4, count: 1 }
+        );
+        // Exactly min_size * max_block_count: still minimum size, exactly the cap of blocks.
+        assert_eq!(
+            compute_block_count(64, 4, 16),
+            BlockDim { size: 4, count: 16 }
+        );
+        // One past: the size grows so the count stays at the cap.
+        assert_eq!(
+            compute_block_count(65, 4, 16),
+            BlockDim { size: 5, count: 13 }
+        );
+        for n in 1..2000usize {
+            let d = compute_block_count(n, 4, 16);
+            assert!(d.count <= 16, "n={n} blew the block cap: {d:?}");
+            assert!(d.size * d.count >= n);
+            assert!((d.count - 1) * d.size < n);
+        }
+    }
+
+    /// b3InitBlocks must tile `[base, base + item_count)` exactly: no gap, no overlap, no dropped
+    /// tail. Every element belongs to exactly one block, or the solve silently skips constraints.
+    #[test]
+    fn blocks_tile_the_range() {
+        for item_count in [1usize, 3, 4, 5, 63, 64, 65, 200] {
+            let dim = compute_block_count(item_count, 4, 16);
+            let mut blocks: Vec<SyncBlock> = (0..dim.count).map(|_| SyncBlock::EMPTY).collect();
+            init_blocks(&mut blocks, dim, 100, item_count, BlockType::Contact, 7);
+
+            let mut covered = vec![0u32; item_count];
+            for b in &blocks {
+                assert_eq!(b.block.color, 7);
+                let block = b.block.work();
+                for i in block.start..block.start + block.count {
+                    covered[i - 100] += 1;
+                }
+            }
+            assert!(
+                covered.iter().all(|&c| c == 1),
+                "item_count={item_count} not tiled exactly: {covered:?}"
+            );
+        }
+    }
+
+    /// The workers' home blocks must partition the ring: every block is someone's start when there
+    /// are at least as many blocks as workers, and no two workers share a home.
+    #[test]
+    fn solver_descriptor_widths_match_box3d() {
+        assert_eq!(core::mem::size_of::<SolverBlock>(), 8);
+        assert_eq!(core::mem::size_of::<SyncBlock>(), 12);
+        assert_eq!(core::mem::size_of::<StageType>(), 4);
+        assert_eq!(
+            core::mem::align_of::<Stage>(),
+            core::mem::align_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::size_of::<Stage>(),
+            if core::mem::size_of::<usize>() == 4 {
+                20
+            } else {
+                24
+            }
+        );
+        let mut blocks = [SyncBlock::EMPTY];
+        init_blocks(
+            &mut blocks,
+            BlockDim {
+                size: u16::MAX as usize,
+                count: 1,
+            },
+            0,
+            u16::MAX as usize,
+            BlockType::Body,
+            NULL_COLOR,
+        );
+        assert_eq!(blocks[0].block.count, u16::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "solver block size exceeds Box3D UINT16_MAX")]
+    fn solver_block_overflow_is_refused_not_truncated() {
+        let mut blocks = [SyncBlock::EMPTY];
+        let size = u16::MAX as usize + 1;
+        init_blocks(
+            &mut blocks,
+            BlockDim { size, count: 1 },
+            0,
+            size,
+            BlockType::Body,
+            NULL_COLOR,
+        );
+    }
+
+    #[test]
+    fn worker_start_indices_are_distinct() {
+        for worker_count in 1..9usize {
+            for block_count in 1..40usize {
+                let starts: Vec<Option<usize>> = (0..worker_count)
+                    .map(|w| worker_start_index(w, block_count, worker_count))
+                    .collect();
+                let mut seen: Vec<usize> = starts.iter().flatten().copied().collect();
+                let n = seen.len();
+                seen.sort_unstable();
+                seen.dedup();
+                assert_eq!(seen.len(), n, "workers collided on a home block");
+                assert!(seen.iter().all(|&s| s < block_count));
+            }
+        }
+    }
+}

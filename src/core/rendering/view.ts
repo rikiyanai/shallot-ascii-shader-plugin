@@ -1,0 +1,922 @@
+import tgpu from "typegpu";
+import * as d from "typegpu/data";
+import * as std from "typegpu/std";
+import type { EntityRef, World } from "../../engine";
+import { resizeViewport, Viewports } from "../../engine";
+import { continueAcquisitionScope, popAcquisitionScope, rawDevice } from "../../engine/runtime";
+import { Camera, CameraViewport, Resolution } from "./camera";
+import { type CameraRect, cameraRect } from "./camera-viewport";
+import { CULL_VOLUME_FLOATS } from "./frustum";
+import { RenderContext } from "./render";
+import { releaseViewTargets } from "./targets";
+
+/**
+ * Per-shading-slot uniform schema shared by GPU bindings and CPU staging offsets.
+ * Each shading slot owns a separate static buffer in RenderContext.viewBuffers.
+ */
+export const ViewUniforms = d
+    .struct({
+        clipFromWorld: d.mat4x4f,
+        resolution: d.vec2f,
+        right: d.vec4f,
+        up: d.vec4f,
+        /** `x` near and `y` far plane distance, `z` 1 for perspective and 0 for orthographic, `w` the cull slot; `xyz` are 0 for views that do not shade. */
+        projection: d.vec4f,
+        eye: d.vec4f,
+        worldFromClip: d.mat4x4f,
+        /** The selected global or camera ambient source, already multiplied by its cd/m² brightness. */
+        ambientColor: d.vec4f,
+        /** EV100 exposure factor, `2^-EV100 / 1.2`. */
+        exposure: d.f32,
+        /** Per-camera shadow filter enum; absent ShadowFilteringMethod packs Gaussian. */
+        shadowFilteringMethod: d.u32,
+        viewFromWorld: d.mat4x4f,
+        clipFromView: d.mat4x4f,
+    })
+    .$name("ViewUniforms");
+
+/** One initial slot keeps the common single-view path small; all per-view state grows on demand. */
+export const INITIAL_VIEW_CAPACITY = 1;
+
+// WebGPU's default 64 KiB uniform binding fits 585 cull slots of 28 floats each.
+export const MAX_SLOTS = Math.floor(
+    (64 * 1024) / (CULL_VOLUME_FLOATS * Float32Array.BYTES_PER_ELEMENT),
+);
+
+/** Reserve the maximum 48 point-shadow faces and four directional cascades in the cull table. */
+export const MAX_SHADOW_SLOTS = 52;
+
+/** Hardware-derived presenting ceiling after reserving every built-in shadow slot; buffers remain lazy-grown. */
+export const MAX_VIEWS = MAX_SLOTS - MAX_SHADOW_SLOTS;
+
+/** Assign a presenting camera's packed slot while keeping overflow out of the fixed tables. */
+export function presentingViewSlot(slot: number): number | undefined {
+    return slot < MAX_VIEWS ? slot : undefined;
+}
+
+/** The warning BeginFrameSystem emits when it refuses a presenting camera past the limit. */
+export function presentingViewRefusal(eid: number): string {
+    return `shallot: ${MAX_VIEWS} presenting-view cull limit reached; entity ${eid} skipped`;
+}
+
+/** Byte size of each shading slot's whole ViewUniforms buffer, and its spacing in RenderContext.viewStaging. */
+export const VIEW_BYTES = d.sizeOf(ViewUniforms);
+
+/** Linear→sRGB (IEC 61966-2-1); presentation into a non-sRGB target must encode exactly once. */
+export const linearToSrgb3 = tgpu.fn(
+    [d.vec3f],
+    d.vec3f,
+)((c) => {
+    "use gpu";
+    const lo = std.mul(c, 12.92);
+    const hi = std.sub(std.mul(1.055, std.pow(std.max(c, d.vec3f(0)), d.vec3f(1 / 2.4))), 0.055);
+    return std.select(hi, lo, std.le(c, d.vec3f(0.0031308)));
+});
+
+/**
+ * BeginFrameSystem sets framebuffer, present and slot each frame. For presenting views, slot indexes
+ * RenderContext.viewBuffers. framebuffer starts as the view-sized, sampleable linear scene target in
+ * RenderContext.format: resolve MSAA into it, or draw into it single-sample. Effects may replace it.
+ * present is the final attachment in the non-sRGB base canvas format; presentation encodes linear→sRGB
+ * exactly once. Scene color stays offscreen so effects can read it instead of writing the swapchain in place.
+ * On a target shared with cameras below it, or for a camera with CameraViewport, present is instead
+ * this camera's own image in the same format,
+ * blended over the target after every draw system by its premultiplied alpha.
+ * depth matches the main pass sample count and is null unless DepthPrepass or a plugin requests it.
+ * A depth-only attachView registration takes a frustum-cull slot but has no canvas, context or color targets;
+ * its owner renders to its own target.
+ */
+export interface View {
+    canvas: HTMLCanvasElement | null;
+    context: GPUCanvasContext | null;
+    /** Current canvas swapchain texture, retained through the frame for pre-presentation readback. */
+    canvasTexture?: GPUTexture;
+    /** Last surface texture identity and its cached view. */
+    surfaceTexture?: GPUTexture;
+    surfaceView?: GPUTextureView;
+    canvasTextureReused?: boolean;
+    /** External captures copied by EndFrameSystem into the same submission as the presenting pass. */
+    frameCaptures?: CanvasFrameCaptureRequest[];
+    /** A weak device-loss watcher serves this view's captures without retaining detached canvases. */
+    frameCaptureLossWatched?: boolean;
+    /** Device loss is permanent for this view; later capture requests fail immediately. */
+    frameCaptureLost?: Error;
+    /** World-owned fixed-size final surface, absent on canvas and depth-only views. */
+    texture?: GPUTexture;
+    /** True after a frame acquired this surface and submitted its encoder. */
+    presented?: boolean;
+    /** Scene-image dimensions in device pixels, including Resolution, pixelRatio and CameraViewport. */
+    width: number;
+    height: number;
+    /** Destination rectangle in target backing pixels, absent for a full-target camera. */
+    viewport?: CameraRect;
+    /** Projection aspect for camera, clusters and shadows; not the scene image's width/height ratio.
+     * With CameraViewport, uses its clamped coordinate-pixel size, independent of render resolution. */
+    aspect: number;
+    /** Canvas display dimensions in CSS pixels, mirrored from the world-owned viewport row. */
+    clientWidth: number;
+    clientHeight: number;
+    /** canvas.clientWidth / clientHeight and window.devicePixelRatio at the last display-size sample */
+    sampledClientWidth: number;
+    sampledClientHeight: number;
+    sampledDpr: number;
+    /** index of this canvas's World-scoped viewport row */
+    viewportIndex: number;
+    framebuffer: GPUTextureView | null;
+    /** current `framebuffer` format; scene-transform effects may redirect it to a scratch format */
+    framebufferFormat?: GPUTextureFormat;
+    present: GPUTextureView | null;
+    depth: GPUTextureView | null;
+    /** Encoded world normals at depth's sample count; null unless requested for this frame. */
+    normal: GPUTextureView | null;
+    /** World-to-view matrix, equal to its slot's ViewUniforms.viewFromWorld. */
+    viewFromWorld?: Float32Array;
+    slot: number;
+    camera: EntityRef;
+    /** @internal World-local identity of the canvas or texture this view shares; 0 or absent for a
+     * depth-only or hand-built view, which shares nothing. */
+    target?: number;
+    /** @internal Index among this frame's cameras on `target`, bottom to top by Camera.order then eid;
+     * 0 or absent for the bottom or a lone view. */
+    sortedIndexForTarget?: number;
+    /** @internal Whether this view's order tie on its target has been warned. */
+    orderTieWarned?: boolean;
+}
+
+export interface CanvasFrameCaptureRequest {
+    buffer: GPUBuffer;
+    width: number;
+    height: number;
+    bytesPerRow: number;
+    resolve: (format: GPUTextureFormat) => void;
+    reject: (error: Error) => void;
+}
+
+interface SceneTransformResult {
+    read: GPUTextureView;
+    write: GPUTextureView;
+}
+
+interface ScratchPair {
+    a: Scratch | null;
+    b: Scratch | null;
+    w: number;
+    h: number;
+    result: SceneTransformResult;
+}
+
+interface SizedTarget {
+    texture: GPUTexture;
+    view: GPUTextureView;
+    w: number;
+    h: number;
+}
+
+interface ViewResources {
+    views: Map<number, View>;
+    offscreen: Map<number, SizedTarget>;
+    /** Presented images of cameras above the bottom of their target, keyed by camera eid. */
+    stacked: Map<number, SizedTarget>;
+    scratch: Map<number, ScratchPair>;
+    lastTarget: number;
+}
+
+export const viewResourcesKey = { create: createViewResources };
+
+function createViewResources(world: World): ViewResources {
+    const resources: ViewResources = {
+        views: new Map(),
+        offscreen: new Map(),
+        stacked: new Map(),
+        scratch: new Map(),
+        lastTarget: 0,
+    };
+    world.onDispose(() => {
+        for (const view of resources.views.values()) {
+            if (view.canvas && _canvasViews.get(view.canvas)?.view === view)
+                _canvasViews.delete(view.canvas);
+            rejectFrameCaptures(
+                view,
+                new Error("captureFrame refused: world disposed before presentation"),
+            );
+            view.surfaceTexture = undefined;
+            view.surfaceView = undefined;
+            view.texture?.destroy();
+            view.context?.unconfigure();
+        }
+        resources.views.clear();
+        for (const target of resources.offscreen.values()) target.texture.destroy();
+        resources.offscreen.clear();
+        for (const target of resources.stacked.values()) target.texture.destroy();
+        resources.stacked.clear();
+        for (const pair of resources.scratch.values()) {
+            pair.a?.texture.destroy();
+            pair.b?.texture.destroy();
+        }
+        resources.scratch.clear();
+    });
+    return resources;
+}
+
+export function initializeViewState(world: World): void {
+    world.resource(viewResourcesKey);
+}
+
+/** every camera with a view, keyed by eid: canvas-bound ({@link attachCanvas}) or off-screen ({@link attachView}) */
+export const Views: import("../../engine").Resource<Map<number, View>> = {
+    create: (world) => world.resource(viewResourcesKey).views,
+};
+
+// canvas → the World that last bound it, for the dev-only rebuild guard below. WeakMap so a collected
+// canvas drops its entry; never populated in production (the guard is dev-gated).
+const _canvasOwners: WeakMap<HTMLCanvasElement, World> = new WeakMap();
+const CANVAS_VIEWS = Symbol.for("@dylanebert/shallot/canvas-views");
+const _canvasViews = (() => {
+    const registry = globalThis as unknown as Record<symbol, unknown>;
+    let views = registry[CANVAS_VIEWS] as
+        | WeakMap<HTMLCanvasElement, { world: World; view: View }>
+        | undefined;
+    if (!views) {
+        views = new WeakMap();
+        registry[CANVAS_VIEWS] = views;
+    }
+    return views;
+})();
+
+/** Live canvas binding used by the frame-capture path; no source exists before a camera binds. */
+export function canvasFrameBinding(
+    canvas: HTMLCanvasElement,
+): { world: World; view: View; device: GPUDevice } | undefined {
+    const binding = _canvasViews.get(canvas);
+    if (!binding || binding.world.disposed) return undefined;
+    const device = binding.world.gpu.device;
+    if (!device) return undefined;
+    return { ...binding, device: rawDevice(device) };
+}
+
+/** Reject readbacks queued for a canvas view that cannot reach its next presentation. */
+function rejectFrameCaptures(view: View, error: Error): void {
+    for (const capture of view.frameCaptures ?? []) capture.reject(error);
+    view.frameCaptures = undefined;
+}
+
+// Consumer bundlers may omit import.meta.env; missing or inaccessible DEV means production.
+export function devEnabled(): boolean {
+    try {
+        const env = import.meta.env as Record<string, unknown> | undefined;
+        return env?.DEV === true;
+    } catch {
+        return false;
+    }
+}
+
+/** Records canvas ownership; warns if a different live World still owns it. Call only in development. */
+export function trackCanvasOwner(canvas: HTMLCanvasElement, world: World): void {
+    const prior = _canvasOwners.get(canvas);
+    if (prior && prior !== world && !prior.disposed) {
+        console.warn(
+            "attachCanvas: canvas already bound to a live World — did an app rebuild without disposing the previous one? dispose it first (app.dispose() / world.dispose())",
+        );
+    }
+    _canvasOwners.set(canvas, world);
+}
+
+/** A live view of this World on `canvas` or `texture`, the target a joining camera shares. */
+function sharedView(
+    world: World,
+    canvas: HTMLCanvasElement | null,
+    texture: GPUTexture | null,
+    except?: View,
+): View | undefined {
+    for (const view of world.resource(Views).values()) {
+        if (view === except) continue;
+        if ((canvas && view.canvas === canvas) || (texture && view.texture === texture))
+            return view;
+    }
+    return undefined;
+}
+
+/**
+ * bind a canvas to a camera entity. A canvas another camera of this World holds is shared: the cameras
+ * draw bottom to top by {@link Camera} `order`. In dev builds it arms the rebuild guard
+ * ({@link trackCanvasOwner}), which catches a rebuild that skipped `dispose`.
+ */
+export function attachCanvas(world: World, eid: number, canvas: HTMLCanvasElement): void {
+    const _views = world.resource(Views);
+
+    if (!world.gpu.device) throw new Error("attachCanvas: RenderingPlugin not initialized");
+    if (!world.resource(RenderContext).format)
+        throw new Error("attachCanvas: RenderContext.format not set");
+    if (cameraView(world, eid)) throw new Error(`attachCanvas: eid ${eid} already bound`);
+
+    const shared = sharedView(world, canvas, null);
+    if (shared) {
+        _views.set(eid, {
+            canvas,
+            context: shared.context,
+            aspect: 1,
+            width: 0,
+            height: 0,
+            clientWidth: shared.clientWidth,
+            clientHeight: shared.clientHeight,
+            sampledClientWidth: shared.sampledClientWidth,
+            sampledClientHeight: shared.sampledClientHeight,
+            sampledDpr: shared.sampledDpr,
+            viewportIndex: shared.viewportIndex,
+            framebuffer: null,
+            present: null,
+            depth: null,
+            normal: null,
+            viewFromWorld: new Float32Array(16),
+            slot: 0,
+            camera: world.ref(eid),
+            target: shared.target,
+            sortedIndexForTarget: 0,
+        });
+        return;
+    }
+
+    const context = canvas.getContext("webgpu") as unknown as GPUCanvasContext | null;
+    if (!context) throw new Error("attachCanvas: WebGPU canvas context unavailable");
+
+    // record ownership only after the attach is validated — a failed attach must not claim the canvas, or a
+    // later legitimate attach from a different live World warns spuriously.
+    if (devEnabled()) trackCanvasOwner(canvas, world);
+
+    const rect = canvas.getBoundingClientRect();
+    const viewportIndex =
+        typeof document === "undefined"
+            ? 0
+            : Math.max(0, Array.from(document.querySelectorAll("canvas")).indexOf(canvas));
+    const dpr = (typeof window === "undefined" ? 1 : window.devicePixelRatio) || 1;
+    resizeViewport(world, viewportIndex, rect.width, rect.height, dpr);
+    const view: View = {
+        canvas,
+        context,
+        aspect: 1,
+        width: 0,
+        height: 0,
+        clientWidth: rect.width,
+        clientHeight: rect.height,
+        sampledClientWidth: canvas.clientWidth,
+        sampledClientHeight: canvas.clientHeight,
+        sampledDpr: dpr,
+        viewportIndex,
+        framebuffer: null,
+        present: null,
+        depth: null,
+        normal: null,
+        viewFromWorld: new Float32Array(16),
+        slot: 0,
+        camera: world.ref(eid),
+        target: ++world.resource(viewResourcesKey).lastTarget,
+        sortedIndexForTarget: 0,
+    };
+    sizeView(world, eid, view);
+    context.configure({
+        device: rawDevice(world.gpu.device),
+        format: navigator.gpu.getPreferredCanvasFormat(),
+        alphaMode: "premultiplied",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    surfaces.delete(context);
+    _views.set(eid, view);
+    _canvasViews.set(canvas, { world, view });
+}
+
+interface SurfaceState {
+    reconfigures: number;
+    error: GPUError | null;
+    settle: (error: GPUError | null) => void;
+}
+
+const surfaces = new WeakMap<GPUCanvasContext, SurfaceState>();
+const SURFACE_RECONFIGURES = 3;
+
+/** Acquire under an acquisition-only validation scope; other GPU work stays outside it.
+ * A failed acquisition repairs the canvas backing and configuration on its next frame.
+ * Three consecutive failed reconfigures fail permanently, naming the canvas viewport. */
+export function acquireCanvasTexture(world: World, view: View): GPUTexture | undefined {
+    const context = view.context!;
+    let state = surfaces.get(context);
+    if (!state) {
+        const current: SurfaceState = {
+            reconfigures: 0,
+            error: null,
+            settle: (error) => {
+                current.error = error;
+                if (!error) current.reconfigures = 0;
+            },
+        };
+        state = current;
+        surfaces.set(context, state);
+    }
+    const device = rawDevice(world.gpu.device);
+    const canvas = view.canvas!;
+    const limit = device.limits.maxTextureDimension2D;
+    // Invalid Chromium textures can retain the requested dimensions. Repair the
+    // backing before acquisition; dimensions of the returned texture cannot validate it.
+    const invalidBacking =
+        canvas.width === 0 || canvas.height === 0 || canvas.width > limit || canvas.height > limit;
+    if (state.error || invalidBacking) {
+        if (state.reconfigures >= SURFACE_RECONFIGURES)
+            throw new Error(
+                `Canvas surface ${view.canvas!.id || `viewport ${view.viewportIndex}`} failed after ${SURFACE_RECONFIGURES} reconfigures: ${state.error?.message ?? "backing dimensions outside device limits"}`,
+            );
+        const inputs = _sizeInputs.get(view);
+        canvas.width = Math.max(1, Math.min(limit, inputs?.[6] ?? view.width));
+        canvas.height = Math.max(1, Math.min(limit, inputs?.[7] ?? view.height));
+        context.configure(context.getConfiguration()!);
+        state.reconfigures++;
+        state.error = null;
+    }
+    device.pushErrorScope("validation");
+    let texture: GPUTexture;
+    try {
+        texture = context.getCurrentTexture();
+    } finally {
+        continueAcquisitionScope(popAcquisitionScope(device), state.settle);
+    }
+    // WebKit returns an empty invalid texture on a surface acquisition failure. Do not
+    // use it while the acquisition's validation scope settles: that would cause cascaded errors.
+    return texture.width > 0 && texture.height > 0 ? texture : undefined;
+}
+
+/**
+ * Backing dimensions in device pixels from CSS display dimensions. Zero resW/resH leaves an axis unset:
+ * both unset use display×ratio; a set axis is exact and one unset follows display aspect.
+ * pixelated marks backing below display size, including ratio < 1, for nearest-neighbor upscaling.
+ */
+export function backingSize(
+    resW: number,
+    resH: number,
+    clientW: number,
+    clientH: number,
+    ratio: number,
+): { w: number; h: number; pixelated: boolean } {
+    let w: number;
+    let h: number;
+    if (resW > 0 && resH > 0) {
+        w = resW;
+        h = resH;
+    } else if (resH > 0) {
+        h = resH;
+        w = Math.max(1, Math.round(resH * (clientW / clientH)));
+    } else if (resW > 0) {
+        w = resW;
+        h = Math.max(1, Math.round(resW * (clientH / clientW)));
+    } else {
+        w = Math.max(1, Math.floor(clientW * ratio));
+        h = Math.max(1, Math.floor(clientH * ratio));
+    }
+    return { w, h, pixelated: w < clientW || h < clientH };
+}
+
+// Cache by View identity so reattached cameras resolve size even when display inputs are unchanged.
+const _sizeInputs = new WeakMap<View, Float64Array>();
+
+/**
+ * Resolves scene size, destination rectangle and projection aspect. Refreshes canvas display geometry
+ * and resolves backing size from Resolution or world pixelRatio.
+ * Called after binding each frame; sets nearest-neighbor upscaling when undersized. Resolution edits
+ * apply without waiting for a resize event. Reads Resolution only when the entity carries it, so stale
+ * storage from a recycled eid cannot act as a pin. Only the bottom camera on a canvas sizes the canvas;
+ * one above it takes its own Resolution or the canvas size. Textures keep their attached dimensions;
+ * depth-only owners supply theirs. CameraViewport crops the scene image but sets aspect from its
+ * coordinate-pixel bounds, not its rounded backing dimensions.
+ */
+export function sizeView(world: World, eid: number, view: View): void {
+    sizeTarget(world, eid, view);
+    view.aspect = view.height > 0 ? view.width / view.height : 1;
+    if (view.canvas || view.texture) sizeCameraViewport(world, eid, view);
+}
+
+function sizeTarget(world: World, eid: number, view: View): void {
+    const canvas = view.canvas;
+    if (!canvas) {
+        if (view.texture) {
+            view.width = view.texture.width;
+            view.height = view.texture.height;
+        }
+        return;
+    }
+    // This read forces current layout before swapchain acquisition can use a stale display size.
+    const clientWidth = canvas.clientWidth;
+    const clientHeight = canvas.clientHeight;
+    const dpr = (typeof window === "undefined" ? 1 : window.devicePixelRatio) || 1;
+    if (
+        clientWidth !== view.sampledClientWidth ||
+        clientHeight !== view.sampledClientHeight ||
+        dpr !== view.sampledDpr
+    ) {
+        const rect = canvas.getBoundingClientRect();
+        view.sampledClientWidth = clientWidth;
+        view.sampledClientHeight = clientHeight;
+        view.sampledDpr = dpr;
+        resizeViewport(world, view.viewportIndex, rect.width, rect.height, dpr);
+    }
+    const viewport = world.resource(Viewports).get(view.viewportIndex);
+    view.clientWidth = viewport?.cssWidth ?? 0;
+    view.clientHeight = viewport?.cssHeight ?? 0;
+    if (!viewport || viewport.cssWidth <= 0 || viewport.cssHeight <= 0) {
+        view.width = 0;
+        view.height = 0;
+        return;
+    }
+    const ratio =
+        world.pixelRatio === "auto" ? Math.min(Math.max(viewport.dpr, 1), 2) : world.pixelRatio;
+    const pinned = world.has(eid, Resolution);
+    const bottom = !view.sortedIndexForTarget;
+    if (!bottom && !pinned) {
+        view.width = canvas.width;
+        view.height = canvas.height;
+        _sizeInputs.delete(view);
+        return;
+    }
+    const resW = pinned ? world.storage(Resolution).width.get(eid) | 0 : 0;
+    const resH = pinned ? world.storage(Resolution).height.get(eid) | 0 : 0;
+    let inputs = _sizeInputs.get(view);
+    if (
+        inputs &&
+        inputs[0] === resW &&
+        inputs[1] === resH &&
+        inputs[2] === view.clientWidth &&
+        inputs[3] === view.clientHeight &&
+        inputs[4] === ratio &&
+        inputs[5] === (bottom ? 1 : 0)
+    ) {
+        view.width = inputs[6]!;
+        view.height = inputs[7]!;
+        return;
+    }
+    if (!inputs) {
+        inputs = new Float64Array(8);
+        _sizeInputs.set(view, inputs);
+    }
+    inputs[0] = resW;
+    inputs[1] = resH;
+    inputs[2] = view.clientWidth;
+    inputs[3] = view.clientHeight;
+    inputs[4] = ratio;
+    inputs[5] = bottom ? 1 : 0;
+    const { w, h, pixelated } = backingSize(resW, resH, view.clientWidth, view.clientHeight, ratio);
+    view.width = inputs[6] = w;
+    view.height = inputs[7] = h;
+    if (!bottom) return;
+    const ir = pixelated ? "pixelated" : "auto";
+    if (canvas.style.imageRendering !== ir) canvas.style.imageRendering = ir;
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+}
+
+const _cameraRect: CameraRect = { x: 0, y: 0, width: 0, height: 0 };
+
+/** Crop the scene and presentation image after sizeView resolves the whole target's backing size. */
+function sizeCameraViewport(world: World, eid: number, view: View): void {
+    if (!world.has(eid, CameraViewport)) {
+        view.viewport = undefined;
+        return;
+    }
+    const width = view.texture?.width ?? view.clientWidth;
+    const height = view.texture?.height ?? view.clientHeight;
+    cameraRect(world, eid, width, height, _cameraRect);
+    const component = world.storage(CameraViewport);
+    if (component.x.get(eid) !== _cameraRect.x) component.x.set(eid, _cameraRect.x);
+    if (component.y.get(eid) !== _cameraRect.y) component.y.set(eid, _cameraRect.y);
+    if (component.width.get(eid) !== _cameraRect.width) component.width.set(eid, _cameraRect.width);
+    if (component.height.get(eid) !== _cameraRect.height)
+        component.height.set(eid, _cameraRect.height);
+    const rect = (view.viewport ??= { x: 0, y: 0, width: 0, height: 0 });
+    const targetWidth = view.texture?.width ?? view.canvas!.width;
+    const targetHeight = view.texture?.height ?? view.canvas!.height;
+    const x = width > 0 ? _cameraRect.x / width : 0;
+    const y = height > 0 ? _cameraRect.y / height : 0;
+    const w = width > 0 ? _cameraRect.width / width : 0;
+    const h = height > 0 ? _cameraRect.height / height : 0;
+    rect.x = Math.floor(x * targetWidth);
+    rect.y = Math.floor(y * targetHeight);
+    rect.width = Math.floor((x + w) * targetWidth) - rect.x;
+    rect.height = Math.floor((y + h) * targetHeight) - rect.y;
+    view.width = w > 0 ? Math.max(1, Math.floor(view.width * w)) : 0;
+    view.height = h > 0 ? Math.max(1, Math.floor(view.height * h)) : 0;
+    view.aspect = _cameraRect.height > 0 ? _cameraRect.width / _cameraRect.height : 1;
+}
+
+/**
+ * Bind a camera to a world-owned final texture in device pixels and return it. Dimensions stay fixed
+ * even with Resolution. Pass a texture another camera of this World holds to share it: the cameras
+ * draw bottom to top by {@link Camera} `order`. Detaching, pruning or disposing the last camera on it
+ * destroys it. Refuses non-cameras, duplicate bindings, uninitialized rendering, dimensions outside the
+ * device's texture limit and a texture no camera of this World holds. BeginFrameSystem acquires it on
+ * the next draw; the final pass writes the same base format as a canvas. A material or pass may
+ * sample the texture once its camera has drawn.
+ */
+export function attachTexture(
+    world: World,
+    eid: number,
+    target: { width: number; height: number } | GPUTexture,
+): GPUTexture {
+    const device = world.gpu.device;
+    if (!device || !world.resource(RenderContext).format)
+        throw new Error("attachTexture: RenderingPlugin not initialized");
+    if (!world.has(eid, Camera)) throw new Error("attachTexture: eid is not a camera");
+    if ("createView" in target) {
+        const shared = sharedView(world, null, target);
+        if (!shared) throw new Error("attachTexture: no camera of this World holds the texture");
+        attachView(world, eid);
+        const view = world.resource(Views).get(eid)!;
+        view.texture = target;
+        view.target = shared.target;
+        view.width = target.width;
+        view.height = target.height;
+        view.aspect = target.width / target.height;
+        return target;
+    }
+    const size = target;
+    for (const value of [size.width, size.height]) {
+        if (!Number.isInteger(value) || value <= 0 || value > device.limits.maxTextureDimension2D)
+            throw new RangeError(
+                "attachTexture: dimensions must be positive integers within maxTextureDimension2D",
+            );
+    }
+    attachView(world, eid);
+    const view = world.resource(Views).get(eid)!;
+    const texture = rawDevice(device).createTexture({
+        label: "camera final texture",
+        size: [size.width, size.height],
+        format: navigator.gpu.getPreferredCanvasFormat(),
+        usage:
+            GPUTextureUsage.RENDER_ATTACHMENT |
+            GPUTextureUsage.COPY_SRC |
+            GPUTextureUsage.TEXTURE_BINDING,
+    });
+    world.own(texture);
+    view.texture = texture;
+    view.target = ++world.resource(viewResourcesKey).lastTarget;
+    view.width = size.width;
+    view.height = size.height;
+    view.aspect = size.width / size.height;
+    return texture;
+}
+
+/**
+ * Register a depth-only view: it takes a cull slot and packs Camera + Transform, but has no
+ * framebuffer or presenting surface. Its caller renders to its own target. Refuses duplicate
+ * bindings; detachView, camera pruning and disposal release the view registration.
+ */
+export function attachView(world: World, eid: number): void {
+    const _views = world.resource(Views);
+
+    if (cameraView(world, eid)) throw new Error(`attachView: eid ${eid} already has a view`);
+    _views.set(eid, {
+        canvas: null,
+        context: null,
+        // square (aspect 1) — an off-screen view's own target sets the resolution; only the aspect
+        // feeds `computeClipFromWorld`, so a shadow's ortho box stays square
+        aspect: 1,
+        width: 1,
+        height: 1,
+        clientWidth: 0,
+        clientHeight: 0,
+        sampledClientWidth: 0,
+        sampledClientHeight: 0,
+        sampledDpr: 0,
+        viewportIndex: -1,
+        framebuffer: null,
+        present: null,
+        depth: null,
+        normal: null,
+        viewFromWorld: new Float32Array(16),
+        slot: 0,
+        camera: world.ref(eid),
+        target: 0,
+        sortedIndexForTarget: 0,
+    });
+}
+
+/** Release a camera's view and owned targets (canvas, texture or depth-only). A canvas or texture
+ * another camera still shares stays with it. Safe on unbound eids; targets the open frame encoder may
+ * reference are destroyed once that frame submits. */
+export function detachView(world: World, eid: number): void {
+    const _views = world.resource(Views);
+    const view = _views.get(eid);
+
+    if (view) {
+        const shared = sharedView(world, view.canvas, view.texture ?? null, view);
+        if (view.texture && !shared) world.retireGpuResource(view.texture);
+        view.canvasTexture = undefined;
+        view.surfaceTexture = undefined;
+        view.surfaceView = undefined;
+        if (view.canvas && _canvasViews.get(view.canvas)?.view === view) {
+            if (shared) {
+                shared.frameCaptures = view.frameCaptures;
+                view.frameCaptures = undefined;
+                _canvasViews.set(view.canvas, { world, view: shared });
+            } else _canvasViews.delete(view.canvas);
+        }
+        rejectFrameCaptures(
+            view,
+            new Error("captureFrame refused: canvas detached before presentation"),
+        );
+    }
+    _views.delete(eid);
+    releaseOffscreen(world, eid);
+    releaseStacked(world, eid);
+    releaseScratch(world, eid);
+    releaseViewTargets(world, eid);
+}
+
+/** The eid's View while the entity it was attached to is live. A View left by a destroyed
+ * entity, including one whose eid was recycled, is released here rather than at the next frame. */
+export function cameraView(world: World, eid: number): View | undefined {
+    const view = world.resource(Views).get(eid);
+    if (!view || world.resolve(view.camera)) return view;
+    detachView(world, eid);
+    return undefined;
+}
+
+/**
+ * Releases views whose camera despawned or lost Camera, including recycled eids before their first frame.
+ * PrepareViewsSystem calls this before binding; retained references prevent a replacement camera from
+ * inheriting the previous camera's canvas or texture.
+ */
+export function pruneViews(world: World): void {
+    world.resource(Views).forEach(pruneView, world);
+}
+
+function pruneView(this: World, view: View, eid: number): void {
+    if (!this.resolve(view.camera) || !this.has(eid, Camera)) detachView(this, eid);
+}
+
+/** the camera's offscreen color target, (re)allocated to the view size. Renderer-agnostic: the main pass's
+ * MSAA resolve and the `Custom` single-sample draw both target it; {@link BeginFrameSystem} sets it on
+ * `view.framebuffer` each frame. Stored per camera so views never overwrite one shared target.
+ * Uses RenderContext.format for linear HDR color, preserving values above one until tonemapping. */
+export function offscreen(world: World, eid: number, w: number, h: number): GPUTextureView {
+    const _viewResources = world.resource(viewResourcesKey);
+
+    const cached = _viewResources.offscreen.get(eid);
+    if (cached && cached.w === w && cached.h === h) return cached.view;
+    cached?.texture.destroy();
+    const texture = world.gpu.device.createTexture({
+        label: `shallot-offscreen-${eid}`,
+        size: { width: w, height: h },
+        format: world.resource(RenderContext).format,
+        // Keep the actual scene target readable by `probeTexture` without inserting a render pass.
+        usage:
+            GPUTextureUsage.RENDER_ATTACHMENT |
+            GPUTextureUsage.TEXTURE_BINDING |
+            GPUTextureUsage.COPY_SRC,
+    });
+    const view = texture.createView();
+    _viewResources.offscreen.set(eid, { texture, view, w, h });
+    return view;
+}
+
+/** @internal the World-owned texture behind a camera's rendered offscreen view. */
+export function offscreenTexture(world: World, eid: number): GPUTexture | undefined {
+    return world.resource(viewResourcesKey).offscreen.get(eid)?.texture;
+}
+
+/** The presented image of a camera above the bottom or with a rectangle, (re)allocated to the view size in the
+ * target's format. Its presentation writes it; EndFrameSystem blends it over the target. */
+export function stacked(world: World, eid: number, w: number, h: number): GPUTextureView {
+    const _viewResources = world.resource(viewResourcesKey);
+
+    const cached = _viewResources.stacked.get(eid);
+    if (cached && cached.w === w && cached.h === h) return cached.view;
+    cached?.texture.destroy();
+    const texture = world.gpu.device.createTexture({
+        label: `shallot-stacked-${eid}`,
+        size: { width: w, height: h },
+        format: navigator.gpu.getPreferredCanvasFormat(),
+        usage:
+            GPUTextureUsage.RENDER_ATTACHMENT |
+            GPUTextureUsage.TEXTURE_BINDING |
+            GPUTextureUsage.COPY_SRC,
+    });
+    const view = texture.createView();
+    _viewResources.stacked.set(eid, { texture, view, w, h });
+    return view;
+}
+
+/** Release a camera's stacked image once it is the bottom of its target or has no view. */
+export function releaseStacked(world: World, eid: number): void {
+    const _viewResources = world.resource(viewResourcesKey);
+
+    const target = _viewResources.stacked.get(eid);
+    if (target) world.retireGpuResource(target.texture);
+    _viewResources.stacked.delete(eid);
+}
+
+function releaseOffscreen(world: World, eid: number): void {
+    const _viewResources = world.resource(viewResourcesKey);
+
+    const offscreen = _viewResources.offscreen.get(eid);
+    if (offscreen) world.retireGpuResource(offscreen.texture);
+    _viewResources.offscreen.delete(eid);
+}
+
+// Scene-transform scratches support storage writes as well as render attachments.
+interface Scratch {
+    texture: GPUTexture;
+    view: GPUTextureView;
+}
+
+const SCENE_SCRATCH_FORMAT: GPUTextureFormat = "rgba16float";
+
+function scratchTexture(world: World, eid: number, slot: "a" | "b", w: number, h: number): Scratch {
+    const texture = world.gpu.device.createTexture({
+        label: `scene-scratch-${eid}-${slot}`,
+        size: { width: w, height: h },
+        format: SCENE_SCRATCH_FORMAT,
+        usage:
+            GPUTextureUsage.STORAGE_BINDING |
+            GPUTextureUsage.TEXTURE_BINDING |
+            GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    return { texture, view: texture.createView() };
+}
+
+/**
+ * Redirects scene color through a compute effect: read is the current framebuffer; write is the other
+ * half of a lazily allocated, per-camera rgba16float scratch pair and becomes the next framebuffer.
+ * Bind read as input and write as storage output, then dispatch before the next effect reads it.
+ * Call after MainPassSystem, before OverlaySystem for scene effects or after it for overlays,
+ * and before presentation. read and write never alias within a call.
+ * BeginFrameSystem resets the chain to the offscreen each frame. The result object is reused on this
+ * camera's next call; later calls also reuse earlier scratch outputs, so do not retain those outputs
+ * as independent images. A single effect allocates only the first scratch.
+ */
+export function sceneTransform(world: World, view: View, eid: number): SceneTransformResult {
+    const _viewResources = world.resource(viewResourcesKey);
+
+    const read = view.framebuffer;
+    if (!read) throw new Error("sceneTransform: view has no framebuffer");
+    let pair = _viewResources.scratch.get(eid);
+    if (!pair || pair.w !== view.width || pair.h !== view.height) {
+        pair?.a?.texture.destroy();
+        pair?.b?.texture.destroy();
+        pair = {
+            a: null,
+            b: null,
+            w: view.width,
+            h: view.height,
+            result: { read, write: read },
+        };
+        _viewResources.scratch.set(eid, pair);
+    }
+    const slot: "a" | "b" = read === pair.a?.view ? "b" : "a";
+    const scratch = (pair[slot] ??= scratchTexture(world, eid, slot, view.width, view.height));
+    view.framebuffer = scratch.view;
+    view.framebufferFormat = SCENE_SCRATCH_FORMAT;
+    pair.result.read = read;
+    pair.result.write = scratch.view;
+    return pair.result;
+}
+
+function releaseScratch(world: World, eid: number): void {
+    const _viewResources = world.resource(viewResourcesKey);
+
+    const pair = _viewResources.scratch.get(eid);
+    if (pair?.a) world.retireGpuResource(pair.a.texture);
+    if (pair?.b) world.retireGpuResource(pair.b.texture);
+    _viewResources.scratch.delete(eid);
+}
+
+export function clearOffscreens(world: World): void {
+    const _viewResources = world.resource(viewResourcesKey);
+
+    for (const o of _viewResources.offscreen.values()) o.texture.destroy();
+    _viewResources.offscreen.clear();
+    for (const o of _viewResources.stacked.values()) o.texture.destroy();
+    _viewResources.stacked.clear();
+}
+
+export function clearScratch(world: World): void {
+    const _viewResources = world.resource(viewResourcesKey);
+
+    for (const p of _viewResources.scratch.values()) {
+        p.a?.texture.destroy();
+        p.b?.texture.destroy();
+    }
+    _viewResources.scratch.clear();
+}
+
+/**
+ * auto-bind a camera to the first `<canvas>` in the document, idempotently, sharing it with any
+ * camera already there. A no-op (returns undefined) headless or until a canvas mounts;
+ * `PrepareViewsSystem` retries each frame, so a late-mounted canvas binds when it appears.
+ * Multi-view binds each camera explicitly via {@link attachCanvas} before its first frame.
+ */
+export function bindCamera(eid: number, world: World): View | undefined {
+    const _views = world.resource(Views);
+
+    const existing = _views.get(eid);
+    if (existing) return existing;
+    if (typeof document === "undefined") return undefined;
+    const canvas = document.querySelector("canvas");
+    if (!(canvas instanceof HTMLCanvasElement)) return undefined;
+    attachCanvas(world, eid, canvas);
+    return _views.get(eid);
+}

@@ -1,0 +1,75 @@
+{
+  "source_sha256": "4ba1f6c53b4ba0291e3be04913e0fb09e73b07d9655e8af6812f5d3952b5d32a",
+  "entries": [
+    {
+      "id": "rx-lib99-plain-round-7row",
+      "role": "whole_circle",
+      "also_roles": [
+        "rim_cap",
+        "flank",
+        "return_base"
+      ],
+      "size_band": {
+        "rows": 7,
+        "px_wide": 93,
+        "band": "l"
+      },
+      "context": {
+        "tangent_in": "none",
+        "tangent_out": "none",
+        "curvature": "closed",
+        "inside": "enclosed",
+        "paper": "whole interior is paper; outside paper on all sides (two stray `.` at pen 0 on rows 5-6 lie 40+ px left of the slice)"
+      },
+      "native": {
+        "rows": [
+          "　　　＿＿",
+          "　 ､ ｀　　　` ､",
+          " /　　　　　　 ‘，",
+          " {　　　 　 　 　 }",
+          "‘，　　　　 　 /",
+          "　 ^ ､ 　 　 ､ `",
+          "　　　￣￣"
+        ],
+        "row_numbers": [
+          1,
+          7
+        ],
+        "x_px": [
+          40,
+          150
+        ],
+        "row_pen_x": [
+          44,
+          44,
+          44,
+          43,
+          47,
+          41,
+          44
+        ]
+      },
+      "ports": {
+        "left": "paper",
+        "right": "paper",
+        "up": "paper",
+        "down": "paper"
+      },
+      "source": {
+        "repo": "unicode-glyph-morphology-explorer",
+        "src": "lib:shapes#99",
+        "label": "線・図形・図表 (lines/shapes) 【円形・球】 section, aa[99] (plain frame of the aa[98]/[135]/[136] globe series)",
+        "aahub_url": "https://aahub.org/mlt/a7065b14a8fb85fd61e0a2e01e91501b",
+        "cited_by": "aahub-reference-index.md 'Role-organized component libraries' (shapes: circles/spheres section)"
+      },
+      "crop": "crops/rx-lib99-plain-round-7row.png",
+      "note": "Plain isolated 7-row round, ink 93 x 88 px (nonwhite bbox of the --png crop). Cap row 1 `＿＿` (sits at the bottom of its row), return row 7 `￣￣` (sits at the top), so ink is only ~5.2 rows tall: about 2 px under the 95 px width target and ~6 px under the 94 px height floor of the xs fit (107 px envelope, 0.75-row tolerance) - a near miss, recorded so Studio can test it; sparse lost-and-found rim of commas/ticks between brace flanks.",
+      "status": {
+        "state": "retained",
+        "reason": "catalog entry in the skill-indexed shapes library circle section; not operator-approved; slightly under the xs envelope"
+      },
+      "inspection": "row 1 `＿＿`@77/93 flat cap; row 2 `､ ｀`@60/72 and `` ` ､``@113/125 shoulders; row 3 `/`@49 left and `‘，`@128/136 right; row 4 `{`@48 and `}`@138 flanks at the widest row; row 5 `‘，`@47/55 and `/`@131; row 6 `^ ､`@57/69 and `､ ``@113/125 lower shoulders; row 7 `￣￣`@77/93 return; interior all paper, each side a gap-separated chain of light marks",
+      "inspected_by": "rounds-xs agent"
+    }
+  ]
+}

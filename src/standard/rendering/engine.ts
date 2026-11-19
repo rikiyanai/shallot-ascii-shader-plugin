@@ -1,0 +1,318 @@
+// The canonical engine substrate: the shared group-0 layout every standard pipeline binds,
+// plus `lit` / `litPbr` / `clusterOf` and their four private seams, authored
+// once against that layout.
+
+import tgpu from "typegpu";
+import * as d from "typegpu/data";
+import * as std from "typegpu/std";
+import { MeshQuant } from "../../core/mesh";
+import { FrameGpu, ViewUniforms } from "../../core/rendering";
+import { clusterCell, LightClusters } from "./cluster";
+import { IndirectLightInput, indirectLight } from "./indirect";
+import { distanceAttenuation, LightingGpu, PointLightGpu, spotFactor } from "./lighting";
+import { brdf, brdfSphere, Pbr, pointShadowRef } from "./shade";
+
+/**
+ * The shared group-0 layout for standard pipelines. Bindings vary by view and pass: color reads
+ * this frame's prepass textures; depth passes bind zero stubs to avoid sampling their attachments.
+ * Holds frame, view and lighting uniforms, clustered lights, mesh dequantization, AO and prepass
+ * textures. Vertex streams belong to material group 2: color reads the 16-byte stream, compact
+ * depth passes the 8-byte position stream.
+ */
+export const engineLayout = tgpu
+    .bindGroupLayout({
+        frame: { uniform: FrameGpu, visibility: ["vertex", "fragment"] },
+        view: { uniform: ViewUniforms, visibility: ["vertex", "fragment"] },
+        lighting: { uniform: LightingGpu, visibility: ["vertex", "fragment"] },
+        pointLights: {
+            storage: LightClusters,
+            access: "readonly",
+            visibility: ["fragment"],
+        },
+        meshQuant: {
+            storage: d.arrayOf(MeshQuant),
+            access: "readonly",
+            visibility: ["vertex"],
+        },
+        prepassDepth: {
+            texture: d.texture2d(),
+            sampleType: "unfilterable-float",
+            visibility: ["fragment"],
+        },
+        prepassNormal: {
+            texture: d.texture2d(),
+            sampleType: "unfilterable-float",
+            visibility: ["fragment"],
+        },
+        ambientOcclusion: {
+            texture: d.texture2d(),
+            sampleType: "unfilterable-float",
+            visibility: ["fragment"],
+        },
+    })
+    .$idx(0);
+
+export const prepassDepthRead = tgpu.fn(
+    [d.vec4f],
+    d.f32,
+)((coord) => {
+    "use gpu";
+    return std.textureLoad(engineLayout.$.prepassDepth, d.vec2i(coord.xy), 0).x;
+});
+export const prepassNormalRead = tgpu.fn(
+    [d.vec4f],
+    d.vec3f,
+)((coord) => {
+    "use gpu";
+    const encoded = std.textureLoad(engineLayout.$.prepassNormal, d.vec2i(coord.xy), 0).xyz;
+    if (std.all(std.eq(encoded, d.vec3f(0)))) return d.vec3f(0);
+    return std.normalize(std.sub(std.mul(encoded, 2), 1));
+});
+export const prepassDepthSlot = tgpu.slot<typeof prepassDepthRead>().$name("prepassDepth");
+export const prepassNormalSlot = tgpu.slot<typeof prepassNormalRead>().$name("prepassNormal");
+
+/** This view's prepass device depth this frame, in reverse-Z (0 is far).
+ * Calling without readsPrepass.depth is refused. Cameras without a prepass this frame and
+ * depth passes read 0; 4x antialiasing reads sample 0. */
+export const prepassDepth = tgpu.fn(
+    [d.vec4f],
+    d.f32,
+)((coord) => {
+    "use gpu";
+    return prepassDepthSlot.$(coord);
+});
+/** This view's prepass world-space unit normal this frame.
+ * Calling without readsPrepass.normal is refused. Cameras without a prepass this frame and
+ * depth passes read vec3f(0). Cleared prepass pixels also read vec3f(0): their zero texel
+ * encodes no unit normal. 4x antialiasing reads sample 0. */
+export const prepassNormal = tgpu.fn(
+    [d.vec4f],
+    d.vec3f,
+)((coord) => {
+    "use gpu";
+    return prepassNormalSlot.$(coord);
+});
+
+/** the sun-shadow seam: the sun's visibility at this fragment (1.0 = unshadowed), multiplied into the
+ *  sun term only. Filled by a real-reference color-pass caller via `sampleSunShadow`; the default
+ *  (vertex stage, shadowless frames) is fully lit. */
+export const sunVisibility = tgpu.privateVar(d.f32, 1);
+/** the point-light seam: the fragment's world position, read by {@link litPbr}'s
+ *  clustered loop. Zero in the vs / prepass entries, where the point term is never enabled. */
+export const fragWorld = tgpu.privateVar(d.vec3f, d.vec3f(0));
+/** the point-light seam: `@builtin(position)`, read by {@link clusterOf} to map the fragment to its
+ *  froxel cluster. */
+export const fragCoord = tgpu.privateVar(d.vec4f, d.vec4f(0));
+/** the point-light seam's enable flag: 0 in the vs / prepass entries (no point contribution), 1 in the
+ *  color fs. */
+export const pointScale = tgpu.privateVar(d.f32, 0);
+
+const pointShadowOf = pointShadowRef();
+
+export const SurfaceOcclusion = d.struct({ diffuse: d.vec3f, specular: d.f32 });
+/** Bevy pbr_fragment.wesl:538–545. Specular applies only to indirect specular radiance,
+ * not to the punctual-light BRDF; standard currently supplies only diffuse indirect light. */
+export const surfaceOcclusion = tgpu.fn(
+    [d.vec3f, d.f32, d.f32, d.f32],
+    SurfaceOcclusion,
+)((baseColor, material, ndotv, perceptualRoughness) => {
+    "use gpu";
+    const visibility = ambientVisibility();
+    const a = std.sub(std.mul(2.0404, baseColor), 0.3324);
+    const b = std.add(std.mul(-4.7951, baseColor), 0.6417);
+    const c = std.add(std.mul(2.7552, baseColor), 0.6903);
+    const x = d.vec3f(visibility);
+    const multibounce = std.max(x, std.mul(std.add(std.mul(std.add(std.mul(x, a), b), x), c), x));
+    return SurfaceOcclusion({
+        diffuse: std.min(d.vec3f(material), multibounce),
+        specular: std.saturate(
+            std.pow(
+                ndotv + visibility,
+                std.exp2(-16 * perceptualRoughness * perceptualRoughness - 1),
+            ) -
+                1 +
+                visibility,
+        ),
+    });
+});
+/** this color fragment's SSAO visibility, 1 elsewhere. Bevy specializes its view layout on SSAO
+ *  (`MeshPipelineViewLayoutKey::SCREEN_SPACE_AMBIENT_OCCLUSION`); standard pipelines serve every
+ *  view, so a view without SSAO binds a 1x1 stub holding 1, read at the clamped coordinate. */
+const ambientVisibility = tgpu.fn(
+    [],
+    d.f32,
+)(() => {
+    "use gpu";
+    if (std.getShaderStage() !== "fragment") return 1;
+    if (pointScale.$ === 0) return 1;
+    const last = std.sub(d.vec2i(std.textureDimensions(engineLayout.$.ambientOcclusion)), 1);
+    return std.textureLoad(
+        engineLayout.$.ambientOcclusion,
+        std.min(d.vec2i(fragCoord.$.xy), last),
+        0,
+    ).x;
+});
+
+/** the fragment's slot-major cluster index ({@link clusterCell}). ViewUniforms depth recovers from the position
+ *  builtin: perspective clip.w is the view depth (`fragCoord.w = 1/clip.w`); orthographic depth is
+ *  linear in `fragCoord.z`.
+ */
+export const clusterOf = tgpu.fn(
+    [],
+    d.u32,
+)(() => {
+    "use gpu";
+    const near = engineLayout.$.view.projection.x;
+    const far = engineLayout.$.view.projection.y;
+    let viewZ = 1 / fragCoord.$.w;
+    if (engineLayout.$.view.projection.z < 0.5) {
+        viewZ = far - fragCoord.$.z * (far - near);
+    }
+    return clusterCell(
+        fragCoord.$.x / engineLayout.$.view.resolution.x,
+        fragCoord.$.y / engineLayout.$.view.resolution.y,
+        viewZ,
+        near,
+        far,
+        engineLayout.$.view.projection.z > 0.5,
+        d.u32(engineLayout.$.view.projection.w),
+    );
+});
+
+/** per-pixel (or per-vertex) metallic-roughness shading.
+ *  Reads the sun-shadow / point-cluster seam: {@link sunVisibility} and {@link pointScale} /
+ *  {@link fragWorld} are fs-scaffold privates, so a vs-side call gets neither point lights nor sun
+ *  shadows. At metallic 0 / dielectric 0 specular vanishes and the response is Lambert at any roughness.
+ */
+const litPbrRadiance = tgpu.fn(
+    [Pbr, d.vec3f, d.vec3f, d.vec3f],
+    d.vec3f,
+)((s, normal, world, V) => {
+    "use gpu";
+    const exposure = engineLayout.$.view.exposure;
+    let indirect = indirectLight(
+        IndirectLightInput({
+            worldPosition: world,
+            normal,
+            view: V,
+            materialOcclusion: s.occlusion,
+            ambientRadiance: engineLayout.$.view.ambientColor.rgb,
+        }),
+    );
+    // At visibility 1, as on the stub, material occlusion stands: WGSL division may round m / m off 1.
+    if (ambientVisibility() < 1) {
+        const occlusion = surfaceOcclusion(
+            s.albedo,
+            s.occlusion,
+            std.max(std.dot(normal, V), 0),
+            s.roughness,
+        );
+        // indirectLight already applied material occlusion; replace it with the per-channel minimum.
+        if (s.occlusion > 0) indirect = std.mul(indirect, std.div(occlusion.diffuse, s.occlusion));
+    }
+    let radiance = d.vec3f(std.mul(std.mul(indirect, exposure), s.albedo));
+    for (let i = d.u32(0); i < engineLayout.$.lighting.directionalCount; i++) {
+        const light = engineLayout.$.lighting.directionalLights[i];
+        let visibility = d.f32(1);
+        if (light.params.y > 0) visibility = sunVisibility.$;
+        radiance = d.vec3f(
+            std.add(
+                radiance,
+                std.mul(
+                    std.mul(light.color.rgb, light.params.x * exposure * visibility),
+                    brdf(s, normal, V, std.neg(light.direction.xyz)),
+                ),
+            ),
+        );
+    }
+    if (std.getShaderStage() === "fragment" && pointScale.$ !== 0) {
+        const entry = engineLayout.$.pointLights.grid[clusterOf()];
+        for (let i = d.u32(0); i < entry.y; i++) {
+            const light = PointLightGpu(
+                engineLayout.$.pointLights.lights.lights[
+                    engineLayout.$.pointLights.indices[entry.x + i]
+                ],
+            );
+            const toLight = std.sub(light.posRange.xyz, fragWorld.$);
+            const distSq = std.dot(toLight, toLight);
+            const radiusSq = light.params.x * light.params.x;
+            const dist = std.sqrt(std.max(distSq, 1e-8));
+            const L = std.div(toLight, dist);
+            const f =
+                distanceAttenuation(distSq, light.posRange.w, radiusSq) *
+                spotFactor(light, L) *
+                pointShadowOf(
+                    light,
+                    normal,
+                    fragWorld.$,
+                    d.u32(engineLayout.$.view.shadowFilteringMethod),
+                );
+            // Preserve product order to retain f32 rounding.
+            radiance = d.vec3f(
+                std.add(
+                    radiance,
+                    std.mul(
+                        std.mul(light.color.rgb, f * exposure),
+                        brdfSphere(s, normal, V, L, dist, light.params.x),
+                    ),
+                ),
+            );
+        }
+    }
+    return radiance;
+});
+
+/** the normal the fragment last lit with, valid when {@link litRecorded} is set; written only under
+ *  {@link recordLitNormal}. */
+export const litNormal = tgpu.privateVar(d.vec3f, d.vec3f(0));
+export const litRecorded = tgpu.privateVar(d.bool, false);
+
+/** every depth pass's lighting: records the normal lighting received, which the normal prepass
+ *  writes, and returns zero radiance, so no depth pipeline samples the shadow atlases it writes. */
+export const recordLitNormal = tgpu
+    .fn(
+        [Pbr, d.vec3f, d.vec3f, d.vec3f],
+        d.vec3f,
+    )((_s, normal, _world, _V) => {
+        "use gpu";
+        litNormal.$ = d.vec3f(normal);
+        litRecorded.$ = true;
+        return d.vec3f(0);
+    })
+    .$name("recordLitNormal");
+
+/** the lighting seam {@link litPbr} calls through: real shading by default; depth pipelines bind
+ *  {@link recordLitNormal} (`root.with(lightingSlot, recordLitNormal)`). */
+export const lightingSlot = tgpu.slot(litPbrRadiance).$name("lightingSlot");
+
+/** {@link litPbrRadiance} through {@link lightingSlot}; `lit` and `applyPbrLighting` shade here. */
+export const litPbr = tgpu.fn(
+    [Pbr, d.vec3f, d.vec3f, d.vec3f],
+    d.vec3f,
+)((s, normal, world, V) => {
+    "use gpu";
+    return lightingSlot.$(s, normal, world, V);
+});
+
+/** Camera-exposed linear color of a diffuse surface under ambient, sun and clustered point/spot lights,
+ *  before fog: StandardMaterial's response at metallic 0, which has no specular. Use it in a custom
+ *  material's fragment to light its own base color; for metallic, roughness, occlusion or emissive,
+ *  use `applyPbrLighting` over `pbrInputFromMaterial`. `normal` is world-space and unit length.
+ *  In every depth pass (the depth and normal prepasses and the shadow atlases) `lit` returns zero, and
+ *  `applyPbrLighting` emissive alone, so a cutoff on alpha derived from lit color sees that value
+ *  there. The normal prepass writes the normal of the fragment's last `lit` or `applyPbrLighting`
+ *  call, or the interpolated normal without one. */
+export const lit = tgpu.fn(
+    [d.vec3f, d.vec3f],
+    d.vec3f,
+)((baseColor, normal) => {
+    "use gpu";
+    const world = fragWorld.$;
+    const V = std.normalize(std.sub(engineLayout.$.view.eye.xyz, world));
+    return litPbr(
+        Pbr({ albedo: baseColor, metallic: 0, roughness: 1, occlusion: 1, dielectric: 0 }),
+        normal,
+        world,
+        V,
+    );
+});

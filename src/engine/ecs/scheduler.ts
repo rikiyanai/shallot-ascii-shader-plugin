@@ -1,0 +1,478 @@
+import { SYSTEM_MEASURE_PREFIX, sampleDiagnosticTime, userTimingSpan } from "../diagnostics";
+import type { World } from "./world";
+
+function invalidDelta(): never {
+    throw new Error("step deltaTime must be a finite, non-negative number");
+}
+
+export const Time = {
+    FIXED_DT: 1 / 60,
+    DEFAULT_DT: 1 / 60,
+    MAX_FIXED_STEPS: 4,
+} as const;
+
+export interface Time {
+    /** In fixed/postFixed, FIXED_DT seconds; otherwise clamped and scaled virtual frame seconds (0 while paused). */
+    deltaTime: number;
+    /** seconds since last frame, raw rAF interval before clamping or scaling */
+    rawDeltaTime: number;
+    /** Clamped real seconds since last frame, unaffected by pause or scale. */
+    realDeltaTime: number;
+    /** fixed timestep interval (1/60), constant; slow-mo reduces tick frequency, not per-tick dt */
+    fixedDeltaTime: number;
+    /** In fixed/postFixed, fixedTick * FIXED_DT seconds; otherwise total virtual frame seconds, frozen while paused. */
+    elapsed: number;
+    /** total elapsed real time in seconds (advances with {@link Time.realDeltaTime}, runs through a pause) */
+    realElapsed: number;
+    /** virtual timescale multiplier (1 = real time, <1 slow-mo, >1 fast-forward). set via `world.setTimeScale` */
+    scale: number;
+    /** Freezes the virtual frame clock and step's fixed work, not explicit ticks. Resume retains scale. */
+    paused: boolean;
+    /** Paced ticks in the last completed fixed loop (0–4); explicit/replay ticks do not change it. */
+    fixedSteps: number;
+    /** Simulation tick, rewound by restore and advanced by every paced or explicit tick. */
+    fixedTick: number;
+    /** Increments on jumpToTick, never on ordinary ticks or snapshot recovery. */
+    fixedTickRevision: number;
+    /** Accumulator fraction in [0, 1), updated after paced ticks for render interpolation; unchanged by replay. */
+    fixedAlpha: number;
+    /** true when fixed steps were clamped this frame */
+    throttled: boolean;
+}
+
+/** preFixed runs once per frame before paced ticks; postFixed runs after every fixed tick,
+ * including explicit and replay ticks. Both use the ordinary system ordering rules. */
+export type SystemGroup = "setup" | "preFixed" | "fixed" | "postFixed" | "simulation" | "draw";
+
+export interface System {
+    readonly update?: (world: World) => void;
+    readonly setup?: (world: World) => void;
+    readonly dispose?: (world: World) => void;
+    /** profiler/debug label; falls back to `pluginName/index` when omitted */
+    readonly name?: string;
+    readonly group?: SystemGroup;
+    readonly first?: boolean;
+    readonly last?: boolean;
+    /** runs after every other system in its group; at most one terminal system is allowed */
+    readonly terminal?: boolean;
+    /** @internal Module-owned slot outside ordinary ordering, including terminal systems.
+     * Each end holds a set ordered by its before/after edges; contradictory or cyclic order is refused. */
+    readonly boundary?: "before" | "after";
+    readonly before?: readonly System[];
+    readonly after?: readonly System[];
+}
+
+function systemGroup(system: System): SystemGroup {
+    return system.group ?? "simulation";
+}
+
+export class Scheduler {
+    logAndPauseErrors = false;
+    private readonly _systems = new Set<System>();
+    private readonly _boundaries = new Map<System, "before" | "after">();
+    private _drawWorld: World | undefined;
+    private readonly _runDraw = () => this.runGroup(this._drawWorld!, "draw");
+    private _systemsVersion = 0;
+    private _accumulator = 0;
+    private readonly _initialized = new WeakSet<System>();
+    private readonly _errored = new Set<System>();
+    private _cache = new Map<SystemGroup, System[]>();
+    private _cacheVersion = -1;
+    private _time: Time = {
+        deltaTime: 0,
+        rawDeltaTime: 0,
+        realDeltaTime: 0,
+        fixedDeltaTime: Time.FIXED_DT,
+        elapsed: 0,
+        realElapsed: 0,
+        scale: 1,
+        paused: false,
+        fixedSteps: 0,
+        fixedTick: 0,
+        fixedTickRevision: 0,
+        fixedAlpha: 0,
+        throttled: false,
+    };
+    private readonly _names = new Map<System, string>();
+    private readonly _nameCounters = new Map<string, number>();
+    private readonly _measurement = new Float64Array(2);
+    /** The system executing synchronously, including setup; restored after nested runs. */
+    currentSystem?: string;
+    /** @internal Group of the executing synchronous system callback. */
+    currentSystemGroup?: SystemGroup;
+    /** Borrowed [monotonic seconds, CPU milliseconds], reused after the callback. */
+    record?: (name: string, measurement: Readonly<Float64Array>) => void;
+    /** optional fence-wait telemetry sink — installed by the profile plugin */
+    fenceWait?: (ms: number) => void;
+
+    /** @internal Capture the integer simulation clock, not frame pacing. */
+    snapshot(): number {
+        return this._time.fixedTick;
+    }
+
+    /** @internal Recovery changes only the integer simulation clock, never frame pacing. */
+    restore(tick: number): void {
+        this._time.fixedTick = tick;
+    }
+
+    jumpToTick(tick: number): void {
+        this._time.fixedTick = tick;
+        this._time.fixedTickRevision++;
+    }
+
+    get time(): Readonly<Time> {
+        return this._time;
+    }
+
+    pause(): void {
+        this._time.paused = true;
+    }
+
+    resume(): void {
+        this._time.paused = false;
+    }
+
+    discardOverstep(seconds: number): void {
+        if (!Number.isFinite(seconds) || seconds < 0)
+            throw new Error("discardOverstep requires finite, non-negative seconds");
+        this._accumulator = Math.max(0, this._accumulator - seconds);
+    }
+
+    setScale(scale: number): void {
+        if (!Number.isFinite(scale))
+            throw new Error(`timescale received ${scale} (must be a finite number)`);
+        this._time.scale = Math.max(0, scale);
+    }
+
+    dispose(world: World): void {
+        for (const system of this._systems) {
+            try {
+                system.dispose?.(world);
+            } catch (err) {
+                console.error(
+                    `System "${this._names.get(system) ?? system.name ?? "?"}" threw during dispose:`,
+                    err,
+                );
+            }
+        }
+        // A disposed world runs no system, including the rest of the pass that disposed it.
+        this._systems.clear();
+        this._errored.clear();
+        this._boundaries.clear();
+        this._systemsVersion++;
+    }
+
+    /** @internal Module-owned slots bracket every ordinary system, including terminal systems. */
+    registerBoundary(system: System, position: "before" | "after", pluginName?: string): void {
+        this._boundaries.set(system, position);
+        this.register(system, pluginName);
+    }
+
+    register(system: System, pluginName?: string): void {
+        this._systems.add(system);
+        this._systemsVersion++;
+        if (system.name !== undefined) {
+            this._names.set(system, pluginName ? `${pluginName}/${system.name}` : system.name);
+        } else if (pluginName !== undefined) {
+            const prefix = pluginName || "?";
+            const idx = this._nameCounters.get(prefix) ?? 0;
+            this._nameCounters.set(prefix, idx + 1);
+            this._names.set(system, `${prefix}/${idx}`);
+        }
+    }
+
+    unregister(system: System): void {
+        if (this._systems.delete(system)) {
+            this._errored.delete(system);
+            this._boundaries.delete(system);
+            this._names.delete(system);
+            this._initialized.delete(system);
+            this._systemsVersion++;
+        }
+    }
+
+    has(system: System): boolean {
+        return this._systems.has(system);
+    }
+
+    step(
+        world: World,
+        input: Readonly<{ deltaTime: number }>,
+        withDrawGroup?: (run: () => void) => void,
+    ): void {
+        const deltaTime = input.deltaTime;
+        if (!Number.isFinite(deltaTime) || deltaTime < 0) {
+            invalidDelta();
+        }
+        const fixedDt = Time.FIXED_DT;
+        const maxDt = fixedDt * Time.MAX_FIXED_STEPS;
+
+        this._time.rawDeltaTime = deltaTime;
+        // Bound catch-up work after a long real frame.
+        const real = Math.min(deltaTime, maxDt);
+        this._time.realDeltaTime = real;
+        this._time.realElapsed += real;
+
+        const scaled = this._time.paused ? 0 : real * this._time.scale;
+        this._time.deltaTime = scaled;
+        this._time.elapsed += scaled;
+        this._accumulator += scaled;
+
+        this.runGroup(world, "setup");
+        this.runGroup(world, "preFixed");
+
+        // Scale must not bypass the catch-up cap; drop excess backlog instead of carrying frame debt.
+        let steps = 0;
+        while (this._accumulator >= fixedDt && steps < Time.MAX_FIXED_STEPS) {
+            this.tick(world);
+            this._accumulator -= fixedDt;
+            steps++;
+        }
+        const postScaleOverrun = this._accumulator >= fixedDt;
+        if (postScaleOverrun) this._accumulator %= fixedDt;
+        this._time.throttled = (!this._time.paused && deltaTime > maxDt) || postScaleOverrun;
+        this._time.fixedSteps = steps;
+        this._time.fixedAlpha = this._accumulator / fixedDt;
+
+        this._time.deltaTime = scaled;
+        this.runGroup(world, "simulation");
+        if (withDrawGroup) {
+            this._drawWorld = world;
+            try {
+                withDrawGroup(this._runDraw);
+            } finally {
+                this._drawWorld = undefined;
+            }
+        } else {
+            this.runGroup(world, "draw");
+        }
+    }
+
+    tick(world: World): void {
+        const deltaTime = this._time.deltaTime;
+        const elapsed = this._time.elapsed;
+        this._time.fixedTick++;
+        this._time.deltaTime = Time.FIXED_DT;
+        this._time.elapsed = this._time.fixedTick * Time.FIXED_DT;
+        try {
+            this.runGroup(world, "fixed");
+            this.runGroup(world, "postFixed");
+        } finally {
+            this._time.deltaTime = deltaTime;
+            this._time.elapsed = elapsed;
+        }
+    }
+
+    private runGroup(world: World, group: SystemGroup): void {
+        const record = this.record;
+        const systems = this.getSorted(group);
+        for (let i = 0; i < systems.length; i++) {
+            const system = systems[i];
+            // A system removed by an earlier one in this pass stays out until it is added again.
+            if (!this._systems.has(system) || this._errored.has(system)) continue;
+            const previous = this.currentSystem;
+            const previousGroup = this.currentSystemGroup;
+            this.currentSystemGroup = group;
+            const name = this._names.get(system) ?? system.name ?? "?";
+            this.currentSystem = this._names.get(system);
+            try {
+                if (this._initialized.has(system)) this.update(world, system, record);
+                else this.runFirst(world, system, record);
+            } catch (e) {
+                if (!this.logAndPauseErrors) {
+                    throw new Error(
+                        `System "${name}" threw: ${e instanceof Error ? e.message : String(e)}`,
+                        { cause: e },
+                    );
+                }
+                // A running host keeps its frame loop. A failed system still registered stays paused until
+                // it is removed and added again, which reruns its setup.
+                const registered = this._systems.has(system);
+                if (registered) this._errored.add(system);
+                console.error(
+                    registered
+                        ? `System "${name}" threw and is paused until its next reload:`
+                        : `System "${name}" threw after it was removed:`,
+                    e,
+                );
+            } finally {
+                this.currentSystem = previous;
+                this.currentSystemGroup = previousGroup;
+            }
+        }
+    }
+
+    private update(world: World, system: System, record: Scheduler["record"]): void {
+        if (!system.update) return;
+        if (!record) {
+            system.update(world);
+            return;
+        }
+        sampleDiagnosticTime(this._measurement);
+        const t0 = this._measurement[0];
+        system.update(world);
+        if (!this._systems.has(system)) return;
+        sampleDiagnosticTime(this._measurement);
+        this._measurement[1] = (this._measurement[0] - t0) * 1000;
+        record(this._names.get(system) ?? "?", this._measurement);
+    }
+
+    /** Runs a system's setup and first update, each under a User Timing span. */
+    private runFirst(world: World, system: System, record: Scheduler["record"]): void {
+        const name = `${SYSTEM_MEASURE_PREFIX}${this._names.get(system) ?? system.name ?? "?"}`;
+        if (system.setup) userTimingSpan(`${name}:setup`, () => system.setup!(world));
+        if (!this._systems.has(system)) return;
+        this._initialized.add(system);
+        if (system.update)
+            userTimingSpan(`${name}:first-update`, () => this.update(world, system, record));
+    }
+
+    private getSorted(group: SystemGroup): System[] {
+        if (this._systemsVersion !== this._cacheVersion) {
+            if (this._cache.size !== 0) this._cache.clear();
+            this._cacheVersion = this._systemsVersion;
+        }
+
+        const cached = this._cache.get(group);
+        if (cached) return cached;
+
+        const all = Array.from(this._systems);
+        const filtered = all.filter((s) => systemGroup(s) === group);
+        validate(filtered, all, this._boundaries);
+        const ordinary = filtered.filter((s) => !this._boundaries.has(s));
+        const start = filtered.filter((s) => this._boundaries.get(s) === "before");
+        const end = filtered.filter((s) => this._boundaries.get(s) === "after");
+        const sorted = [
+            ...kahnSort(start, edgesOf(start)),
+            ...sortSystems(ordinary),
+            ...kahnSort(end, edgesOf(end)),
+        ];
+        this._cache.set(group, sorted);
+        return sorted;
+    }
+}
+
+function sortSystems(systems: System[]): System[] {
+    const first = systems.filter((s) => s.first);
+    const last = systems.filter((s) => s.last);
+    const terminal = systems.filter((s) => s.terminal);
+    const normal = systems.filter((s) => !s.first && !s.last && !s.terminal);
+
+    return [
+        ...kahnSort(first, edgesOf(first)),
+        ...kahnSort(normal, edgesOf(normal)),
+        ...kahnSort(last, edgesOf(last)),
+        ...terminal,
+    ];
+}
+
+function kahnSort(nodes: System[], edges: [System, System][]): System[] {
+    if (nodes.length === 0) return [];
+    const adj = new Map<System, System[]>();
+    const inDegree = new Map<System, number>();
+    for (const node of nodes) {
+        adj.set(node, []);
+        inDegree.set(node, 0);
+    }
+    for (const [from, to] of edges) {
+        if (!adj.has(from) || !inDegree.has(to)) continue;
+        adj.get(from)!.push(to);
+        inDegree.set(to, inDegree.get(to)! + 1);
+    }
+    const sorted: System[] = [];
+    const queue: System[] = [];
+    for (const node of nodes) if (inDegree.get(node) === 0) queue.push(node);
+    while (queue.length) {
+        const node = queue.shift()!;
+        sorted.push(node);
+        for (const next of adj.get(node)!) {
+            const d = inDegree.get(next)! - 1;
+            inDegree.set(next, d);
+            if (d === 0) queue.push(next);
+        }
+    }
+    if (sorted.length !== nodes.length) {
+        throw new Error("Circular dependency between systems");
+    }
+    return sorted;
+}
+
+function edgesOf(systems: System[]): [System, System][] {
+    const edges: [System, System][] = [];
+    for (const system of systems) {
+        for (const target of system.before ?? []) {
+            if (systems.includes(target)) edges.push([system, target]);
+        }
+        for (const target of system.after ?? []) {
+            if (systems.includes(target)) edges.push([target, system]);
+        }
+    }
+    return edges;
+}
+
+function validate(
+    systems: System[],
+    all: System[],
+    boundaries: ReadonlyMap<System, "before" | "after">,
+): void {
+    const terminals = systems.filter((s) => s.terminal && !boundaries.has(s));
+    if (terminals.length > 1)
+        throw new Error("System group cannot have more than one terminal system");
+
+    for (const s of systems) {
+        if (s.first && s.last)
+            throw new Error("System cannot have both first and last constraints");
+        if (s.terminal && (s.first || s.last)) {
+            throw new Error("System cannot combine terminal with first or last constraints");
+        }
+        const group = systemGroup(s);
+        const sRank = systemRank(s, boundaries);
+        for (const ref of [...(s.before ?? []), ...(s.after ?? [])]) {
+            if (!all.includes(ref)) continue;
+            const refGroup = systemGroup(ref);
+            if (refGroup !== group) {
+                throw new Error(`Cross-group constraint: ${group} references ${refGroup}`);
+            }
+            // satisfiable cross-partition constraints hold by construction (first < normal < last)
+            // and stay silent; only the unsatisfiable direction errors
+            const refRank = systemRank(ref, boundaries);
+            if (s.before?.includes(ref) && sRank > refRank) {
+                throw new Error(
+                    `Unsatisfiable ordering: a ${partitionName(sRank)} system cannot run before a ${partitionName(refRank)} system`,
+                );
+            }
+            if (s.after?.includes(ref) && sRank < refRank) {
+                throw new Error(
+                    `Unsatisfiable ordering: a ${partitionName(sRank)} system cannot run after a ${partitionName(refRank)} system`,
+                );
+            }
+        }
+    }
+}
+
+function systemRank(system: System, boundaries: ReadonlyMap<System, "before" | "after">): number {
+    return boundaries.get(system) === "before"
+        ? -1
+        : boundaries.get(system) === "after"
+          ? 4
+          : system.first
+            ? 0
+            : system.last
+              ? 2
+              : system.terminal
+                ? 3
+                : 1;
+}
+function partitionName(rank: number): string {
+    return rank === -1
+        ? "before boundary"
+        : rank === 4
+          ? "after boundary"
+          : rank === 0
+            ? "first"
+            : rank === 2
+              ? "last"
+              : rank === 3
+                ? "terminal"
+                : "normal";
+}

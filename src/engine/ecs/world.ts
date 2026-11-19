@@ -1,0 +1,1198 @@
+import type * as d from "typegpu/data";
+import {
+    createFrameEncoder,
+    finishFrameEncoder,
+    ReadbackPool,
+    submitFrame,
+    type WorldGpu,
+} from "../runtime";
+import { FieldColumns } from "./columns";
+import {
+    type Component,
+    type ComponentRecord,
+    Components,
+    type ComponentValues,
+    declaration,
+    fields,
+    freezeComponent,
+    idOf,
+    isPresentation,
+    type ScalarField,
+    sameComponentSchema,
+    type Vector2Field,
+    type Vector4Field,
+} from "./component";
+import { Entities, type EntityRef } from "./entity";
+import { type Recovery, SnapshotComposition, type WorldSnapshot } from "./snapshot";
+
+export type { WorldSnapshot } from "./snapshot";
+
+import { Queries } from "./query";
+import { ComponentRegistry } from "./registry";
+import { Scheduler, type System, Time } from "./scheduler";
+import { type ChangeClock, type ComponentStorage, WorldField } from "./storage";
+import { GpuTable, type GpuTableOptions } from "./table";
+
+const INITIAL_CAPACITY = 16;
+const UPLOAD_CHUNK_BYTES = 64 * 1024;
+interface UploadChunk {
+    buffer: GPUBuffer;
+    offset: number;
+    fence: number;
+    used: boolean;
+}
+interface FrameCopy {
+    source: GPUBuffer | undefined;
+    sourceOffset: number;
+    destination: GPUBuffer | undefined;
+    destinationOffset: number;
+    size: number;
+}
+
+/** A world-owned value identified by its declaration, or an explicit reload-stable key. */
+export type Resource<T> = {
+    readonly create: (world: World) => T;
+    /** Opt into carrying this value across re-evaluated declarations. The owner must refuse
+     * a carried shape its new code cannot use. Keys must be unique to the resource. */
+    readonly key?: symbol;
+};
+
+/**
+ * Owns its entity storage, resources, GPU tables and allocations registered with {@link own};
+ * {@link dispose} releases them, never the GPU device.
+ */
+export class World {
+    /** this world's component registrations, with their defaults and requirements. @internal */
+    readonly registry = new ComponentRegistry();
+    private _scheduler = new Scheduler();
+    private _frameEncoder: GPUCommandEncoder | undefined;
+    private readonly _frameSubmitCallbacks: ((() => void) | undefined)[] = [];
+    private _frameSubmitCallbackCount = 0;
+    private readonly _frameEncoderDescriptor: GPUCommandEncoderDescriptor = {
+        label: "shallot-frame",
+    };
+    private _lastSubmittedEncoder: GPUCommandEncoder | undefined;
+    private readonly _commandBuffers: GPUCommandBuffer[] = [];
+    private _frameFence: Promise<void> | undefined;
+    private _inDrawGroup = false;
+    private _retiredResources: (GPUBuffer | GPUTexture)[] = [];
+    private _frameCopies: FrameCopy[] = [];
+    private _frameCopyCount = 0;
+    private _uploadChunks: UploadChunk[] = [];
+    private _frameUploadBytes = 0;
+    private _stepping = false;
+    private _recovering = false;
+    private _columns = new FieldColumns();
+    /** @internal The change tick this world's field marks stamp. */
+    readonly changeClock: ChangeClock = { tick: 1 };
+    private _snapshots = new SnapshotComposition(
+        (operation) =>
+            this._stepping &&
+            this.currentSystemGroup !== "preFixed" &&
+            !(operation === "snapshot" && this.currentSystemGroup === "postFixed"),
+        () => `${this.registry.revision}/${this._storage.size}`,
+        () => {
+            for (const entry of this.registry.entries()) this.storage(entry.component);
+        },
+    );
+    private _readback: ReadbackPool | undefined;
+
+    /** One-shot buffer and texture staging owned by this world. */
+    get readback(): ReadbackPool {
+        if (this._disposed) throw new Error("readback world is disposed");
+        return (this._readback ??= new ReadbackPool(this));
+    }
+
+    private readonly _stepInput = { deltaTime: Time.DEFAULT_DT };
+    private readonly _runDrawGroup = (run: () => void) => this.runDrawGroup(run);
+    private readonly _runStep = () =>
+        this._scheduler.step(this, this._stepInput, this._runDrawGroup);
+    private _entities = new Entities();
+    private _survivors = new Set<number>();
+    private _components = new Components(
+        () => this._queries.restore(this._components, this._entities),
+        (id, eid, present) => {
+            const component = this._storage.get(id)?.schema;
+            if (!component) return;
+            for (const table of this._tablesByComponent.get(id) ?? []) {
+                if (present) table.attachComponent(eid, component);
+                else table.detachComponent(eid, component);
+            }
+            this.notifyMembership(component, eid, present);
+        },
+        (id, eid) => this._queries.onComponentChanged(id, eid, this._components),
+        (eid) => this._survivors.has(eid),
+    );
+    private _queries = new Queries();
+    // Per destroy nesting depth, the entity and its held component ids, so a destroy inside an
+    // observer keeps its caller's list and a destroy of an entity already being destroyed is a no-op.
+    private readonly _destroying: number[] = [];
+    private readonly _held: number[][] = [];
+    private _destroyDepth = 0;
+    private _storage = new Map<
+        number,
+        {
+            schema: Component;
+            presentation: boolean;
+            schemas: WeakSet<Component>;
+            fields: Map<string, WorldField>;
+            storage: Record<string, unknown>;
+        }
+    >();
+    private _resources = new Map<Resource<unknown> | symbol, unknown>();
+    private _tables = new Map<string, GpuTable>();
+    private _tablesByComponent = new Map<number, GpuTable[]>();
+    private _membershipObservers = new Map<number, Set<(eid: number, present: boolean) => void>>();
+    private get _highWater(): number {
+        return this._columns.highWater;
+    }
+    private set _highWater(value: number) {
+        this._columns.highWater = value;
+    }
+    private _pixelRatio: number | "auto";
+    private _fieldUploadSeen = false;
+    private _changesClearedAtUpload = false;
+    private _disposals: (() => void)[] = [];
+    private _controller: AbortController | undefined;
+    private _disposed = false;
+    private _gpu: WorldGpu | undefined;
+    private _gpuResources = new Set<{ destroy(): void }>();
+
+    constructor(opts?: { pixelRatio?: number | "auto" }) {
+        this._pixelRatio = opts?.pixelRatio ?? "auto";
+        this._columns.highWater = 1;
+        this._snapshots.register(Symbol("entities"), {
+            snapshot: () => this._entities.snapshot(),
+            restore: (state) => {
+                this._survivors.clear();
+                for (const eid of this._entities.all())
+                    if (
+                        state.sparse[eid] < state.count &&
+                        state.dense[state.sparse[eid]] === eid &&
+                        state.generation[eid] === this._entities.generation(eid)
+                    )
+                        this._survivors.add(eid);
+                this._entities.restore(state);
+            },
+        });
+        this._snapshots.register(Symbol("fields"), this._columns);
+        this._snapshots.register(Symbol("clock"), this._scheduler);
+        this._snapshots.register(Symbol("membership"), this._components);
+    }
+
+    /** Fence for the latest draw-group submission; a propagated draw error may set it to the engine-copy replay's fence.
+     * Undefined when neither submitted. Reading it issues no fence. */
+    get frameFence(): Promise<void> | undefined {
+        return this._frameFence;
+    }
+
+    /** this world's GPU device, typed root and frame state; unavailable when the build acquired no device. */
+    get gpu(): WorldGpu {
+        if (!this._gpu)
+            throw new Error(
+                "World.gpu is unavailable: no enabled plugin declares a GPU requirement",
+            );
+        return this._gpu;
+    }
+
+    /** Diagnostic identity of the system executing synchronously, including setup; absent outside the schedule. */
+    get currentSystem(): string | undefined {
+        return this._scheduler.currentSystem;
+    }
+
+    /** @internal Group of the system executing synchronously; absent outside the schedule. */
+    get currentSystemGroup() {
+        return this._scheduler.currentSystemGroup;
+    }
+
+    /** @internal GPU context for lifecycle code that must also run without a device. */
+    get gpuIfAvailable(): WorldGpu | undefined {
+        return this._gpu;
+    }
+
+    /** @internal attach this world's GPU context during build. */
+    attachGpu(compute: WorldGpu): void {
+        this._gpu = compute;
+    }
+
+    /**
+     * Resolve once per declaration object or explicit key in this World. Reloaded declarations
+     * create fresh values unless they share a key; carrying a value does not run the new creator.
+     * Creators register cleanup with onDispose or own, which runs at world disposal.
+     * Refuses after disposal; this does not invalidate caller-retained references.
+     */
+    resource<T>(declaration: Resource<T>): T {
+        if (this._disposed) throw new Error("World.resource: world is disposed");
+        const key = declaration.key ?? declaration;
+        if (this._resources.has(key)) return this._resources.get(key) as T;
+        const value = declaration.create(this);
+        this._resources.set(key, value);
+        return value;
+    }
+
+    /** Own an allocation until disposal or explicit destruction; destroy immediately if already disposed. */
+    own(resource: { destroy(): void }): void {
+        if (this._disposed) {
+            resource.destroy();
+            return;
+        }
+        if (this._gpuResources.has(resource)) return;
+        this._gpuResources.add(resource);
+        const destroy = resource.destroy;
+        resource.destroy = () => {
+            this._gpuResources.delete(resource);
+            resource.destroy = destroy;
+            destroy.call(resource);
+        };
+    }
+
+    /** Queue a stable callback for this draw group only. Call while drawing, where the state it commits
+     * is encoded; it runs after submission, or at successful group end without an encoder, and is dropped
+     * on a draw error. The callback must not throw. */
+    onFrameSubmit(callback: () => void): void {
+        if (!this._inDrawGroup)
+            throw new Error(
+                "World.onFrameSubmit is available only during the draw group of step()",
+            );
+        if (this._disposed) throw new Error("World.onFrameSubmit: world is disposed");
+        const index = this._frameSubmitCallbackCount++;
+        if (index === this._frameSubmitCallbacks.length) this._frameSubmitCallbacks.push(callback);
+        else this._frameSubmitCallbacks[index] = callback;
+    }
+
+    /** The current draw group's command encoder, opened on first use. Outside draw this refuses;
+     * a CPU-only World returns undefined while a GPU-backed draw may record commands. */
+    frameEncoder(): GPUCommandEncoder | undefined {
+        if (!this._inDrawGroup)
+            throw new Error("World.frameEncoder is available only during the draw group of step()");
+        if (!this._gpu) return undefined;
+        return (this._frameEncoder ??= createFrameEncoder(
+            this.gpu.device,
+            this._frameEncoderDescriptor,
+        ));
+    }
+
+    private runDrawGroup(run: () => void): void {
+        this.beginDrawGroup();
+        try {
+            run();
+        } catch (error) {
+            this.abortDrawGroup();
+            throw error;
+        }
+        this.endDrawGroup();
+    }
+
+    private beginDrawGroup(): void {
+        this.resetFrameSubmitCallbacks();
+        this._inDrawGroup = true;
+    }
+
+    /** Submit recorded work once, then issue the fence that owns its staging ranges. */
+    private endDrawGroup(): void {
+        this._inDrawGroup = false;
+        const encoder = this._frameEncoder;
+        this._frameEncoder = undefined;
+        if (encoder && !this._disposed) this.submitDrawEncoder(encoder);
+        else this.releaseRetiredResources();
+        this.resetFrameCopies();
+        if (!this._disposed) this.runFrameSubmitCallbacks();
+        else this.resetFrameSubmitCallbacks();
+    }
+
+    private runFrameSubmitCallbacks(): void {
+        const count = this._frameSubmitCallbackCount;
+        this._frameSubmitCallbackCount = 0;
+        try {
+            for (let i = 0; i < count; i++) {
+                if (this._disposed) break;
+                const callback = this._frameSubmitCallbacks[i]!;
+                this._frameSubmitCallbacks[i] = undefined;
+                callback();
+            }
+        } finally {
+            if (!this._disposed)
+                for (let i = 0; i < count; i++) this._frameSubmitCallbacks[i] = undefined;
+        }
+    }
+
+    private resetFrameSubmitCallbacks(): void {
+        for (let i = 0; i < this._frameSubmitCallbackCount; i++)
+            this._frameSubmitCallbacks[i] = undefined;
+        this._frameSubmitCallbackCount = 0;
+    }
+
+    /** Drop system work and submit only the engine copies needed to preserve table state. */
+    private abortDrawGroup(): void {
+        this._inDrawGroup = false;
+        this._frameEncoder = undefined;
+        this.resetFrameSubmitCallbacks();
+        if (this._frameCopyCount > 0 && !this._disposed) {
+            const encoder = this.gpu.device.createCommandEncoder({ label: "shallot-frame-replay" });
+            for (let i = 0; i < this._frameCopyCount; i++) {
+                const copy = this._frameCopies[i];
+                encoder.copyBufferToBuffer(
+                    copy.source!,
+                    copy.sourceOffset,
+                    copy.destination!,
+                    copy.destinationOffset,
+                    copy.size,
+                );
+            }
+            this.submitDrawEncoder(encoder);
+        } else {
+            this.releaseRetiredResources();
+        }
+        this.resetFrameCopies();
+    }
+
+    private submitDrawEncoder(encoder: GPUCommandEncoder): void {
+        const commandBuffer = finishFrameEncoder(encoder);
+        // Keep the spent wrapper reachable: V8 otherwise clears its weak method feedback and
+        // recompiles this boundary after GC.
+        this._lastSubmittedEncoder = encoder;
+        this._commandBuffers[0] = commandBuffer;
+        submitFrame(this.gpu.device.queue, this._commandBuffers);
+        for (const chunk of this._uploadChunks) {
+            if (!chunk.used) continue;
+            chunk.used = false;
+            chunk.fence = this.gpu.fences.issued + 1;
+        }
+        this._frameFence = this.gpu.sync();
+        this.releaseRetiredResources();
+    }
+
+    private releaseRetiredResources(): void {
+        for (const resource of this._retiredResources) resource.destroy();
+        this._retiredResources.length = 0;
+    }
+
+    private recordFrameCopy(
+        source: GPUBuffer,
+        sourceOffset: number,
+        destination: GPUBuffer,
+        destinationOffset: number,
+        size: number,
+    ): void {
+        let copy = this._frameCopies[this._frameCopyCount];
+        if (copy) {
+            copy.source = source;
+            copy.sourceOffset = sourceOffset;
+            copy.destination = destination;
+            copy.destinationOffset = destinationOffset;
+            copy.size = size;
+        } else {
+            copy = { source, sourceOffset, destination, destinationOffset, size };
+            this._frameCopies.push(copy);
+        }
+        this._frameCopyCount++;
+    }
+
+    private resetFrameCopies(): void {
+        for (let i = 0; i < this._frameCopyCount; i++) {
+            const copy = this._frameCopies[i];
+            copy.source = undefined;
+            copy.destination = undefined;
+            copy.size = 0;
+            copy.sourceOffset = 0;
+            copy.destinationOffset = 0;
+        }
+        this._frameCopyCount = 0;
+    }
+
+    /** @internal Growth records in draw; otherwise its immediate submission follows preceding queue writes.
+     * Old buffers retire after the copy submission. */
+    growGpuBuffer(previous: GPUBuffer, buffer: GPUBuffer): void {
+        if (this._inDrawGroup) {
+            this.frameEncoder()!.copyBufferToBuffer(previous, 0, buffer, 0, previous.size);
+            this.recordFrameCopy(previous, 0, buffer, 0, previous.size);
+            this._retiredResources.push(previous);
+        } else {
+            const encoder = this.gpu.device.createCommandEncoder();
+            encoder.copyBufferToBuffer(previous, 0, buffer, 0, previous.size);
+            this.gpu.device.queue.submit([encoder.finish()]);
+            previous.destroy();
+        }
+    }
+
+    /** @internal Destroy a buffer or texture the open frame encoder may reference once that frame submits;
+     * with no encoder open, destroy it now. */
+    retireGpuResource(resource: GPUBuffer | GPUTexture): void {
+        if (this._frameEncoder) this._retiredResources.push(resource);
+        else resource.destroy();
+    }
+
+    /** @internal Outside draw, writes use queue order. Draw uploads share the encoder and recycle after its fence. */
+    uploadGpuTable(buffer: GPUBuffer, offset: number, data: ArrayBufferLike, size: number): void {
+        if (!this._inDrawGroup) {
+            this.gpu.device.queue.writeBuffer(buffer, offset, data as ArrayBuffer, offset, size);
+            return;
+        }
+        const limit = this.gpu.device.limits.maxBufferSize;
+        if (size > limit - this._frameUploadBytes)
+            throw new Error(
+                `GPU table frame uploads exceed the ${limit}-byte frame budget: ${this._frameUploadBytes} bytes recorded, ${size} more requested`,
+            );
+        const encoder = this.frameEncoder()!;
+        const chunk = this.uploadChunk(size);
+        this._frameUploadBytes += size;
+        const sourceOffset = chunk.offset;
+        chunk.offset += size;
+        chunk.used = true;
+        this.gpu.device.queue.writeBuffer(
+            chunk.buffer,
+            sourceOffset,
+            data as ArrayBuffer,
+            offset,
+            size,
+        );
+        encoder.copyBufferToBuffer(chunk.buffer, sourceOffset, buffer, offset, size);
+        this.recordFrameCopy(chunk.buffer, sourceOffset, buffer, offset, size);
+    }
+
+    // Append until submission completion makes an entire chunk reusable.
+    // In-flight chunks may accept more bytes, but never overwrite a recorded copy's source.
+    private uploadChunk(size: number): UploadChunk {
+        for (const chunk of this._uploadChunks) {
+            if (!chunk.used && chunk.fence <= this.gpu.fences.completed) chunk.offset = 0;
+            if (chunk.buffer.size - chunk.offset >= size) return chunk;
+        }
+        const limit = this.gpu.device.limits.maxBufferSize;
+        let capacity = Math.min(UPLOAD_CHUNK_BYTES, limit);
+        while (capacity < size && capacity < limit) capacity = Math.min(capacity * 2, limit);
+        const buffer = this.gpu.device.createBuffer({
+            label: "table-upload-chunk",
+            size: capacity,
+            usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        });
+        this.own(buffer);
+        const chunk: UploadChunk = {
+            buffer,
+            offset: 0,
+            fence: 0,
+            used: false,
+        };
+        this._uploadChunks.push(chunk);
+        return chunk;
+    }
+
+    /** Whether this world owns a registered resource. */
+    owns(resource: { destroy(): void }): boolean {
+        return this._gpuResources.has(resource);
+    }
+
+    /** Declare a world-owned dense-slot table with one TypeGPU record layout.
+     * Names are unique within this world; disposal releases its buffers. */
+    table<T extends d.AnyWgslData>(
+        name: string,
+        record: T,
+        options?: GpuTableOptions,
+    ): GpuTable<T> {
+        if (this._tables.has(name)) throw new Error(`World.table: duplicate table "${name}"`);
+        const table = new GpuTable(this, name, record, options);
+        this._tables.set(name, table);
+        return table;
+    }
+
+    /** @internal Bind a table's dense rows to a component's membership lifecycle. */
+    bindTableComponent(component: Component, table: GpuTable): void {
+        const id = idOf(component);
+        const tables = this._tablesByComponent.get(id);
+        if (tables) {
+            if (tables.includes(table)) return;
+            tables.push(table);
+        } else {
+            this._tablesByComponent.set(id, [table]);
+        }
+        for (const eid of this.query([component])) table.attachComponent(eid, component);
+    }
+
+    /**
+     * Call `observer(eid, present)` each time `eid` gains or loses `component`; the returned function
+     * stops it. When it runs, `has` already reports the new membership.
+     * - Attachment through {@link add} notifies after the component's defaults and values are
+     *   written and its missing required companions are added, each notifying first, so every
+     *   field is readable. An attachment whose defaults, values or companions throw is undone
+     *   without notifying; companions already added stay. Replacing the values of a held
+     *   component does not notify.
+     * - Detachment through {@link remove} or {@link destroy} notifies before the fields clear, so
+     *   they still read the values being removed, and writes to them are lost. Destroy notifies
+     *   once every membership has cleared.
+     * - {@link restore} notifies only the eids whose membership of `component` changed, after the
+     *   restored values are in place.
+     *
+     * An observer may change other entities, and components of `eid` with no change in progress,
+     * immediately. Unsupported, with undefined results: changing `eid`'s membership of a component
+     * whose attachment or detachment on `eid` is in progress, which includes `component` itself
+     * and a component whose required companions are being added; adding to `eid` while it is
+     * being destroyed; and any membership change or {@link restore} inside a restore notification. Destroying `eid` while it is being destroyed does nothing. An error thrown out
+     * of an observer propagates once every observer of the change has run and the change, or the
+     * whole restore, is complete.
+     */
+    observeMembership(
+        component: Component,
+        observer: (eid: number, present: boolean) => void,
+    ): () => void {
+        const id = idOf(component);
+        let observers = this._membershipObservers.get(id);
+        if (!observers) this._membershipObservers.set(id, (observers = new Set()));
+        observers.add(observer);
+        return () => {
+            observers!.delete(observer);
+            if (observers!.size === 0) this._membershipObservers.delete(id);
+        };
+    }
+
+    private notifyMembership(component: Component, eid: number, present: boolean): void {
+        const observers = this._membershipObservers.get(idOf(component));
+        if (observers) notify(observers, eid, present);
+    }
+
+    /** @internal Advance the change tick and return the one marks stamped until now. A consumer that
+     * keeps the last return reads, on its next latch, the mark words whose `changeTicks` are newer,
+     * as a Bevy system compares change ticks with its last run. */
+    incrementChangeTick(): number {
+        return this.changeClock.tick++;
+    }
+
+    /** @internal Resolve the world-owned column for engine change consumers. */
+    fieldStorage(component: Component, name: string): WorldField {
+        this.storage(component);
+        const field = this._storage.get(idOf(component))?.fields.get(name);
+        if (!field) throw new Error(`World.fieldStorage: unknown field "${name}"`);
+        return field;
+    }
+
+    /** @internal Unbind a table from a component's membership lifecycle. */
+    unbindTableComponent(component: Component, table: GpuTable): void {
+        const id = idOf(component);
+        const tables = this._tablesByComponent.get(id);
+        if (!tables) return;
+        const index = tables.indexOf(table);
+        if (index >= 0) tables.splice(index, 1);
+        if (tables.length === 0) this._tablesByComponent.delete(id);
+    }
+
+    /** @internal Find the table that owns a current record, active-list or eid-map buffer. */
+    tableForBuffer(buffer: GPUBuffer): GpuTable | undefined {
+        for (const table of this._tables.values()) {
+            if (
+                table.buffer === buffer ||
+                table.activeRowsBuffer === buffer ||
+                table.eidToRowBuffer === buffer
+            )
+                return table;
+        }
+        return undefined;
+    }
+
+    /** @internal Upload all declared tables at the head of draw. */
+    uploadTables(): void {
+        for (const table of this._tables.values()) table.upload();
+    }
+
+    /** Highest allocated entity id plus one; each component's columns grow only to cover its holders. */
+    get entityHighWater(): number {
+        return this._highWater;
+    }
+
+    /** render device-pixel ratio fixed to this world's build config. */
+    get pixelRatio(): number | "auto" {
+        return this._pixelRatio;
+    }
+
+    /** current component schemas and their world-owned field columns. @internal */
+    storageEntries(): IterableIterator<{
+        schema: Component;
+        fields: Map<string, WorldField>;
+    }> {
+        return this._storage.values();
+    }
+
+    /** clear field marks after this world's frame upload point. @internal */
+    clearChanges(): void {
+        for (const entry of this._storage.values()) {
+            for (const field of entry.fields.values()) field.dirty.fill(0);
+        }
+        this._changesClearedAtUpload = true;
+    }
+
+    /** record that this world's field upload point is running. @internal */
+    markFieldUploadPoint(): void {
+        this._fieldUploadSeen = true;
+    }
+
+    /** clear marks only when no earlier upload system did so this frame. @internal */
+    clearChangesIfNeeded(): void {
+        if (!this._fieldUploadSeen && !this._changesClearedAtUpload) this.clearChanges();
+    }
+
+    /** Resolve a schema to this world's storage. Retain these accessors at system setup,
+     * not their `column` arrays: growth replaces arrays, while accessors remain valid.
+     * Setters and bulk `writeEncoded` publish frame-scoped field marks for table upload. */
+    storage<T extends Component>(component: T): ComponentStorage<T> {
+        const id = idOf(component);
+        const existing = this._storage.get(id);
+        if (existing) {
+            if (existing.presentation !== isPresentation(component))
+                throw new Error(
+                    `world.storage: component "${declaration(component, "world.storage").key}" recovery policy changed: this world already stores another declaration under that key with different presentation metadata`,
+                );
+            if (existing.schemas.has(component)) return existing.storage as ComponentStorage<T>;
+            if (!sameComponentSchema(existing.schema, component)) {
+                throw new Error(
+                    `world.storage: component "${declaration(component, "world.storage").key}" schema changed: this world already stores another record under that key with different fields`,
+                );
+            }
+            freezeComponent(component);
+            existing.schemas.add(component);
+            return existing.storage as ComponentStorage<T>;
+        }
+        freezeComponent(component);
+        const columns = new Map<string, WorldField>();
+        const storage: Record<string, unknown> = {};
+        for (const { name, field } of fields(component)) {
+            const column = new WorldField(field, INITIAL_CAPACITY, this);
+            if (!isPresentation(component)) this._columns.register(column);
+            columns.set(name, column);
+            storage[name] = column.bind();
+        }
+        this._storage.set(id, {
+            schema: component,
+            presentation: isPresentation(component),
+            schemas: new WeakSet([component]),
+            fields: columns,
+            storage,
+        });
+        return storage as ComponentStorage<T>;
+    }
+
+    get time(): Readonly<Time> {
+        return this._scheduler.time;
+    }
+
+    /** Advance a virtual frame by `deltaTime` seconds, with paced fixed work, simulation and draw.
+     * After setup, preFixed systems may restore and replay with tick before the paced ticks.
+     * Replay changes fixedTick but not the accumulator, fixedAlpha or the four paced-tick cap;
+     * fixedSteps counts only paced ticks. Field marks accumulate until normal frame upload/clear.
+     * postFixed systems may capture after every completed fixed group, including replay ticks.
+     * Pause, scale and the catch-up cap apply only here. Refuses inside a step or tick,
+     * or a negative or non-finite delta.
+     * A propagated setup/update throw ends the step with a named Error and the thrown value as cause.
+     * A propagated draw throw drops the unfinished system encoder without submitting its commands.
+     * Only recorded table growth and staged upload copies replay through a fresh submission; if there are
+     * none, no submission or fence issues. The GPU frame does not advance. With
+     * {@link logAndPauseSystemErrors}, the failed system is paused, later draw systems run, and the frame submits. */
+    step(deltaTime = Time.DEFAULT_DT): void {
+        if (this._stepping || this._recovering)
+            throw new Error("World.step: refuses inside a step or tick");
+        this._frameFence = undefined;
+        this._frameUploadBytes = 0;
+        this._fieldUploadSeen = false;
+        this._changesClearedAtUpload = false;
+        this._stepInput.deltaTime = deltaTime;
+        let stepped = false;
+        this._stepping = true;
+        try {
+            this._runStep();
+            stepped = true;
+        } finally {
+            this._stepping = false;
+            // A failed scheduler has no CPU-only fallback upload point; preserve its pending marks.
+            if (!this._gpu && stepped) this.clearChangesIfNeeded();
+            if (this._gpu && stepped) {
+                this._gpu.frame++;
+                this._readback?.advance(this._gpu.frame);
+            }
+        }
+    }
+
+    /** Advance exactly one fixed tick, ignoring pause, scale and catch-up limits. Runs only the fixed
+     * and postFixed groups (including lazy system setup), not setup, preFixed, simulation or draw groups.
+     * Does not advance the GPU frame or readback; queued table writes remain ordered before the next frame submission.
+     * Outside step, CPU field marks clear on success; a GPU world keeps them for its next upload.
+     * In preFixed, replay retains marks for the frame, leaves fixedAlpha and fixedSteps unchanged,
+     * and does not consume the accumulator or catch-up cap. Refuses elsewhere inside step/tick,
+     * and during recovery callbacks. Errors follow {@link step}; the tick count is not rolled back. */
+    tick(): void {
+        if (this._recovering || (this._stepping && this.currentSystemGroup !== "preFixed"))
+            throw new Error("World.tick: refuses inside a step or tick");
+        const inFrame = this._stepping;
+        let ticked = false;
+        this._stepping = true;
+        try {
+            this._scheduler.tick(this);
+            ticked = true;
+        } finally {
+            this._stepping = inFrame;
+            if (!inFrame && !this._gpu && ticked) this.clearChanges();
+        }
+    }
+
+    /** Capture entity identity and allocation, simulation component membership, all stored and registered simulation
+     * fields and their pending change marks through the entity high-water mark, and fixedTick.
+     * Local to this world and registry;
+     * includes declared participants' hidden simulation state; excludes pacing, GPU and host state.
+     * During step/tick, allowed only in preFixed or postFixed, never in recovery callbacks.
+     * Query order is derived from restored membership. The image is reusable, opaque and independent
+     * of writes, not a save format. */
+    snapshot(): WorldSnapshot {
+        if (this._recovering) throw new Error("World.snapshot: refuses during recovery");
+        this._recovering = true;
+        try {
+            return this._snapshots.snapshot();
+        } finally {
+            this._recovering = false;
+        }
+    }
+
+    /** Restore a local image between ticks or in step's preFixed group, never in recovery callbacks.
+     * Refuses elsewhere during step/tick, another world's image or
+     * a changed component registry. Retained accessors and references resolve the restored state;
+     * columns never shrink, queries and membership consumers reconcile, and fields publish changes.
+     * Pending marks and restored marks are retained, not rewound or cleared, even on a frame with no paced ticks.
+     * Presentation components keep current fields and membership only on live identities that
+     * survive restore. Entities destroyed or recreated by restore have no presentation membership;
+     * a reused eid never inherits it. Insertion applies defaults as usual.
+     * Participants restore hidden simulation state after ECS and clock recovery; pacing, GPU and host state stay current.
+     * An error thrown by an observer, a participant or a GPU table propagates after the rest of the restore;
+     * a table attachment that threw leaves that membership restored and unannounced, without rows in that table
+     * and the tables bound after it. */
+    restore(snapshot: WorldSnapshot): void {
+        if (this._recovering) throw new Error("World.restore: refuses during recovery");
+        this._recovering = true;
+        try {
+            this._snapshots.restore(snapshot);
+        } finally {
+            this._recovering = false;
+        }
+    }
+
+    /** Move the fixed clock without running fixed work, as a client adopting an authoritative tick.
+     * Allowed between ticks or in preFixed, never during recovery. Refuses negative or non-safe-integer
+     * ticks. The paced accumulator, fixedAlpha and frame clock stay current; field marks are untouched
+     * and recovery participants do not run. Rendering discards interpolation history across the jump,
+     * even if a later jump returns to the old head. Subsequent ticks count from the new tick.
+     * Unlike Netcode for Entities' NetworkTime jump, no network role is implied. */
+    jumpToTick(tick: number): void {
+        if (this._recovering || (this._stepping && this.currentSystemGroup !== "preFixed"))
+            throw new Error(
+                "World.jumpToTick: requires between ticks or preFixed outside recovery",
+            );
+        if (!Number.isSafeInteger(tick) || tick < 0)
+            throw new Error("World.jumpToTick: requires a non-negative safe integer tick");
+        this._scheduler.jumpToTick(tick);
+    }
+
+    /** @internal Register an ordered simulation owner. */
+    registerRecovery<S>(
+        name: string | symbol,
+        recovery: Recovery<S> | "stateless" | undefined,
+    ): void {
+        this._snapshots.register(name, recovery);
+    }
+
+    /** Freeze the virtual frame clock and step's fixed work, not {@link tick}. The real frame clock
+     * keeps running. Takes effect next frame; resume retains the prior scale. */
+    pause(): void {
+        this._scheduler.pause();
+    }
+
+    /** unfreeze the virtual clock. */
+    resume(): void {
+        this._scheduler.resume();
+    }
+
+    /** Discard seconds of accumulated fixed time, clamping at zero, as Bevy Time<Fixed>::discard_overstep.
+     * Only callable in preFixed, after this frame's scaled delta has accumulated; refuses elsewhere
+     * and during recovery callbacks, or for negative/non-finite seconds. Undiscarded fractions feed
+     * fixedAlpha after the paced ticks. Does not alter frame time, simulation/draw, or explicit tick. */
+    discardOverstep(seconds: number): void {
+        if (this._recovering || !this._stepping || this.currentSystemGroup !== "preFixed")
+            throw new Error("World.discardOverstep: requires preFixed outside recovery callbacks");
+        this._scheduler.discardOverstep(seconds);
+    }
+
+    /** Set virtual timescale: 1 real time, <1 slow-mo, >1 fast-forward, 0 freeze; negatives clamp to 0.
+     * Refuses non-finite values. Applies to step's virtual clock and tick frequency, never explicit {@link tick}. */
+    setTimeScale(scale: number): void {
+        this._scheduler.setScale(scale);
+    }
+
+    create(): number {
+        const eid = this._entities.add();
+        if (eid + 1 > this._highWater) this._highWater = eid + 1;
+        this._queries.onEntityCreated(eid);
+        return eid;
+    }
+
+    /** Remove every component, notify membership observers, clear its fields, and free the eid; no-op when it is not alive or already being destroyed. */
+    destroy(eid: number): void {
+        if (!this._entities.exists(eid)) return;
+        const depth = this._destroyDepth;
+        for (let i = 0; i < depth; i++) if (this._destroying[i] === eid) return;
+        this._destroying[depth] = eid;
+        this._destroyDepth = depth + 1;
+        const held = (this._held[depth] ??= []);
+        const count = this._components.held(eid, held);
+        this._components.clear(eid);
+        try {
+            if (count !== 0 && this._membershipObservers.size !== 0) {
+                if (count > 1)
+                    for (let i = 1; i < count; i++) {
+                        const id = held[i];
+                        let j = i;
+                        while (j > 0 && held[j - 1] > id) {
+                            held[j] = held[j - 1];
+                            j--;
+                        }
+                        held[j] = id;
+                    }
+                let failure: { error: unknown } | undefined;
+                for (let i = 0; i < count; i++) {
+                    const observers = this._membershipObservers.get(held[i]);
+                    if (!observers) continue;
+                    try {
+                        notify(observers, eid, false);
+                    } catch (error) {
+                        failure ??= { error };
+                    }
+                }
+                if (failure) throw failure.error;
+            }
+        } finally {
+            this._destroyDepth = depth;
+            this._queries.onEntityRemoved(eid);
+            for (const tables of this._tablesByComponent.values()) {
+                for (const table of tables) table.release(eid);
+            }
+            for (let i = 0; i < count; i++) {
+                const entry = this._storage.get(held[i]);
+                if (entry) for (const field of entry.fields.values()) field.clear(eid);
+            }
+            this._entities.remove(eid);
+        }
+    }
+
+    exists(eid: number): boolean {
+        return this._entities.exists(eid);
+    }
+
+    /**
+     * Keep an entity across frames and storage growth, not destruction or eid reuse.
+     * Returns 0 for a dead eid. Local snapshot recovery restores identity, so a reference
+     * captured with its entity resolves again after restore. Valid only in this World and run,
+     * never across saves.
+     * The 21-bit generation wraps after 2^21 reuses of one eid and warns once.
+     */
+    ref(eid: number): EntityRef {
+        return (
+            this._entities.exists(eid) ? this._entities.generation(eid) * 2 ** 32 + eid : 0
+        ) as EntityRef;
+    }
+
+    /**
+     * Resolve a reference kept across frames or storage growth to its live eid, or 0
+     * after destruction or reuse. 0 means missing. Use only references from this World
+     * and run; after the 21-bit generation wraps, an old reference can alias a live eid.
+     */
+    resolve(ref: EntityRef): number {
+        const eid = ref >>> 0;
+        return this._entities.exists(eid) &&
+            this._entities.generation(eid) === Math.floor(ref / 2 ** 32)
+            ? eid
+            : 0;
+    }
+
+    /** @internal Check an ECS generation without materializing its encoded reference number. */
+    matchesEntityGeneration(eid: number, generation: number): boolean {
+        return this._entities.exists(eid) && this._entities.generation(eid) === generation;
+    }
+
+    /** snapshot of every alive entity id */
+    entities(): readonly number[] {
+        return this._entities.all();
+    }
+
+    /**
+     * Attach a component with optional field values (vectors are arrays), or replace the values of
+     * one already attached, as Bevy's `insert` does. Missing fields take the declared defaults when
+     * this world registers the component, and 0 otherwise; required companions are added only on
+     * attachment. Every write goes through field setters, publishing changes.
+     */
+    add<T>(eid: number, component: T, values?: ComponentValues<NoInfer<T>>): void {
+        const storage = this.storage(component as Component);
+        const id = idOf(component as Component);
+        const fields = this._storage.get(id)!.fields;
+        if (!this._components.add(eid, component)) {
+            for (const field of fields.values()) field.clear(eid);
+            this.registry.applyDefaults(this, component as Component, eid, values);
+            if (values) writeValues(storage, eid, values);
+            return;
+        }
+        for (const field of fields.values()) field.ensure(eid + 1);
+        const tables = this._tablesByComponent.get(id);
+        let attached = 0;
+        try {
+            if (tables) {
+                for (const table of tables) {
+                    table.attachComponent(eid, component as Component);
+                    attached++;
+                }
+            }
+        } catch (error) {
+            if (tables) {
+                for (const table of tables) {
+                    if (attached-- === 0) break;
+                    table.detachComponent(eid, component as Component);
+                }
+            }
+            this._components.remove(eid, component);
+            throw error;
+        }
+        this._queries.onComponentChanged(id, eid, this._components);
+        try {
+            this.registry.applyDefaults(this, component as Component, eid, values);
+            if (values) writeValues(storage, eid, values);
+            for (const required of this.registry.getRequirements(component as Component)) {
+                if (!this._components.has(eid, required)) this.add(eid, required);
+            }
+        } catch (error) {
+            // An attachment that did not complete is undone unannounced; companions already added stay.
+            this._components.remove(eid, component);
+            if (tables)
+                for (const table of tables) table.detachComponent(eid, component as Component);
+            this._queries.onComponentChanged(id, eid, this._components);
+            for (const field of fields.values()) field.clear(eid);
+            throw error;
+        }
+        this.notifyMembership(component as Component, eid, true);
+    }
+
+    /** Remove a component and clear its fields after membership observers, table detachment and query updates. */
+    remove(eid: number, component: any): void {
+        if (!this._components.has(eid, component)) return;
+        const id = idOf(component as Component);
+        this._components.remove(eid, component);
+        try {
+            this.notifyMembership(component as Component, eid, false);
+        } finally {
+            const tables = this._tablesByComponent.get(id);
+            if (tables)
+                for (const table of tables) table.detachComponent(eid, component as Component);
+            this._queries.onComponentChanged(id, eid, this._components);
+            const entry = this._storage.get(id);
+            if (entry) for (const field of entry.fields.values()) field.clear(eid);
+        }
+    }
+
+    has<T>(eid: number, component: T): boolean {
+        return this._components.has(eid, component);
+    }
+
+    /**
+     * Read a component's values as one record that `add` takes back, or undefined when the entity
+     * does not hold it. Vectors are plain arrays of their authored length, three for `vec3`; entity
+     * fields are live eids, 0 once destroyed. Each call allocates a fresh record and marks nothing;
+     * per-frame reads stay on `world.storage(Component)`.
+     */
+    get<T>(eid: number, component: T): ComponentRecord<T> | undefined {
+        if (!this._components.has(eid, component)) return undefined;
+        const record: Record<string, number | number[]> = {};
+        for (const [name, field] of this._storage.get(idOf(component as Component))!.fields) {
+            const type = field.type;
+            if (type.lanes === 1) {
+                record[name] = field.get(eid);
+                continue;
+            }
+            const values: number[] = [];
+            const length = type.components ?? type.lanes;
+            for (let lane = 0; lane < length; lane++) values.push(field.get(eid, lane));
+            record[name] = values;
+        }
+        return record as ComponentRecord<T>;
+    }
+
+    /** Find matching entities. An idle query starts in ascending eid order; nested iterations keep
+     * the current array order. Membership changes follow RegisteredQuery's iteration contract;
+     * unchanged iterations allocate nothing after iterator-pool warmup. */
+    query(terms: any[]): Iterable<number> {
+        return this._queries.find(terms, this._components, this._entities);
+    }
+
+    /**
+     * find exactly one entity, warns if multiple match, returns -1 when nothing matches
+     */
+    only(terms: any[]): number {
+        let result = -1;
+        let count = 0;
+        for (const eid of this.query(terms)) {
+            if (count === 0) result = eid;
+            count++;
+            if (count > 1) break;
+        }
+        if (count > 1) {
+            console.warn("world.only: expected 1 match, found multiple");
+        }
+        return result;
+    }
+
+    /** Fixed and postFixed systems belong to a plugin's declared recovery. Without plugin attribution,
+     * snapshot refuses by system name until the system is removed. */
+    addSystem(system: System, pluginName?: string): void {
+        if (system.group === "fixed" || system.group === "postFixed") {
+            if (pluginName) this._snapshots.require(pluginName);
+            else this._snapshots.requireSystem(system);
+        }
+        if (system.boundary) this._scheduler.registerBoundary(system, system.boundary, pluginName);
+        else this._scheduler.register(system, pluginName);
+    }
+
+    removeSystem(system: System): void {
+        this._scheduler.unregister(system);
+        this._snapshots.removeSystem(system);
+    }
+
+    /** true if the system is live in the scheduler */
+    hasSystem(system: System): boolean {
+        return this._scheduler.has(system);
+    }
+
+    /**
+     * the CPU timing sink, or `undefined` when profiling is off. Hot-path
+     * callers can read this once and skip timed work entirely when absent. The callback borrows
+     * [monotonic seconds, CPU milliseconds]; it must copy values before returning.
+     */
+    get recordSink(): ((name: string, measurement: Readonly<Float64Array>) => void) | undefined {
+        return this._scheduler.record;
+    }
+
+    set recordSink(fn: ((name: string, measurement: Readonly<Float64Array>) => void) | undefined) {
+        this._scheduler.record = fn;
+    }
+
+    /** @internal The running host chooses log-and-pause so one failing system cannot stop its frame loop.
+     * A failed system stays paused until the page reloads or it is removed and added again, which reruns
+     * its setup; later draw systems run, and the frame submits when it recorded work. */
+    logAndPauseSystemErrors(): void {
+        this._scheduler.logAndPauseErrors = true;
+    }
+
+    /** the GPU fence-wait telemetry sink, or `undefined` when profiling is off */
+    get fenceWaitSink(): ((ms: number) => void) | undefined {
+        return this._scheduler.fenceWait;
+    }
+
+    set fenceWaitSink(fn: ((ms: number) => void) | undefined) {
+        this._scheduler.fenceWait = fn;
+    }
+
+    /**
+     * True once disposal starts. Async work must check this after awaiting before mutating the World.
+     */
+    get disposed(): boolean {
+        return this._disposed;
+    }
+
+    /**
+     * Callbacks run last-registered first at {@link dispose}. A callback registered after disposal
+     * starts runs immediately; {@link signal} is already aborted.
+     */
+    onDispose(fn: () => void): void {
+        if (this._disposed) {
+            fn();
+            return;
+        }
+        this._disposals.push(fn);
+    }
+
+    /**
+     * Lazily created lifetime signal, aborted when {@link dispose} starts; already aborted if read afterward.
+     */
+    get signal(): AbortSignal {
+        if (!this._controller) this._controller = new AbortController();
+        if (this._disposed && !this._controller.signal.aborted) this._controller.abort();
+        return this._controller.signal;
+    }
+
+    /** tear down the world; disposes every registered system */
+    dispose(): void {
+        if (this._disposed) return;
+        this._disposed = true;
+        this._controller?.abort();
+        this._readback?.dispose();
+        this._readback = undefined;
+        // A user cleanup failure must not skip remaining callbacks or engine teardown.
+        for (let i = this._disposals.length - 1; i >= 0; i--) {
+            try {
+                this._disposals[i]();
+            } catch (err) {
+                console.error("World.dispose: a teardown callback threw:", err);
+            }
+        }
+        this._disposals.length = 0;
+        this._scheduler.dispose(this);
+        this._queries.clear();
+        this._storage.clear();
+        this._columns.clear();
+        this._snapshots.clear();
+        for (const table of this._tables.values()) table.dispose();
+        this._tables.clear();
+        this._frameEncoder = undefined;
+        this._lastSubmittedEncoder = undefined;
+        this._frameSubmitCallbacks.length = 0;
+        this._frameSubmitCallbackCount = 0;
+        this._commandBuffers.length = 0;
+        this._inDrawGroup = false;
+        for (const resource of this._retiredResources) resource.destroy();
+        this._retiredResources.length = 0;
+        this.resetFrameCopies();
+        this._uploadChunks.length = 0;
+        this._frameUploadBytes = 0;
+        this._resources.clear();
+
+        this.registry.clear();
+        for (const resource of this._gpuResources) {
+            try {
+                resource.destroy();
+            } catch (err) {
+                console.error("World.dispose: GPU resource release threw:", err);
+            }
+        }
+        this._gpuResources.clear();
+    }
+}
+
+function writeValues(
+    storage: Record<string, unknown>,
+    eid: number,
+    values: Record<string, unknown>,
+): void {
+    for (const name in values) {
+        const value = values[name];
+        if (value === undefined) continue;
+        const field = storage[name] as ScalarField | Vector2Field | Vector4Field;
+        if (typeof value === "number") (field as ScalarField).set(eid, value);
+        else {
+            const lanes = value as readonly number[];
+            field.set(eid, lanes[0], lanes[1], lanes[2], lanes[3]);
+        }
+    }
+}
+
+/** Run every observer, then rethrow the first error one threw. */
+function notify(
+    observers: Set<(eid: number, present: boolean) => void>,
+    eid: number,
+    present: boolean,
+): void {
+    let failure: { error: unknown } | undefined;
+    for (const observer of observers) {
+        try {
+            observer(eid, present);
+        } catch (error) {
+            failure ??= { error };
+        }
+    }
+    if (failure) throw failure.error;
+}

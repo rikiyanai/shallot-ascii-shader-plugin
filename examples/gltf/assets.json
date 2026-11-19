@@ -1,0 +1,790 @@
+{
+    "source": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/",
+    "commit": "2bac6f8c57bf471df0d2a1e8a8ec023c7801dddf",
+    "written": [
+        { "name": "PunctualLights", "path": "models/PunctualLights.gltf", "license": "CC0-1.0", "sha256": "143717ff1f28e12de0821e3e673967386a093cf5ff32e342d695b00ea09b4ad0" },
+        { "name": "MorphSkin", "path": "models/MorphSkin.gltf", "license": "CC0-1.0", "sha256": "2444995e6997099682f6ffc03f3601bc650ad1e46d3d2559d401d1348feed180" },
+        { "name": "SkinnedNormal", "path": "models/SkinnedNormal.gltf", "license": "CC0-1.0", "sha256": "fa648612c0e8d4ca35b48ab8e0ada4abd5d063982278fd5ba43429c10a959678" }
+    ],
+    "models": [
+        {"name": "StainedGlassLamp", "license": "Models/StainedGlassLamp/LICENSE.md", "files": [{"path": "Models/StainedGlassLamp/LICENSE.md", "sha256": "fec4380b73f21e468b6fb0ec9984c8ea6f3b589e1ff431112a8cfa6c960f7bbb"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp.bin", "sha256": "7873a6f30835589b3b6fc3b0d749b8fe80f1ea29f4f170fba6d8ac11083d9397"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp.gltf", "sha256": "4157e692bb4b7fb9bc5ac59d972d2f77700955b141464642b43b13a4ac726fb8"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_base_basecolor.ktx2", "sha256": "0b8d3376f0f1dc58b804756256a3b38ae6279b6aeb22ba24475ee9eaeb867daa"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_base_emissive.ktx2", "sha256": "a354583d8f7e6605a57797d3d70a1b6032b416380f5782654f8fcaad4ec59658"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_base_normal.ktx2", "sha256": "ed9e50d14137ee380095ec108050ad828025abd68521bae9ff8598752c0ec8b2"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_base_occlusion-rough-metal.ktx2", "sha256": "b5d9e7021a9f2c7a0403000e8a8c7e4e806a97647f409c76441b7395f638382f"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_bulbs_occlusion.ktx2", "sha256": "54c646ddc5bcdbe5bcdeed17c22e47bfde61fba43739c395e656a9defd3807ee"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_glass_basecolor-alpha.ktx2", "sha256": "c29e86278b417f34d9221f509cb21b30348364905f875db7914fed102f64cdc8"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_glass_emissive.ktx2", "sha256": "dcf80976e11ac51b2bac8f34a697e9f6392c2b4065e9c053d2dbc024b4a97976"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_glass_normal.ktx2", "sha256": "1444cc1ae65d2b3a8b84c7d82dc0d179de7deef8608a7a4e32dc837546392f1d"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_glass_occlusion-rough-metal.ktx2", "sha256": "7d7f1aa17aff14d025320eb6062964bc59764e42f2218e42ec0d4feacd223ced"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_glass_transmission-clearcoat.ktx2", "sha256": "ea3fff36824c0d4715a87d84fc7e4caaee74381e5b19b69e031bfb94f831a9da"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_grill_basecolor-alpha.ktx2", "sha256": "1ad2e5f610b99ea673ea332818d4a43413808253966266436cbfba810c62dd42"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_grill_emissive.ktx2", "sha256": "bb90c9fa9ae0666666e18e91155e3c812b25509d54f7f05c28bd3572de1eef86"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_grill_normal.ktx2", "sha256": "9123bdcb18e8bc04be404dc6cb72b90b33f715306b58035084d22e1b066c4c26"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_grill_occlusion-rough-metal.ktx2", "sha256": "99c46448580ad86a5cf503437bb530f90391abdb3a736d18dd789f24efc0d8ab"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_hardware_basecolor.ktx2", "sha256": "f96c1526e96abd9c19bba3667cc08aeec529f73e0fccfb9d5cb37be41c791c2f"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_hardware_emissive.ktx2", "sha256": "a3e32214faaddc3de6c747e466c279e72b308c8c2618918d28a9e443b78414c5"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_hardware_normal.ktx2", "sha256": "b89f5e1e15949442af898f0af5670ac993d903ee8a99aee3cb3bd4792525fa7e"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_hardware_occlusion-rough-metal.ktx2", "sha256": "c296f1794f96c79dbfa05211dd0a77d962d02e05277c0adee0fadc0d6948d045"}, {"path": "Models/StainedGlassLamp/glTF-KTX-BasisU/StainedGlassLamp_steel_occlusion.ktx2", "sha256": "a391ac6160d7d07a7922e16541a5d6eb4aab39282e3e7c96a01a66a1d203af26"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp.bin", "sha256": "7873a6f30835589b3b6fc3b0d749b8fe80f1ea29f4f170fba6d8ac11083d9397"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp.gltf", "sha256": "333ca209284d02d40862e058f4e5b52c4a6ace75ac42debd69714b700e1a2938"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_base_basecolor.png", "sha256": "a1dd9943830b09195b333411bcf1690f6330fa477e5afd40f5e0c06e74f4ae85"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_base_emissive.png", "sha256": "0fab04b357696b5a85477f87b3bbf6f9c0bd6b5726e0b78a5adf32120b8990d3"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_base_normal.png", "sha256": "5cc524fe2cb56446b38b50537b3a48b22a965b2f5630b238783d625ffad9a3ba"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_base_occlusion-rough-metal.png", "sha256": "fc9c61af6a3908925f46758434e70f5e8086a02019eba4cf3a585950de4ee75b"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_bulbs_occlusion.png", "sha256": "45a55bffc5c025c4c397fdd83ebf723b6bb22e53a4e1bda9ffb6aa27b17d13d7"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_glass_basecolor-alpha.png", "sha256": "8b2ce87d7a7eda447f29595e2ccac3e27e097f845d8f8263ef09cd2574abc2a1"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_glass_emissive.png", "sha256": "d467bf4675fcbf65b887dba4769711d764659253e005bf09c75402c5d7200ca4"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_glass_normal.png", "sha256": "304fdcdbf9ab92bce5ac3c152b27a760be0f03ef9bb830b013ee096ca604eb57"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_glass_occlusion-rough-metal.png", "sha256": "d565c51c13e8a18e644f998998ab2b15c735011a1cc4828e6da90cd2cbd2e941"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_glass_transmission-clearcoat.png", "sha256": "9599538f90d21b4b332f0800ce81c3a5c0e328bc27b81ea8b9ecfeae5a00a63d"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_grill_basecolor-alpha.png", "sha256": "34ebdd2045586dae22edce1f5947414785a93cb3c7ac3e475435a6b8f4b2a0dc"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_grill_emissive.png", "sha256": "489c479d59a46d75160429faab6061dad8227f486bd3db2d866681be3207ab4e"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_grill_normal.png", "sha256": "fd0d28aa717c5fe73d868eec86435f12758f0678621d5f0be24f1cd75d8f3173"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_grill_occlusion-rough-metal.png", "sha256": "f98364ba920f42b4c4bfd7806344681d88eaadfe9459ffdc986159998aa4ada7"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_hardware_basecolor.png", "sha256": "9ec70581d5101c84ede44ed49bed5a7a91651e9df4c0b84ca03df6b28db2f7f4"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_hardware_emissive.png", "sha256": "edf2f87f088a60692c30fcf4e3e58e377dde34fbf7fed1995d94cd1fb83d9aea"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_hardware_normal.png", "sha256": "27b9c1cc187a6b492e8598eac98443847c7f91397b5f2554df21a7955de64680"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_hardware_occlusion-rough-metal.png", "sha256": "1675a23fbebd5bd49d41965cdb7e67d7341aec68fa25e89c5f93c2320e282d81"}, {"path": "Models/StainedGlassLamp/glTF/StainedGlassLamp_steel_occlusion.png", "sha256": "f179328a54bda12e97860dbadb7abc4d1c55514ab364467fa8ca3bca94f41532"}]},
+        {"name": "AnisotropyBarnLamp", "license": "Models/AnisotropyBarnLamp/LICENSE.md", "files": [{"path": "Models/AnisotropyBarnLamp/LICENSE.md", "sha256": "e134777852bb33f44780ccd91976c1616542f35633e15286cdeec6bb77e0f97f"}, {"path": "Models/AnisotropyBarnLamp/glTF-KTX-BasisU/AnisotropyBarnLamp.bin", "sha256": "50f196f7613c3cf40886c0058c8f4a51f6118d5654879f41bb2fcdb5ba989871"}, {"path": "Models/AnisotropyBarnLamp/glTF-KTX-BasisU/AnisotropyBarnLamp.gltf", "sha256": "71a528dfc329c6df9f3651d2fdbaf4ea5ee5e8dab668596f126bc7c2425c4543"}, {"path": "Models/AnisotropyBarnLamp/glTF-KTX-BasisU/AnisotropyBarnLamp_anisotropy.ktx2", "sha256": "4f2ee6ad27b50eb1497c73369d42154234c23d06292d4163cb61c0e65a02c68a"}, {"path": "Models/AnisotropyBarnLamp/glTF-KTX-BasisU/AnisotropyBarnLamp_basecolor.ktx2", "sha256": "9887c98d487f2415f9221f37c14f185edfded7c9438e83ce75a753ae27a4ae53"}, {"path": "Models/AnisotropyBarnLamp/glTF-KTX-BasisU/AnisotropyBarnLamp_normalbump.ktx2", "sha256": "c04db9be21ca5f2d57c86854b9608c240e13b47e7d7329b696b62a79b262f839"}, {"path": "Models/AnisotropyBarnLamp/glTF-KTX-BasisU/AnisotropyBarnLamp_occlusionroughnessmetal.ktx2", "sha256": "73a1ba6dfa0fbf1b1edc158b119623acbff894d62ce5ac3edaa20bedfe812383"}, {"path": "Models/AnisotropyBarnLamp/glTF/AnisotropyBarnLamp.bin", "sha256": "50f196f7613c3cf40886c0058c8f4a51f6118d5654879f41bb2fcdb5ba989871"}, {"path": "Models/AnisotropyBarnLamp/glTF/AnisotropyBarnLamp.gltf", "sha256": "a9cd85ee50b263cee9a8bd5436cb2af1bb0759d6c20e24c1d698b2ad9743dffc"}, {"path": "Models/AnisotropyBarnLamp/glTF/AnisotropyBarnLamp_anisotropy.png", "sha256": "a6984933a23e9b01be337e22944abd332300c3f87a0db7debf2d96dd067cb393"}, {"path": "Models/AnisotropyBarnLamp/glTF/AnisotropyBarnLamp_basecolor.png", "sha256": "3827208d4de41289a1f698b0153778b14e713b00dd05ba3c5be55f2e19c5a264"}, {"path": "Models/AnisotropyBarnLamp/glTF/AnisotropyBarnLamp_normalbump.png", "sha256": "30749a9c852e8179164678e315657f5da37e60e4915f6000fb9dca8f42fd10c7"}, {"path": "Models/AnisotropyBarnLamp/glTF/AnisotropyBarnLamp_occlusionroughnessmetal.png", "sha256": "b70aef816e86ec7c2867e7babbaa94d818d9fd587dd2fcd447fc8af0a8055577"}]},
+        { "name": "MeshoptCubeTest", "license": "Models/MeshoptCubeTest/LICENSE.md", "files": [
+            { "path": "Models/MeshoptCubeTest/LICENSE.md", "sha256": "63fc4b5080289c3640c904dcf5adb3a6122a707928164d7520f46b3051da8ac3" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/MeshoptCubeTest.bin", "sha256": "6578c1d82c5cc2b228e9513e37f348ca89cdb24b5985aa0567efef8d3c014360" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/MeshoptCubeTest.gltf", "sha256": "b5947609f3d8aba58de3d43101df3b635ffaaab5849431f8518af6a98a040433" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/col0.png", "sha256": "250410286de74c532ee877b51b039228742a2e4d7fd611dce29230e841ab75f7" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/col1.png", "sha256": "10a6db3432385dceaacb15a66f94ce79c6c2460d9b1ef1f25c3399bd2d0ee521" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/col2.png", "sha256": "28f15b21a88b213315e13cdcb7914007934e69f3ed8b8dc9495f469d865d57e7" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/col3.png", "sha256": "d518c528b85d9c2c5915c5822b152ac8c162da1bc11a9581e5486d53ebaeb11a" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/col4.png", "sha256": "8f5659a0451392c567217b432a6c83f65a6c22eb3a225e853daa45ec847abdb3" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/row0.png", "sha256": "a26715d56e91e83b19e336174494bd3e39cfc3a5f1b6f1166951a9ec38bf6baa" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/row1.png", "sha256": "8b005615419b1efb98d3cce2fd9529fc53bd34337a317aece8cd4a7558053ec4" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/row2.png", "sha256": "b4e1d53d2a5492adc2d148b19b421733fb23edf1a0aded6fea1ec11c710f11b0" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/row3.png", "sha256": "ae96accde34a0a35ffe63a2fa4f777eaeacf6d3157e6ef69ba5da285949d7f77" },
+            { "path": "Models/MeshoptCubeTest/glTF-Meshopt/row4.png", "sha256": "689cf0ae16c22125a4a1ad44e0431aed1a92a101def096161d133ec56906bca3" }
+        ] },
+        { "name": "LightsPunctualLamp", "license": "Models/LightsPunctualLamp/LICENSE.md", "files": [
+            { "path": "Models/LightsPunctualLamp/LICENSE.md", "sha256": "44100aecf907abd0460eff3c437323643c565929f61df7c408a3d6966332e8b6" },
+            { "path": "Models/LightsPunctualLamp/glTF/LightsPunctualLamp.data.bin", "sha256": "817275cb2c1e2efa74432ef64b5f05313f8a28c1132a6d2a96fb6cb8f344fca9" },
+            { "path": "Models/LightsPunctualLamp/glTF/LightsPunctualLamp.gltf", "sha256": "282d05dfaf47e80b9bff502a45527d380a979cde9ecf3ffb2bc459342456423c" },
+            { "path": "Models/LightsPunctualLamp/glTF/material0_basecolor.jpeg", "sha256": "ab3fb0fefa6892b6c040f0399b7603e69a2703c42f85968bb053c96e666fecce" },
+            { "path": "Models/LightsPunctualLamp/glTF/material0_emissive.jpeg", "sha256": "d9b74e2dfb8999e3dff0b552b678347bec22bd5d936e1ce24d0545921774c0f8" },
+            { "path": "Models/LightsPunctualLamp/glTF/material0_metallic_roughness.jpeg", "sha256": "6078c0286d7e7f9e6c749c4e386cc61313b7740d1333af3f284cfe1de6c2df92" },
+            { "path": "Models/LightsPunctualLamp/glTF/material0_normal.png", "sha256": "3da4ac573bd4701a199906428dd01230786e99b0abfd044553985cd3d7e134dd" },
+            { "path": "Models/LightsPunctualLamp/glTF/material1_basecolor.png", "sha256": "cb2f264bd18cea43607016bf979d9e2051c46cd24cb48eed8812212b75825210" },
+            { "path": "Models/LightsPunctualLamp/glTF/material1_normal.png", "sha256": "9b831eecebcf3e71b4c4b2dfee99fe231e1d02661eeae2c61bdfdc693f1ec1f6" },
+            { "path": "Models/LightsPunctualLamp/glTF/material2_transmission.jpeg", "sha256": "bce8b14403e58446a8d1cd3fb8a881a51f211494f923241f8533919e5578e14b" }
+        ] },
+        { "name": "PointLightIntensityTest", "license": "Models/PointLightIntensityTest/LICENSE.md", "files": [
+            { "path": "Models/PointLightIntensityTest/LICENSE.md", "sha256": "253dcc017376355c20bedfaa80734c55a2ff46ea90076521558ee61e13f46701" },
+            { "path": "Models/PointLightIntensityTest/glTF/LampColorNames.png", "sha256": "92433d3e05d124a8e37d89f4f0f4863a02654409210a31b35c82154b0ea0a3cd" },
+            { "path": "Models/PointLightIntensityTest/glTF/PointLightIntensityTest.bin", "sha256": "29c2e0d139c8fe4a190654179177166c5da1932a9378d19e8f7f74622e6b16d6" },
+            { "path": "Models/PointLightIntensityTest/glTF/PointLightIntensityTest.gltf", "sha256": "7913fe3e6829beba77f65ea749e40b3e95906bc2894afc443c22e3d91e263733" }
+        ] },
+        { "name": "DirectionalLight", "license": "Models/DirectionalLight/LICENSE.md", "files": [
+            { "path": "Models/DirectionalLight/LICENSE.md", "sha256": "849ea5bbd5c99d35f9f746bb2d0238d7ac0e57f02e84b7b9a0f9a50a789fea22" },
+            { "path": "Models/DirectionalLight/glTF/DirectionalLight.bin", "sha256": "43aea71c4cbe518a9aa34e04ea2acd0b779c189213aee70cec3d80d1a8e72741" },
+            { "path": "Models/DirectionalLight/glTF/DirectionalLight.gltf", "sha256": "71fbfe89e98201b70f5de027604d3745be41e900b8cb03ccfd446c3896c6b559" }
+        ] },
+        { "name": "EmissiveStrengthTest", "license": "Models/EmissiveStrengthTest/LICENSE.md", "files": [
+            { "path": "Models/EmissiveStrengthTest/LICENSE.md", "sha256": "22c93a569b134779fab131236460049937c1f5c858292d3f08d626079b82cedd" },
+            { "path": "Models/EmissiveStrengthTest/glTF/EmissiveStrengthTest.bin", "sha256": "54ba759d776228b52a256bb7b739581ad3081ac77677ee905b4920e869ceccf5" },
+            { "path": "Models/EmissiveStrengthTest/glTF/EmissiveStrengthTest.gltf", "sha256": "84264f4300d2618aa2be39e90448f1716df8f1946d0d172476773bc9a4a99f65" },
+            { "path": "Models/EmissiveStrengthTest/glTF/PlainGrid.png", "sha256": "c67b0411f4f8d2c940c7e4583ce6c7607cc6c45779c88c3c16f2d2892fb9c411" }
+        ] },
+        { "name": "TextureTransformTest", "license": "Models/TextureTransformTest/LICENSE.md", "files": [
+            { "path": "Models/TextureTransformTest/LICENSE.md", "sha256": "2756f452c3dd14860ace0f63abc5899755a1efbd63d63671fd6eec16e5fce2c1" },
+            { "path": "Models/TextureTransformTest/glTF/Arrow.png", "sha256": "5df5b251fed0ac306cf859a30b59a4953d152483a4bed2b84e5bba1c667a1e64" },
+            { "path": "Models/TextureTransformTest/glTF/Correct.png", "sha256": "3a14b12635ebbcee3ea427fbdb4d20da73e4740ec7a51683d700a2d6b4b7861a" },
+            { "path": "Models/TextureTransformTest/glTF/Error.png", "sha256": "8d1032ef535a5c379bf78f9f565d3180ee3fc2d1cfef6892dee6e567728b619c" },
+            { "path": "Models/TextureTransformTest/glTF/NotSupported.png", "sha256": "1fbdeca7e5c105d677a39578e4bab82b89c8aa9f406ee681ede05635ea0f8c74" },
+            { "path": "Models/TextureTransformTest/glTF/TextureTransformTest.bin", "sha256": "d0cdd23f2fa0996a0db99d4932fb9912a51a34e27c8bf832d072dc856ee9a7af" },
+            { "path": "Models/TextureTransformTest/glTF/TextureTransformTest.gltf", "sha256": "c22c8c6c96c0ea4bcbb9b47ea245a093c5ef59acc5fd425effa4c00da4cdf164" },
+            { "path": "Models/TextureTransformTest/glTF/UV.png", "sha256": "ac37ff52fe06a4c8c35ad4e1e7e8da039dfa8afc9b629d40a44ca8b8cfe9d03d" }
+        ] },
+        { "name": "TextureTransformMultiTest", "license": "Models/TextureTransformMultiTest/LICENSE.md", "files": [
+            { "path": "Models/TextureTransformMultiTest/LICENSE.md", "sha256": "6ca5a443146e5012bdb86b20f23d591cbffec098ce32dbc7733705c32ad54e1f" },
+            { "path": "Models/TextureTransformMultiTest/glTF/TTMT_Labels.png", "sha256": "744109ace177c81063faf7540bdc9b029834076fe5058af5810159b97149873b" },
+            { "path": "Models/TextureTransformMultiTest/glTF/TestMap-1.png", "sha256": "e0d3820efacf8a37628e24f838016ad792391dc4b597ba5d9cc6fb34d0b66412" },
+            { "path": "Models/TextureTransformMultiTest/glTF/TestMap.png", "sha256": "29e88a0807288a7fe1fbad7b75eb920115f8850d3f28c53df9815ca83b9daa01" },
+            { "path": "Models/TextureTransformMultiTest/glTF/TestMap_Normal.png", "sha256": "7ab4b4ec2270dac1d5bebd76986b8734ab42908678c2e87509f8408689313e5b" },
+            { "path": "Models/TextureTransformMultiTest/glTF/TextureTransformMultiTest.bin", "sha256": "72a0dea23011275b1ee6891a2b2fc91925e3b0a83677b4ad278925db755a2575" },
+            { "path": "Models/TextureTransformMultiTest/glTF/TextureTransformMultiTest.gltf", "sha256": "088276b7f005109c94d22e3938f49bab20aeca675adc8be335ee3f6909a25d5a" }
+        ] },
+        { "name": "MorphPrimitivesTest", "license": "Models/MorphPrimitivesTest/LICENSE.md", "files": [
+            { "path": "Models/MorphPrimitivesTest/LICENSE.md", "sha256": "c5cb97e22a9ce3b298c9d7c4def7f4f40af73c52b69818a30f773e78c699bf54" },
+            { "path": "Models/MorphPrimitivesTest/glTF/MorphPrimitivesTest.bin", "sha256": "59ec1d7ca5c8d7605b69aa57cee3da2994384831a290e5271ecd963002c31c76" },
+            { "path": "Models/MorphPrimitivesTest/glTF/MorphPrimitivesTest.gltf", "sha256": "a51388b330a49586388e052dc66f74e95cdbc1efcdddea4248f65e200e1d335a" },
+            { "path": "Models/MorphPrimitivesTest/glTF/uv_texture.jpg", "sha256": "d498c54b30f096b663b161f37ee64397253d6fa15ee4f8c03082c890f6065031" },
+            { "path": "Models/MorphPrimitivesTest/glTF-Draco/MorphPrimitivesTest.bin", "sha256": "4c600738509168bd0dfad3b67bf8ff9b9ae0bf331b7a1531958029ff9d76e14d" },
+            { "path": "Models/MorphPrimitivesTest/glTF-Draco/MorphPrimitivesTest.gltf", "sha256": "6133d2a743b536dca87be279deeef1e1c50761ee9a932814561696221db576d4" },
+            { "path": "Models/MorphPrimitivesTest/glTF-Draco/uv_texture.jpg", "sha256": "d498c54b30f096b663b161f37ee64397253d6fa15ee4f8c03082c890f6065031" }
+        ] },
+        { "name": "MorphStressTest", "license": "Models/MorphStressTest/LICENSE.md", "files": [
+            { "path": "Models/MorphStressTest/LICENSE.md", "sha256": "d71442a3656e7ba9f1ac39cdc814a1f18051ce6792d895528d0fa3226595a26a" },
+            { "path": "Models/MorphStressTest/glTF/ColorSwatches.png", "sha256": "80ac40f4caa24872aef11a2990afcaaec7fe9e3113db148ecf63f0016639e9fb" },
+            { "path": "Models/MorphStressTest/glTF/Base_AO.png", "sha256": "e64d4f4b3d7b4f1a0fa3e37006a8fbab76b8980d72fd740060631c30d8d77681" },
+            { "path": "Models/MorphStressTest/glTF/MorphStressTest.bin", "sha256": "684397e52a7f3941f369a88373633050462b6c27c1f1aff05f5bb32cf09cabe6" },
+            { "path": "Models/MorphStressTest/glTF/TinyGrid.png", "sha256": "16af23fd3e1bc37c8989293a09ee456c4f19825db69a9266c267e8035937c834" },
+            { "path": "Models/MorphStressTest/glTF/MorphStressTest.gltf", "sha256": "e9ffb5c8d4d6b8b83bf0bbee26146addcd474a44294bcbaae8019e63767272cd" }
+        ] },
+        { "name": "SimpleMorph", "license": "Models/SimpleMorph/LICENSE.md", "files": [
+            { "path": "Models/SimpleMorph/LICENSE.md", "sha256": "1e02a9b60a8fcd5340d6e8a94c657f094c25941540892bee8060950a0fb12c6c" },
+            { "path": "Models/SimpleMorph/glTF/SimpleMorph_geometry.bin", "sha256": "44e308fa30e6864c143c44d43bcf0dd3a48c0e21b8abd33344cf4949166c12ea" },
+            { "path": "Models/SimpleMorph/glTF/SimpleMorph_animation.bin", "sha256": "bba8e6c8579b04fca092057a83266582a2f22fbe390d16f0eb92b577c60f9776" },
+            { "path": "Models/SimpleMorph/glTF/SimpleMorph.gltf", "sha256": "99ec94e30b326077edb3958f5d2b68b4d8ad181529da86f5adf883065e68a2d2" }
+        ] },
+        { "name": "SimpleSkin", "license": "Models/SimpleSkin/LICENSE.md", "files": [
+            { "path": "Models/SimpleSkin/LICENSE.md", "sha256": "88574262014bd515adb4b6d407da01c5f34d43aef24f5719ce55627c002f55a5" },
+            { "path": "Models/SimpleSkin/glTF/SimpleSkin.gltf", "sha256": "8d92e9888340eb98e82a65a1f8b037d9a1d9f09e5fd0b6ba6d40fd93700b3239" },
+            { "path": "Models/SimpleSkin/glTF/SimpleSkin_animation.bin", "sha256": "ff21b1bc3d0abbe53f7665060ec6c22d873b6e85a7669171a2b6b8ae01c39347" },
+            { "path": "Models/SimpleSkin/glTF/SimpleSkin_geometry.bin", "sha256": "35f0ca6bc07976c0aadc163d4737758989cfcc9870a99800004c4478fe698b63" },
+            { "path": "Models/SimpleSkin/glTF/SimpleSkin_inverseBindMatrices.bin", "sha256": "5844ab221cd2ad367420a248f6387b46e5f8498604427730a37ee96b4d4ec599" },
+            { "path": "Models/SimpleSkin/glTF/SimpleSkin_skinningData.bin", "sha256": "413bc8a8c0da673df767874e6f05f0b00c9261756a08586b9d555bd5535414b5" }
+        ] },
+        { "name": "RiggedSimple", "license": "Models/RiggedSimple/LICENSE.md", "files": [
+            { "path": "Models/RiggedSimple/LICENSE.md", "sha256": "4e6210accf90bdeaad0c18494410a99a34c1a6db7fcb681d7347f0c93f1e9f8b" },
+            { "path": "Models/RiggedSimple/glTF/RiggedSimple.gltf", "sha256": "18cd3e4d50ecadc93f6b6a720a4ee0d5154443c2fa331bc0dd3bef7499c02eb0" },
+            { "path": "Models/RiggedSimple/glTF/RiggedSimple0.bin", "sha256": "b18e39089acca03219a7a3aa4dd3f00eaedebf438bc3bd58fdcda855f64eafe6" },
+            { "path": "Models/RiggedSimple/glTF-Draco/RiggedSimple.gltf", "sha256": "ef345d43419377a4a1c255b1a779723e3d2d3b4321ee33b1f9833840306d5449" },
+            { "path": "Models/RiggedSimple/glTF-Draco/RiggedSimple0.bin", "sha256": "c0196c3e1d642ea4d78898c0b4e9b1644828a2083145264fb5f9b18b0fb29229" }
+        ] },
+        { "name": "RiggedFigure", "license": "Models/RiggedFigure/LICENSE.md", "files": [
+            { "path": "Models/RiggedFigure/LICENSE.md", "sha256": "7e6c51b3129aafef4c626283fc18cab4298d73a7f3ee746058b5f211b6b95165" },
+            { "path": "Models/RiggedFigure/glTF/RiggedFigure.gltf", "sha256": "ca84ebbf6084d755ff7ac81b3b7c8bc388da68c8aa4b2cf236503b07d3858cc6" },
+            { "path": "Models/RiggedFigure/glTF/RiggedFigure0.bin", "sha256": "28baa193dbc2f8bfad9cb8c13ae16191c592725ea3b2b22b7f05ab701618ce27" },
+            { "path": "Models/RiggedFigure/glTF-Draco/RiggedFigure.gltf", "sha256": "25039daae7c4cd7394b39180341fd2519af82d6ac6ca2e8bec737cb9866b6d69" },
+            { "path": "Models/RiggedFigure/glTF-Draco/RiggedFigure0.bin", "sha256": "ef8c02bf4d186b058d21d5615bd133e75ec5be46f23cc4943d2543d745ede5cb" }
+        ] },
+        { "name": "CesiumMan", "license": "Models/CesiumMan/LICENSE.md", "files": [
+            { "path": "Models/CesiumMan/LICENSE.md", "sha256": "6fc08173a20bf7843098948be999b0492db2f748c074cd1cc83bc15e95bac8a4" },
+            { "path": "Models/CesiumMan/glTF/CesiumMan.gltf", "sha256": "bbb66a129c906e015620197b683edbc6e7a27510169ffa5adec2114046f14919" },
+            { "path": "Models/CesiumMan/glTF/CesiumMan_data.bin", "sha256": "2115d3c8df0519cea62f7def76d66d2346c5ac2216319859d3c79e3784dafd3f" },
+            { "path": "Models/CesiumMan/glTF/CesiumMan_img0.jpg", "sha256": "35d278c7b7b0b9e22881b2c435e41ce8659f230c776ef8780b4a5087abbefaa1" },
+            { "path": "Models/CesiumMan/glTF-Draco/CesiumMan.gltf", "sha256": "5993c2f730e0f638a08809517b894f9d18e55cdbcbb7d7a257cae759ead53df5" },
+            { "path": "Models/CesiumMan/glTF-Draco/CesiumMan_data.bin", "sha256": "9163e503db5931c7a7012e67d006a8fa9bfff55ce29ec8ca7cdc205652bc948c" },
+            { "path": "Models/CesiumMan/glTF-Draco/CesiumMan_img0.jpg", "sha256": "35d278c7b7b0b9e22881b2c435e41ce8659f230c776ef8780b4a5087abbefaa1" }
+        ] },
+        { "name": "Fox", "license": "Models/Fox/LICENSE.md", "files": [
+            { "path": "Models/Fox/LICENSE.md", "sha256": "4fb16547e78b0358641d1bd6706b66318974396fd3d67cac41f4150b7cf42e5c" },
+            { "path": "Models/Fox/glTF/Fox.bin", "sha256": "c7d0d8de28a84d5b25623037f88e063e1502495a2ee6c55f182c61161ad12f80" },
+            { "path": "Models/Fox/glTF/Fox.gltf", "sha256": "6ddcabf511c0257b87dedf6ac51f1bdb6f21e570eee5fa7c4fa6162d055cb002" },
+            { "path": "Models/Fox/glTF/Texture.png", "sha256": "61c8b109ee7f8bf262791933380fafb1465f7b51cbe6472c2d21eff0b31f83a1" }
+        ] },
+        { "name": "RecursiveSkeletons", "license": "Models/RecursiveSkeletons/LICENSE.md", "files": [
+            { "path": "Models/RecursiveSkeletons/LICENSE.md", "sha256": "653d3375367e8fe80fa9c362c9e488f68f07ded635c700ac73f5ea84979ac0c0" },
+            { "path": "Models/RecursiveSkeletons/glTF/RecursiveSkeletons.bin", "sha256": "6523983aed9765e6b774c6e390f042c1bc2ca16e49e1e474dbbb899bc3473a34" },
+            { "path": "Models/RecursiveSkeletons/glTF/RecursiveSkeletons.gltf", "sha256": "9ebca751395f63359e7868d4a9b82ee1632c20680c5c05daa7f54a246eb9de85" }
+        ] },
+        { "name": "BrainStem", "license": "Models/BrainStem/LICENSE.md", "files": [
+            { "path": "Models/BrainStem/LICENSE.md", "sha256": "55b6fce3643e5a1101b7df76ae564f4c0b1de730e8189f4dc3fdcd311ed6f90d" },
+            { "path": "Models/BrainStem/glTF/BrainStem.gltf", "sha256": "8fc99ed74161aa79573236f9a457e238b0649993dfb41234fd7f6eafad696b75" },
+            { "path": "Models/BrainStem/glTF/BrainStem0.bin", "sha256": "1418d04d972655b9b1907d3d51438cd150e19016716e107bb949cd4379ac5cdb" },
+            { "path": "Models/BrainStem/glTF-Meshopt/BrainStem.bin", "sha256": "e18cbda514dd7626dcdf36730881a3f9c26def1d84c55b178b932e5c533c44c5" },
+            { "path": "Models/BrainStem/glTF-Meshopt/BrainStem.gltf", "sha256": "a011abbef412e2eb7269dc4f5c3be10dac0145e3c6ef39ff239afacd7d402990" },
+            { "path": "Models/BrainStem/glTF-Meshopt-EXT/BrainStem.bin", "sha256": "ac004b976aa36cd65e03c485cae40aa85341f6653c9795aef2f223cefe14c8c2" },
+            { "path": "Models/BrainStem/glTF-Meshopt-EXT/BrainStem.gltf", "sha256": "75901f9abeff5bf01cff350d08843cc2e93eabd9f99dc52e9552462a26bbd6e0" },
+            { "path": "Models/BrainStem/glTF-Draco/BrainStem.gltf", "sha256": "d5f35c011854baa9ba8bc89e076f0a3c5a3b64f7b956c5378bfb0b99041c9c40" },
+            { "path": "Models/BrainStem/glTF-Draco/BrainStem0.bin", "sha256": "39346163441a1d03258052be80befcb17933f6bae4606aab7deb4f95258ba85c" }
+        ] },
+        { "name": "InterpolationTest", "license": "Models/InterpolationTest/LICENSE.md", "files": [
+            { "path": "Models/InterpolationTest/LICENSE.md", "sha256": "3a3762ba63cc52e52bbaa65f8f187e02cf05d7256e750ede4c40db611169e7e7" },
+            { "path": "Models/InterpolationTest/glTF/InterpolationTest.gltf", "sha256": "4357b9e260f2e7ffb153255da37c20d6c20a03c76cbebf959a0a4f144a873028" },
+            { "path": "Models/InterpolationTest/glTF/InterpolationTest_data.bin", "sha256": "f4ab866b1b34a0b0ae345a4ac37f2b13b49f6f4e4068ef345880bfcdcdd4d961" },
+            { "path": "Models/InterpolationTest/glTF/InterpolationTest_img0.png", "sha256": "dc89eecc149440e13448baf1434b313b1c81ecd027f6f68f8ba20e32eefcc0b4" }
+        ] },
+        { "name": "AnimatedTriangle", "license": "Models/AnimatedTriangle/LICENSE.md", "files": [
+            { "path": "Models/AnimatedTriangle/LICENSE.md", "sha256": "5dde96e00f66d01505fdb036b21d0f1ed83990807ade96d211c42963b654980c" },
+            { "path": "Models/AnimatedTriangle/glTF/AnimatedTriangle.gltf", "sha256": "d326af21f8d2ae6b3853f1f3e4e0d673053b1c5938659dfefe5d28c7a9f42f76" },
+            { "path": "Models/AnimatedTriangle/glTF/AnimatedTriangle_animation.bin", "sha256": "ec3bdaac71a222034affffef8a9ec531563bc02a3720e513cd8bf852e270f99b" },
+            { "path": "Models/AnimatedTriangle/glTF/AnimatedTriangle_geometry.bin", "sha256": "898ed7f560dca9907a80c98be57fbbc0f3a092d2e3683b964ffcfa75c549ac62" }
+        ] },
+        { "name": "AnimatedCube", "license": "Models/AnimatedCube/LICENSE.md", "files": [
+            { "path": "Models/AnimatedCube/LICENSE.md", "sha256": "4197e9489628d7fcde13b8a875d89f49eebdf9ca8adb5998d48f91fbbf1fe2b9" },
+            { "path": "Models/AnimatedCube/glTF/AnimatedCube.bin", "sha256": "82de770fc82b48a77a33bb26abd4d7e75620491b36ddf98e8dca69fa73dd798c" },
+            { "path": "Models/AnimatedCube/glTF/AnimatedCube.gltf", "sha256": "59a3c451a5167b8ac4b59d61d4b94b2b7a215ee827efaed75629677a1217b552" },
+            { "path": "Models/AnimatedCube/glTF/AnimatedCube_BaseColor.png", "sha256": "0750d5a03c1bebc640571e309f66c6e88efbff2ef4c120619466a7014551bb9a" }
+        ] },
+        { "name": "BoxAnimated", "license": "Models/BoxAnimated/LICENSE.md", "files": [
+            { "path": "Models/BoxAnimated/LICENSE.md", "sha256": "c17eb3e366fdf3c9cfd23d37d5d5394ed0984e7b223eb400e924edfaeb892dee" },
+            { "path": "Models/BoxAnimated/glTF/BoxAnimated.gltf", "sha256": "bb97bd72afb27f46a63ae458c3f194e40f7e8a09aac1f5eb4cef3293c689ab0b" },
+            { "path": "Models/BoxAnimated/glTF/BoxAnimated0.bin", "sha256": "e976ed06d0fbb5b4e92a33ef264e78894cf9c8cdb8c5836e43ef92f4d968def4" }
+        ] },
+        { "name": "AnimatedMorphCube", "license": "Models/AnimatedMorphCube/LICENSE.md", "files": [
+            { "path": "Models/AnimatedMorphCube/LICENSE.md", "sha256": "f329408d3b37552eb0773907af5448a8aa1ae078c1c22c3e83e7ee5e10ec45bd" },
+            { "path": "Models/AnimatedMorphCube/glTF/AnimatedMorphCube.bin", "sha256": "4aba93918adba56c1cc688a38c527bc647e26f2c386802e119b4d01b7250dd23" },
+            { "path": "Models/AnimatedMorphCube/glTF/AnimatedMorphCube.gltf", "sha256": "0b910ed4b52fd9fbb565911fc7f9f285edb0f30fa4913a93143466d439d1092e" },
+            { "path": "Models/AnimatedMorphCube/glTF-Quantized/AnimatedMorphCube.bin", "sha256": "bde22d01f34dd8f5d83cfbb20a1a6d117ec48596157df5d484a58eba13cdff51" },
+            { "path": "Models/AnimatedMorphCube/glTF-Quantized/AnimatedMorphCube.gltf", "sha256": "ff514453beb4b2130fe4c0857a71f8af568a86258f814b4c7b9ac9a55722a850" }
+        ] },
+        {
+            "name": "Box",
+            "license": "Models/Box/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/Box/LICENSE.md",
+                    "sha256": "634623c7bef43aa4b16a3556ac55ae71b671daf4509437d403e4f2a0273928dc"
+                },
+                {
+                    "path": "Models/Box/glTF/Box.gltf",
+                    "sha256": "4a0d69eecfce0672a50b71dc218cbacec6c53fe2445040c235c6314b1b2c41b9"
+                },
+                {
+                    "path": "Models/Box/glTF/Box0.bin",
+                    "sha256": "3266a8e39b9f425b3341cbe5eec7849f44310256bfa651e6b8b40c85ce0ccafb"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                },
+                {
+                    "path": "Models/Box/glTF-Draco/Box.bin",
+                    "sha256": "610dc6e08aba7c2720c8e4ec0578efd91cf2d88a5e638dab7811a22f0235bf2e"
+                },
+                {
+                    "path": "Models/Box/glTF-Draco/Box.gltf",
+                    "sha256": "3c46acecdfa90b012ec9052d8a1dfa61358e6d56a9e333504189cc78a2de4d1b"
+                }
+            ]
+        },
+        {
+            "name": "BoxTextured",
+            "license": "Models/BoxTextured/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/BoxTextured/LICENSE.md",
+                    "sha256": "d1dd37789acabde1b950a2b84273ca34ecd9afd9bce49f1334eeb12cd3389e0f"
+                },
+                {
+                    "path": "Models/BoxTextured/glTF/BoxTextured.gltf",
+                    "sha256": "1e9003a4a2a8822ff60da529357bd8e4dec4a59b1a479017993e7e2ad5fcebef"
+                },
+                {
+                    "path": "Models/BoxTextured/glTF/BoxTextured0.bin",
+                    "sha256": "2e8c0483fa6665c686ec345f89dcbb2a694a587442584d09f8a83a59633327bc"
+                },
+                {
+                    "path": "Models/BoxTextured/glTF/CesiumLogoFlat.png",
+                    "sha256": "9c22b05c5b136d03c5621a8765e50a8322be6c35b9de53e9fe22685840d7f469"
+                },
+                {
+                    "path": "LICENSES/LicenseRef-CC-BY-TM.txt",
+                    "sha256": "7a0eedc807b6a5674247e2760be7cc1b62ec1c66ba6bb7cbed2c2cfcd4269e88"
+                },
+                {
+                    "path": "LICENSES/LicenseRef-LegalMark-Cesium.txt",
+                    "sha256": "b6fc08fa37e5ca7894a5f2e9e7c4d1da7b01f40b031bd9573e7fd415292d10c4"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "TextureSettingsTest",
+            "license": "Models/TextureSettingsTest/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/TextureSettingsTest/LICENSE.md",
+                    "sha256": "3e78efcec06f0ac4789f10b1287e464bfd73d2dc1ef09d828da51d6a0c43633e"
+                },
+                {
+                    "path": "Models/TextureSettingsTest/glTF/CheckAndX.png",
+                    "sha256": "19da9a7f987b9a64684500c1de49293c0922f1840f13ce5d38505b8b5fe1c001"
+                },
+                {
+                    "path": "Models/TextureSettingsTest/glTF/CheckAndX_V.png",
+                    "sha256": "4f8ea98d173360c29275e04cac8d1d05004b1605d818e6f143aca8f31e4f302d"
+                },
+                {
+                    "path": "Models/TextureSettingsTest/glTF/TextureSettingsTest.gltf",
+                    "sha256": "dd1f85b4638ffc72f1e09e19b101b7a05d94a0353facced8f59c16a2d9c09447"
+                },
+                {
+                    "path": "Models/TextureSettingsTest/glTF/TextureSettingsTest0.bin",
+                    "sha256": "1aa2e5e31ae08179eea355945b6fd5d84bd5ffd62a50b93a68c2368d9f345cbe"
+                },
+                {
+                    "path": "Models/TextureSettingsTest/glTF/TextureTestLabels.png",
+                    "sha256": "14b29323950f10cacfbc4160ea8982aaac6bdea21cf4ec5e8c1589917266415a"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "AlphaBlendModeTest",
+            "license": "Models/AlphaBlendModeTest/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/AlphaBlendModeTest/LICENSE.md",
+                    "sha256": "bcb192b4857fb212ca10c2853e44f7917e38494826c53b23a2e1478631448e95"
+                },
+                {
+                    "path": "Models/AlphaBlendModeTest/glTF/AlphaBlendLabels.png",
+                    "sha256": "19c705f7e207384ca1ab01e0665601c051ca33c5848c03ce4fffad625b416b53"
+                },
+                {
+                    "path": "Models/AlphaBlendModeTest/glTF/AlphaBlendModeTest.bin",
+                    "sha256": "bb89ab8d9ac0cfbc168e5d552e3ec2fe1285fd01bacb65c863d838b3db025c85"
+                },
+                {
+                    "path": "Models/AlphaBlendModeTest/glTF/AlphaBlendModeTest.gltf",
+                    "sha256": "49e06672900df95593040d35bbc7a2ee5921ae8d46edc44b64ccf2df65e64849"
+                },
+                {
+                    "path": "Models/AlphaBlendModeTest/glTF/MatBed_baseColor.jpg",
+                    "sha256": "71571cce0d86c7c5ed4ac73d852ec34e72e7234a2f905f2758e118519c950bcf"
+                },
+                {
+                    "path": "Models/AlphaBlendModeTest/glTF/MatBed_normal.jpg",
+                    "sha256": "d8891a9c08e375507ac8f1fb260577bda5e90506e79db92ebbfb5caa9216be49"
+                },
+                {
+                    "path": "Models/AlphaBlendModeTest/glTF/MatBed_occlusionRoughnessMetallic.jpg",
+                    "sha256": "e1472454ad6be574c3a418985f06a8ba36877108a94f61590f01e118804379b4"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "TwoSidedPlane",
+            "license": "Models/TwoSidedPlane/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/TwoSidedPlane/LICENSE.md",
+                    "sha256": "fdc8d82484c188686be30e4b735bf9239e4ce00be74509ef12418926807f94e6"
+                },
+                {
+                    "path": "Models/TwoSidedPlane/glTF/TwoSidedPlane.bin",
+                    "sha256": "b5773c232084d848db9087978e97ca1ea4ffc1e955bd39c5bfc523c3fa577bc9"
+                },
+                {
+                    "path": "Models/TwoSidedPlane/glTF/TwoSidedPlane.gltf",
+                    "sha256": "0aafbfd9713131f7e477739a98e643f16a61248aa06ed7212db34516c7309d12"
+                },
+                {
+                    "path": "Models/TwoSidedPlane/glTF/TwoSidedPlane_BaseColor.png",
+                    "sha256": "7587c655a189fc1078fb19e05703cf9e44000d5181f592d958be23600eff36bc"
+                },
+                {
+                    "path": "Models/TwoSidedPlane/glTF/TwoSidedPlane_MetallicRoughness.png",
+                    "sha256": "66b22936f67e0dfa53bca026f191a5cd2d1a585341d481b88104d0010dd4e3ae"
+                },
+                {
+                    "path": "Models/TwoSidedPlane/glTF/TwoSidedPlane_Normal.png",
+                    "sha256": "8cdd7cd63dbfb2834b72e2420cfa47f6f4c84039635ef9abe3d1a1cb58fa5e51"
+                },
+                {
+                    "path": "LICENSES/CC0-1.0.txt",
+                    "sha256": "a43fc2004d1e073f1107a1f6146664d08dae6cea93cb828742a4bec6da828e91"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "OrientationTest",
+            "license": "Models/OrientationTest/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/OrientationTest/LICENSE.md",
+                    "sha256": "f2865aa5e71314104b5f6296ab77cdd9367831f1753b6a588556665a80f4ffbe"
+                },
+                {
+                    "path": "Models/OrientationTest/glTF/OrientationTest.bin",
+                    "sha256": "cf7ec4fbad3bb386ccfd9dea15f35d8dbf1f7848d48ec4c315816b98b67fbd49"
+                },
+                {
+                    "path": "Models/OrientationTest/glTF/OrientationTest.gltf",
+                    "sha256": "a3e358daf54b9535c221a5376dd3df91a881e306e65086419a8aa08122209f7b"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "SimpleMeshes",
+            "license": "Models/SimpleMeshes/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/SimpleMeshes/LICENSE.md",
+                    "sha256": "ed2807c412ee047adebf9f523922e51c3771cb245b5514af768a359c9daeb4af"
+                },
+                {
+                    "path": "Models/SimpleMeshes/glTF/SimpleMeshes.bin",
+                    "sha256": "63b006e58bdbc47206ea303ef2f630139e39a0c52a8454745ff6eb4f32df8365"
+                },
+                {
+                    "path": "Models/SimpleMeshes/glTF/SimpleMeshes.gltf",
+                    "sha256": "9c750a9e6a9ed3ba782b99c733a8280e57e45299b37627c16e9270705aa58342"
+                },
+                {
+                    "path": "LICENSES/CC0-1.0.txt",
+                    "sha256": "a43fc2004d1e073f1107a1f6146664d08dae6cea93cb828742a4bec6da828e91"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "TriangleWithoutIndices",
+            "license": "Models/TriangleWithoutIndices/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/TriangleWithoutIndices/LICENSE.md",
+                    "sha256": "ba5a20c573eb3462e0eed53738fdc2407aac8f3bd6a8ff5fabfb79aacab69ff3"
+                },
+                {
+                    "path": "Models/TriangleWithoutIndices/glTF/TriangleWithoutIndices.bin",
+                    "sha256": "d8b87038ed2ace74ed183166f6b0a541eab77f7184d50e65edc4bca5ccb5445a"
+                },
+                {
+                    "path": "Models/TriangleWithoutIndices/glTF/TriangleWithoutIndices.gltf",
+                    "sha256": "b273d61fdbde2b2cd3aeadaae524776a9703c8354d5dfb5fd0da636724c4a62c"
+                },
+                {
+                    "path": "LICENSES/CC0-1.0.txt",
+                    "sha256": "a43fc2004d1e073f1107a1f6146664d08dae6cea93cb828742a4bec6da828e91"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "CesiumMilkTruck",
+            "license": "Models/CesiumMilkTruck/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/CesiumMilkTruck/LICENSE.md",
+                    "sha256": "2706e1f1df6be804a83ac7a108d2bf1b11d4fcdc5ec1c821ba725a659ccdebbd"
+                },
+                {
+                    "path": "Models/CesiumMilkTruck/glTF/CesiumMilkTruck.gltf",
+                    "sha256": "28cb3b0da68a88aa8c5852e616a3feb4983f0a7e96c3f291a585d0698e34f2d4"
+                },
+                {
+                    "path": "Models/CesiumMilkTruck/glTF/CesiumMilkTruck.jpg",
+                    "sha256": "5041b9dcdc5c1587648d829fee1f2e4df373befb29aaf15742d39f83d64e7e2e"
+                },
+                {
+                    "path": "Models/CesiumMilkTruck/glTF/CesiumMilkTruck_data.bin",
+                    "sha256": "6783d6e3151b9ca72c64cf694cdb6964de3a2cffcf62015c1d91e358df434046"
+                },
+                {
+                    "path": "LICENSES/LicenseRef-CC-BY-TM.txt",
+                    "sha256": "7a0eedc807b6a5674247e2760be7cc1b62ec1c66ba6bb7cbed2c2cfcd4269e88"
+                },
+                {
+                    "path": "LICENSES/LicenseRef-LegalMark-Cesium.txt",
+                    "sha256": "b6fc08fa37e5ca7894a5f2e9e7c4d1da7b01f40b031bd9573e7fd415292d10c4"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                },
+                {
+                    "path": "Models/CesiumMilkTruck/glTF-Draco/CesiumMilkTruck.gltf",
+                    "sha256": "f2ed3e8c0cf73bd73709fe7ff62b5d29afd49f48cdac6a59674291e6e40e503d"
+                },
+                {
+                    "path": "Models/CesiumMilkTruck/glTF-Draco/CesiumMilkTruck.jpg",
+                    "sha256": "5041b9dcdc5c1587648d829fee1f2e4df373befb29aaf15742d39f83d64e7e2e"
+                },
+                {
+                    "path": "Models/CesiumMilkTruck/glTF-Draco/CesiumMilkTruck_data.bin",
+                    "sha256": "a9ec68ba84a345ccb5509c324a013b471c8d1ea96ac305a273c0d3332aacc373"
+                }
+            ]
+        },
+        {
+            "name": "SimpleSparseAccessor",
+            "license": "Models/SimpleSparseAccessor/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/SimpleSparseAccessor/LICENSE.md",
+                    "sha256": "484c4e950b4741b3cbf8d146187c4a9f0b60cc1e5ae4ade688b84fd659163220"
+                },
+                {
+                    "path": "Models/SimpleSparseAccessor/glTF/SimpleSparseAccessor.gltf",
+                    "sha256": "852cea1ab8665caca6bee912422ed246feb42819c9905ba17a542937e058825a"
+                },
+                {
+                    "path": "Models/SimpleSparseAccessor/glTF/SimpleSparseAccessor.bin",
+                    "sha256": "8b01fde2d485b480626115ff804f972edb4ef87f23d2600054bcc859cee38f92"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "NegativeScaleTest",
+            "license": "Models/NegativeScaleTest/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/NegativeScaleTest/LICENSE.md",
+                    "sha256": "f3a5807437e6710247babbc22e1b8cfb9d2a73eb7b8fe8b6b757dae3898d594b"
+                },
+                {
+                    "path": "Models/NegativeScaleTest/glTF/NegativeScaleTest.gltf",
+                    "sha256": "b534c320b19f7b9a3ddaf12db4fa1da3182ca8ddf9bc61aa7b0a5a5f3b100f18"
+                },
+                {
+                    "path": "Models/NegativeScaleTest/glTF/NegativeScaleTest.bin",
+                    "sha256": "671826651d22463a9d830dc1b9c0ff3d17b2812e06b43466861eac2a7c5211f1"
+                },
+                {
+                    "path": "Models/NegativeScaleTest/glTF/CheckAndX.png",
+                    "sha256": "19da9a7f987b9a64684500c1de49293c0922f1840f13ce5d38505b8b5fe1c001"
+                },
+                {
+                    "path": "Models/NegativeScaleTest/glTF/NegativeScaleLabels2.png",
+                    "sha256": "71a79de243ebdd640fb90dba1ba250632de1343537ae86f7e95379fe2da50725"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "MeshPrimitiveModes",
+            "license": "Models/MeshPrimitiveModes/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/MeshPrimitiveModes/LICENSE.md",
+                    "sha256": "2f2c2f74ab238e71353260b5018fa44acfb856b5708346d92d1c64933bfb8edd"
+                },
+                {
+                    "path": "Models/MeshPrimitiveModes/glTF/MeshPrimitiveModes.gltf",
+                    "sha256": "2a8b3209c25e2fca5105539136a05f42d170767f0eb16148cd3825758e5ee977"
+                },
+                {
+                    "path": "Models/MeshPrimitiveModes/glTF/buffer.bin",
+                    "sha256": "4369522e5929bed650242fea069c687aa2ea1230caa61c378610b2154c1048d7"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                },
+                {
+                    "path": "LICENSES/CC0-1.0.txt",
+                    "sha256": "a43fc2004d1e073f1107a1f6146664d08dae6cea93cb828742a4bec6da828e91"
+                }
+            ]
+        },
+        {
+            "name": "MetalRoughSpheres",
+            "license": "Models/MetalRoughSpheres/LICENSE.md",
+            "files": [
+                { "path": "Models/MetalRoughSpheres/LICENSE.md", "sha256": "77aa36355a1228cacf20e354ac73752318df5fc671b599ae306acdeadf258680" },
+                { "path": "Models/MetalRoughSpheres/glTF/MetalRoughSpheres.gltf", "sha256": "a24fd6fd24b2baef80a5d56b465a55635f7ec79039414e25c341d1402cc28048" },
+                { "path": "Models/MetalRoughSpheres/glTF/MetalRoughSpheres0.bin", "sha256": "f35a1caf37837b2987e24859d812a23e40ca37e1f741782e2a754961250e8c36" },
+                { "path": "Models/MetalRoughSpheres/glTF/Spheres_BaseColor.png", "sha256": "7327b8de2ce91d0ca4fdefcf28fdc58cb555e885a8e5f3b3cfab867c3f349efc" },
+                { "path": "Models/MetalRoughSpheres/glTF/Spheres_MetalRough.png", "sha256": "7b352787106705789df0e025a8ea2209074569cd87029369bc66080dfca78e5a" },
+                { "path": "LICENSES/CC-BY-4.0.txt", "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb" }
+            ]
+        },
+        {
+            "name": "NormalTangentTest",
+            "license": "Models/NormalTangentTest/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/NormalTangentTest/LICENSE.md",
+                    "sha256": "db12791120efa80eb35549b70dcf0caa5f3a45038edb2c4f094b80768ab211a1"
+                },
+                {
+                    "path": "Models/NormalTangentTest/glTF/NormalTangentTest.gltf",
+                    "sha256": "ef2b152063304ebb0314646d3d1610cdc680e131d2cbfef10972dc6120d4dd18"
+                },
+                {
+                    "path": "Models/NormalTangentTest/glTF/NormalTangentTest0.bin",
+                    "sha256": "2d0fc6d43cb11b61a746bc80218b5e9e6c60dcc40f86d4a3f4fdbf11909cd990"
+                },
+                {
+                    "path": "Models/NormalTangentTest/glTF/NormalTangentTest_BaseColor.png",
+                    "sha256": "4182902c6dc833b48c0325568c2c5bd3e2d5fc04e27a8dc1917ced2818e1fac1"
+                },
+                {
+                    "path": "Models/NormalTangentTest/glTF/NormalTangentTest_OcclusionRoughnessMetallic.png",
+                    "sha256": "3fff511720bea1fd8590ddb7b62090700e812e39ca71dd3200493093ad704399"
+                },
+                {
+                    "path": "Models/NormalTangentTest/glTF/NormalTangentTest_Normal.png",
+                    "sha256": "9cebea6c513ddfb1f5f5c761c08bca1468d2283a3cd9772bba3a57e484862ead"
+                },
+                {
+                    "path": "LICENSES/CC0-1.0.txt",
+                    "sha256": "a43fc2004d1e073f1107a1f6146664d08dae6cea93cb828742a4bec6da828e91"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "NormalTangentMirrorTest",
+            "license": "Models/NormalTangentMirrorTest/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/NormalTangentMirrorTest/LICENSE.md",
+                    "sha256": "5bb9cf407c5e40c8e378e926f5110a17dc97b1662ebb2a660048ec2c0727dfb0"
+                },
+                {
+                    "path": "Models/NormalTangentMirrorTest/glTF/NormalTangentMirrorTest.gltf",
+                    "sha256": "2da070d2036a51cf645c40a2ded94c1c72cc38de94039a321257610bfdd2e163"
+                },
+                {
+                    "path": "Models/NormalTangentMirrorTest/glTF/NormalTangentMirrorTest.bin",
+                    "sha256": "4cc94ba24a39bdf34f5db6c1b38a8423ff4bd33a5b2d6f52db7959c6021273b7"
+                },
+                {
+                    "path": "Models/NormalTangentMirrorTest/glTF/NormalTangentMirrorTest_OcclusionRoughnessMetallic.png",
+                    "sha256": "4edb5c336d3d7b2c131d6aee925b967c2ae15ca8c011823bb17551c75d060ee8"
+                },
+                {
+                    "path": "Models/NormalTangentMirrorTest/glTF/NormalTangentMirrorTest_Normal.png",
+                    "sha256": "95b14c4a91309fc5834e30030dfb8898297b96754a05733d37e6c04f2e45a6fb"
+                },
+                {
+                    "path": "Models/NormalTangentMirrorTest/glTF/NormalTangentMirrorTest_BaseColor.png",
+                    "sha256": "879c6296d80189e4d1a871d8cbf788e087d2f6b1a822647b449348dc1734934f"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "VertexColorTest",
+            "license": "Models/VertexColorTest/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/VertexColorTest/LICENSE.md",
+                    "sha256": "86aa24e5a9af3eee8a42829f89d2a3b63283538157086c3f9119f5f4c7b3b1eb"
+                },
+                {
+                    "path": "Models/VertexColorTest/glTF/VertexColorTest.gltf",
+                    "sha256": "cfa41dcbf220eee5cde1a83e5cedf6e5e962f8947e80f7d95ada589a829f78c4"
+                },
+                {
+                    "path": "Models/VertexColorTest/glTF/VertexColorTest.bin",
+                    "sha256": "6db785f1fb513441354b543619bc6fc72798b6f4295034a45a41480662f625a9"
+                },
+                {
+                    "path": "Models/VertexColorTest/glTF/VertexColorTestLabels.png",
+                    "sha256": "f2446c642ff49c1a1377ca6a955dbe3e0f4d1bb01035739e7f122e8a9ff74852"
+                },
+                {
+                    "path": "Models/VertexColorTest/glTF/VertexColorChecks.png",
+                    "sha256": "51911f1787fa12bf373828804df0cf8f4279a8c1b5e0f6046f5f4b425ad5337a"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        {
+            "name": "TextureCoordinateTest",
+            "license": "Models/TextureCoordinateTest/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/TextureCoordinateTest/LICENSE.md",
+                    "sha256": "9423067cbfd96555202e8b72710ad522a2647f254ad15e4b920a33b88c98d09b"
+                },
+                {
+                    "path": "Models/TextureCoordinateTest/glTF/TextureCoordinateTest.gltf",
+                    "sha256": "424f373518a4451c612d952290dc3aa217de8f17008c4030e378da0d582ab1da"
+                },
+                {
+                    "path": "Models/TextureCoordinateTest/glTF/TextureCoordinateTest.bin",
+                    "sha256": "428cf36c6431d3252568295ea9bd5301813c96bb9cdd0f141de7a40a5abc9858"
+                },
+                {
+                    "path": "Models/TextureCoordinateTest/glTF/TextureCoordinateTemplate.png",
+                    "sha256": "07728c817d1f3d0b86d1fcc4610ed5ae4cf5064cb7f245bb891e84fb95fe28c8"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                },
+                {
+                    "path": "LICENSES/CC0-1.0.txt",
+                    "sha256": "a43fc2004d1e073f1107a1f6146664d08dae6cea93cb828742a4bec6da828e91"
+                }
+            ]
+        },
+        {
+            "name": "MultiUVTest",
+            "license": "Models/MultiUVTest/LICENSE.md",
+            "files": [
+                {
+                    "path": "Models/MultiUVTest/LICENSE.md",
+                    "sha256": "1adc5bca7030326731f4f1a9ed1f56c5c479335cab10839b6358157729b6935a"
+                },
+                {
+                    "path": "Models/MultiUVTest/glTF/MultiUVTest.gltf",
+                    "sha256": "d22a984388457f00da6dc6f6ff1bee6d7828ed3c8e7e7236d5698411cd1cf806"
+                },
+                {
+                    "path": "Models/MultiUVTest/glTF/MultiUVTest.bin",
+                    "sha256": "952adeb8026481be255ccfb4fa8c410b7f847c0fcfc71fac5ca6bb1905ca69fc"
+                },
+                {
+                    "path": "Models/MultiUVTest/glTF/uv0.png",
+                    "sha256": "c6a1c9390a73f59b4cd67d24c1a02f21020b4d033ffe311e29b9c29579e63c7c"
+                },
+                {
+                    "path": "Models/MultiUVTest/glTF/uv1.png",
+                    "sha256": "be9bbbfecd86e6ea366dbfc0430e10b6ab1e8e5ad46b95a6c28d25f9f8b1740e"
+                },
+                {
+                    "path": "LICENSES/LicenseRef-LegalMark-Khronos.txt",
+                    "sha256": "169fcb347ab3b6f61c48e2fe315b52eba61dffb039e6494da325913bbbdf872c"
+                },
+                {
+                    "path": "LICENSES/CC-BY-4.0.txt",
+                    "sha256": "c8041334a99cb48852b2139253cbde5f8ac87e27f124aed51223e0d5bf0080eb"
+                }
+            ]
+        },
+        { "name": "Avocado", "license": "Models/Avocado/LICENSE.md", "files": [
+            { "path": "Models/Avocado/LICENSE.md", "sha256": "15aa885ef74db3dce103da85abb568476378a815ca46db0cf7667a1a795b4194" },
+            { "path": "Models/Avocado/glTF/Avocado.bin", "sha256": "3bf7ce0ec994562eabf0cb72a52bbc7976818d630d62609a966b53a5ff9b9180" },
+            { "path": "Models/Avocado/glTF/Avocado.gltf", "sha256": "c9bde1d2f09514dad0a16971df2222beb582fad5dfc86203de1d56389d52feda" },
+            { "path": "Models/Avocado/glTF/Avocado_baseColor.png", "sha256": "385dce948c3b9e8bc93e1c930d796e72b02cbd474b121a160d577de95ebbb48f" },
+            { "path": "Models/Avocado/glTF/Avocado_normal.png", "sha256": "25783c211761b7e32497fdd3e2490f3bac05b738e5e2bc62fc5b78a270bb4e50" },
+            { "path": "Models/Avocado/glTF/Avocado_roughnessMetallic.png", "sha256": "33ee80f7ccfd36825acfbd5ef0a51326bea49e33efed852dca44798798bd6901" },
+            { "path": "Models/Avocado/glTF-Quantized/Avocado.bin", "sha256": "ec991f94879b1987d82e57e4edb13c0b48be65092177a541f146c2c71de27422" },
+            { "path": "Models/Avocado/glTF-Quantized/Avocado.gltf", "sha256": "0cb153be897b36ca62e7c08f6f9921c764063d791e4cef249b95c928bc324b85" },
+            { "path": "Models/Avocado/glTF-Quantized/Avocado_baseColor.png", "sha256": "385dce948c3b9e8bc93e1c930d796e72b02cbd474b121a160d577de95ebbb48f" },
+            { "path": "Models/Avocado/glTF-Quantized/Avocado_normal.png", "sha256": "25783c211761b7e32497fdd3e2490f3bac05b738e5e2bc62fc5b78a270bb4e50" },
+            { "path": "Models/Avocado/glTF-Quantized/Avocado_roughnessMetallic.png", "sha256": "33ee80f7ccfd36825acfbd5ef0a51326bea49e33efed852dca44798798bd6901" },
+            { "path": "Models/Avocado/glTF-Draco/Avocado.bin", "sha256": "535123a66a19c0427298d0bbe81b0ba5efa6d8155b7c659e11c23d8c6d6fe2c6" },
+            { "path": "Models/Avocado/glTF-Draco/Avocado.gltf", "sha256": "63ec45999c1df77adc3837857c95d16dde7aee062b4a1d4475ca968514ec8609" },
+            { "path": "Models/Avocado/glTF-Draco/Avocado_baseColor.png", "sha256": "385dce948c3b9e8bc93e1c930d796e72b02cbd474b121a160d577de95ebbb48f" },
+            { "path": "Models/Avocado/glTF-Draco/Avocado_normal.png", "sha256": "25783c211761b7e32497fdd3e2490f3bac05b738e5e2bc62fc5b78a270bb4e50" },
+            { "path": "Models/Avocado/glTF-Draco/Avocado_roughnessMetallic.png", "sha256": "33ee80f7ccfd36825acfbd5ef0a51326bea49e33efed852dca44798798bd6901" }
+        ] },
+        { "name": "Duck", "license": "Models/Duck/LICENSE.md", "files": [
+            { "path": "Models/Duck/LICENSE.md", "sha256": "f97057a519a1dfab15a5503dc4bd0051c190c272dabbb5cf02e23961e06bc2aa" },
+            { "path": "Models/Duck/glTF/Duck.gltf", "sha256": "98009069c87b165df92dbc8213d7c2b4f296074097ad2ec4efddf3dbc50cdcb0" },
+            { "path": "Models/Duck/glTF/Duck0.bin", "sha256": "4c851f5909095ecf77e66e0968c31d5354f17a49b62e1fad0c341e1635145ee9" },
+            { "path": "Models/Duck/glTF/DuckCM.png", "sha256": "8aedb428cbb815dffea650fe75bff032ea240f00ccad2f64dc8f62a0c5e30313" },
+            { "path": "Models/Duck/glTF-Quantized/Duck.bin", "sha256": "a8f5a07454ca7bf0e6f8e029c7c626b71b6b60703b9e8240b78d849f01c3dbcb" },
+            { "path": "Models/Duck/glTF-Quantized/Duck.gltf", "sha256": "a0522c4c01b3a9f168ca95ed18810947c730d0bedb9ce8c3b46c7a58ba196821" },
+            { "path": "Models/Duck/glTF-Quantized/DuckCM.png", "sha256": "8aedb428cbb815dffea650fe75bff032ea240f00ccad2f64dc8f62a0c5e30313" },
+            { "path": "Models/Duck/glTF-Draco/Duck.bin", "sha256": "f59b26a8caf37e4f8a2fac83407bc4f2a78fe76b24f943ca48f3add34462744e" },
+            { "path": "Models/Duck/glTF-Draco/Duck.gltf", "sha256": "022457ac914363a8a175b3f28bb2539f90315b7e44a03157cc0f9e5a651c56df" },
+            { "path": "Models/Duck/glTF-Draco/DuckCM.png", "sha256": "8aedb428cbb815dffea650fe75bff032ea240f00ccad2f64dc8f62a0c5e30313" }
+        ] },
+        { "name": "Lantern", "license": "Models/Lantern/LICENSE.md", "files": [
+            { "path": "Models/Lantern/LICENSE.md", "sha256": "bb3a06704566d7d31e719e098203a18ddebd4735a5fa65baa25ea39958a5c31c" },
+            { "path": "Models/Lantern/glTF/Lantern.bin", "sha256": "ef0e2e89e4b14ff9035b43867a16dc3218569b29363ccb16b283b86f1dc50eb0" },
+            { "path": "Models/Lantern/glTF/Lantern.gltf", "sha256": "2106fea76c458caf43078c34ae7da7016cedd1f22e6f4badf94590be590f53d6" },
+            { "path": "Models/Lantern/glTF/Lantern_baseColor.png", "sha256": "a2d6aa660f0b9ce46b3863e955248454e73be96063218b799af9f750e0f7be71" },
+            { "path": "Models/Lantern/glTF/Lantern_emissive.png", "sha256": "eafa6390501d537f5bbcf92c64ad1c39d2493aef4508e9cc9d537771efe8bad7" },
+            { "path": "Models/Lantern/glTF/Lantern_normal.png", "sha256": "3318a4d3bef8be53c192d87b7401145493774126c54a22e50e1269f9476065fa" },
+            { "path": "Models/Lantern/glTF/Lantern_roughnessMetallic.png", "sha256": "01b8105756fd86f13e66602f85ee03e7e5daf22a8531f32bef8bbe678cf38cf6" },
+            { "path": "Models/Lantern/glTF-Quantized/Lantern.bin", "sha256": "98d081fd37f63702ac9d8578a2c13f432caffe3d9adba6f86e292085b6873823" },
+            { "path": "Models/Lantern/glTF-Quantized/Lantern.gltf", "sha256": "f96fcbcf0da532749f1f8ae1071bc4ffc2ba1a43ed387784fa939d0db08ab67b" },
+            { "path": "Models/Lantern/glTF-Quantized/Lantern_baseColor.png", "sha256": "a2d6aa660f0b9ce46b3863e955248454e73be96063218b799af9f750e0f7be71" },
+            { "path": "Models/Lantern/glTF-Quantized/Lantern_emissive.png", "sha256": "eafa6390501d537f5bbcf92c64ad1c39d2493aef4508e9cc9d537771efe8bad7" },
+            { "path": "Models/Lantern/glTF-Quantized/Lantern_normal.png", "sha256": "3318a4d3bef8be53c192d87b7401145493774126c54a22e50e1269f9476065fa" },
+            { "path": "Models/Lantern/glTF-Quantized/Lantern_roughnessMetallic.png", "sha256": "01b8105756fd86f13e66602f85ee03e7e5daf22a8531f32bef8bbe678cf38cf6" },
+            { "path": "Models/Lantern/glTF-Draco/Lantern.bin", "sha256": "d1fd7356f178e69480fbec43dfcf029f5e94c4d9d1db124886391fe3279c138b" },
+            { "path": "Models/Lantern/glTF-Draco/Lantern.gltf", "sha256": "8539e26c7547bcd72374f1aad72090506d1dd8a2435e11531f30093078818038" },
+            { "path": "Models/Lantern/glTF-Draco/Lantern_baseColor.png", "sha256": "a2d6aa660f0b9ce46b3863e955248454e73be96063218b799af9f750e0f7be71" },
+            { "path": "Models/Lantern/glTF-Draco/Lantern_emissive.png", "sha256": "eafa6390501d537f5bbcf92c64ad1c39d2493aef4508e9cc9d537771efe8bad7" },
+            { "path": "Models/Lantern/glTF-Draco/Lantern_normal.png", "sha256": "3318a4d3bef8be53c192d87b7401145493774126c54a22e50e1269f9476065fa" },
+            { "path": "Models/Lantern/glTF-Draco/Lantern_roughnessMetallic.png", "sha256": "01b8105756fd86f13e66602f85ee03e7e5daf22a8531f32bef8bbe678cf38cf6" }
+        ] },
+        { "name": "CarConcept", "license": "Models/CarConcept/LICENSE.md", "files": [
+            { "path": "Models/CarConcept/LICENSE.md", "sha256": "657c9c5e7a85decee5d2f7dfb537b5053443051deff72708c3caad0a2904f0a5" },
+            { "path": "Models/CarConcept/glTF/CarConcept.data.bin", "sha256": "5cd6ceb6a502dc3c79863c2f11c06f6aa7474e53367bb212b3e3c3f1e7611d20" },
+            { "path": "Models/CarConcept/glTF/CarConcept.gltf", "sha256": "1a2395a86bdef0a1e9b3d3875bb056f688c624c19cf27c867b6d5cde6f37722f" },
+            { "path": "Models/CarConcept/glTF-KTX-BasisU-Draco/CarConcept.data.bin", "sha256": "157d1a7ba13b1aa512db25c36cb805c95ec5a96709e9de1a5fa084dd7487658e" },
+            { "path": "Models/CarConcept/glTF-KTX-BasisU-Draco/CarConcept.gltf", "sha256": "8bdd76afb00f6b430a0bfb4112ecf67c3c6307d27ebd8298ab92047aefca6cfd" }
+        ] }
+    ]
+}

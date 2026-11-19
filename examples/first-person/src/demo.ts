@@ -1,0 +1,257 @@
+import {
+    Body,
+    BodyType,
+    Camera,
+    Character,
+    CharacterPlugin,
+    component,
+    DirectionalLight,
+    GlobalAmbientLight,
+    InputPlugin,
+    lookAtRotation,
+    Materials,
+    MeshInstance,
+    MeshMaterial,
+    MeshPlugin,
+    type Plugin,
+    type Resource,
+    Shape,
+    ShapeKind,
+    StandardMaterial,
+    StandardPhysicsPlugin,
+    StandardRenderer,
+    type System,
+    setTargetTransform,
+    Transform,
+    type World,
+} from "@dylanebert/shallot";
+import { internText, Justify, Text, TextPlugin } from "@dylanebert/shallot/extras";
+import { Anchor } from "@dylanebert/shallot/rendering";
+import { LocalPlayer, Player, PlayerPlugin, TouchControls } from "./player";
+
+type Vec3 = readonly [number, number, number];
+type Vec4 = readonly [number, number, number, number];
+const GROUND_COLOR = [0.085, 0.08, 0.072, 1] as const;
+const STEP_COLOR = [0.15, 0.14, 0.125, 1] as const;
+const LIFT_COLOR = [0.658, 0.301, 0.117, 1] as const;
+const TOWER_COLOR = [0.06, 0.057, 0.052, 1] as const;
+const PERCH_COLOR = [0.11, 0.105, 0.095, 1] as const;
+
+function block(
+    world: World,
+    at: Vec3,
+    size: Vec3,
+    rgba: Vec4,
+    type: BodyType = BodyType.Static,
+): number {
+    const eid = world.create();
+    world.add(eid, Transform, { translation: at, scale: size });
+    world.add(eid, Body, { type });
+    world.add(eid, Shape);
+    world.add(eid, MeshInstance);
+    const material = world.resource(Materials).add(StandardMaterial({ baseColor: rgba }));
+    world.add(eid, MeshMaterial, material);
+    return eid;
+}
+
+export const Route: Resource<{ entities: ReturnType<typeof route> | null }> = {
+    create: () => ({ entities: null }),
+};
+
+export function route(world: World) {
+    const ambient = world.resource(GlobalAmbientLight);
+    ambient.color = 0xd8e4ff;
+    ambient.brightness = 380;
+    const sun = world.create();
+    world.add(sun, Transform, { rotation: lookAtRotation(0, 0, 0, 1, -2, -0.35) });
+    world.add(sun, DirectionalLight, {
+        color: 0xffe8cc,
+        illuminance: 6000,
+        maximumDistance: 50,
+        depthBias: 0.0005,
+        shadowNormalBias: 1.8,
+    });
+    world.storage(DirectionalLight).shadowMapsEnabled.set(sun, 1);
+    const eye = world.create();
+    world.add(eye, Camera, { fov: 70, clearColor: 0x191816 });
+    world.add(eye, StandardRenderer);
+    world.add(eye, Transform, { translation: [0, 2.7, 12] });
+    const player = world.create();
+    world.add(player, Transform, { translation: [0, 2, 12] });
+    world.add(player, Body, {
+        type: BodyType.Kinematic,
+    });
+    world.add(player, Shape, {
+        kind: ShapeKind.Capsule,
+        capsuleCenter1: [0, -0.6, 0],
+        capsuleCenter2: [0, 0.6, 0],
+        radius: 0.3,
+    });
+    // Pogo placement floats two radii above contact.
+    world.add(player, Character);
+    world.add(player, Player, { camera: eye });
+    world.add(player, LocalPlayer);
+    block(world, [0, 0, -5], [32, 1, 52], GROUND_COLOR);
+    const steps = [
+        [
+            [0, 0.75, 3],
+            [6, 0.5, 3],
+        ],
+        [
+            [0, 1.25, 0],
+            [6, 0.5, 3],
+        ],
+        [
+            [0, 1.75, -3],
+            [6, 0.5, 3],
+        ],
+    ] as const satisfies readonly (readonly [Vec3, Vec3])[];
+    for (const [at, size] of steps) block(world, at, size, STEP_COLOR);
+    const lift = block(world, [0, 1.75, -6.5], [6, 0.5, 4], LIFT_COLOR, BodyType.Kinematic);
+    world.add(lift, Lift);
+    const tower = [
+        [[0.7, 2.5, -10], [4.4, 1, 2.4], TOWER_COLOR],
+        [[-0.7, 3.5, -12.3], [3.6, 1, 2.4], TOWER_COLOR],
+        [[0.7, 4.5, -14.5], [4.4, 1, 3], PERCH_COLOR],
+    ] as const satisfies readonly (readonly [Vec3, Vec3, Vec4])[];
+    for (const [at, size, rgba] of tower) block(world, at, size, rgba);
+    const controls = world.create();
+    world.add(controls, Transform, {
+        translation: [0, 0.505, 7.5],
+        rotation: [-Math.SQRT1_2, 0, 0, Math.SQRT1_2],
+    });
+    world.add(controls, Anchor, { offset: Anchor.CENTER });
+    world.add(controls, Text, {
+        content: internText(world, "WASD  Move\nSPACE  Jump\nMOUSE  Look"),
+        fontSize: 0.5,
+        maxWidth: 5,
+        justify: Justify.Center,
+        color: 0xeee9df,
+    });
+    return { player, eye, lift, controls };
+}
+
+// Marks route entities driven by the lift system; their authored positions become trajectory bases.
+export const Lift = component("Lift", {});
+
+const TRAVEL = 1.5;
+const RATE = 0.65;
+const RECIPE_STATE: Resource<DemoBag> = { create: createBag };
+const Hint: Resource<{ touch: boolean | null }> = { create: () => ({ touch: false }) };
+type DemoBag = {
+    // Each lift eid has a base position at slot * 3 in liftBases.
+    liftEids: number[];
+    liftBases: number[];
+    liftCount: number;
+};
+function stateBag(world: World): DemoBag {
+    return world.resource(RECIPE_STATE);
+}
+
+// The bag's creation, apart from the per-frame lookup: its dispose closure would otherwise make every
+// lookup allocate a context.
+function createBag(world: World): DemoBag {
+    const bag: DemoBag = {
+        liftEids: [],
+        liftBases: [],
+        liftCount: 0,
+    };
+    world.onDispose(() => {
+        bag.liftCount = 0;
+    });
+    return bag;
+}
+
+// The lift's pose register is written in place each tick; setTargetTransform copies it.
+const liftPos: [number, number, number] = [0, 0, 0];
+const LIFT_QUAT = [0, 0, 0, 1] as const;
+
+const lift: System = {
+    name: "lift",
+    group: "fixed",
+    before: CharacterPlugin.systems,
+    update(world: World): void {
+        const bag = stateBag(world);
+        const phase = 2 * (world.time.elapsed * RATE);
+        const rise = 0.5 * TRAVEL * (1 - Math.cos(phase));
+        for (let slot = 0; slot < bag.liftCount; slot++) {
+            const base = slot * 3;
+            liftPos[0] = bag.liftBases[base];
+            liftPos[1] = bag.liftBases[base + 1] + rise;
+            liftPos[2] = bag.liftBases[base + 2];
+            setTargetTransform(world, bag.liftEids[slot], liftPos, LIFT_QUAT);
+        }
+    },
+};
+
+export const Demo = {
+    name: "Demo",
+    recovery: (world: World) => ({
+        snapshot() {
+            const bag = stateBag(world);
+            return {
+                liftEids: bag.liftEids.slice(),
+                liftBases: bag.liftBases.slice(),
+                liftCount: bag.liftCount,
+            };
+        },
+        restore(saved: Pick<DemoBag, "liftEids" | "liftBases" | "liftCount">) {
+            const bag = stateBag(world);
+            world.resource(Hint).touch = null;
+            bag.liftEids = saved.liftEids.slice();
+            bag.liftBases = saved.liftBases.slice();
+            bag.liftCount = saved.liftCount;
+        },
+    }),
+    components: [Lift],
+    dependencies: [
+        PlayerPlugin,
+        CharacterPlugin,
+        InputPlugin,
+        StandardPhysicsPlugin,
+        MeshPlugin,
+        TextPlugin,
+    ],
+    initialize(world: World) {
+        const state = world.resource(Route);
+        state.entities ??= route(world);
+    },
+    warm(world: World) {
+        const bag = stateBag(world);
+        bag.liftCount = 0;
+        for (const eid of world.query([Lift, Body])) {
+            const base = bag.liftCount * 3;
+            bag.liftEids[bag.liftCount] = eid;
+            bag.liftBases[base] = world.storage(Transform).translation.x.get(eid);
+            bag.liftBases[base + 1] = world.storage(Transform).translation.y.get(eid);
+            bag.liftBases[base + 2] = world.storage(Transform).translation.z.get(eid);
+            bag.liftCount++;
+        }
+    },
+    systems: [
+        lift,
+        {
+            name: "Demo/Controls",
+            group: "draw",
+            update(world) {
+                const controls = world.resource(Route).entities?.controls;
+                if (controls === undefined || !world.has(controls, Text)) return;
+                const touch = world.resource(TouchControls).used;
+                const hint = world.resource(Hint);
+                if (hint.touch === touch) return;
+                hint.touch = touch;
+                const text = world.storage(Text);
+                text.content.set(
+                    controls,
+                    internText(
+                        world,
+                        touch
+                            ? "STICK  Move\nDRAG  Look\nJump"
+                            : "WASD  Move\nSPACE  Jump\nMOUSE  Look",
+                    ),
+                );
+                text.fontSize.set(controls, touch ? 0.3 : 0.5);
+            },
+        },
+    ],
+} satisfies Plugin;

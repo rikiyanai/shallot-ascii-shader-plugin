@@ -1,0 +1,764 @@
+/** World-space ray. `dir` must be normalized so distances along it are in world units. */
+export interface Ray {
+    origin: readonly [number, number, number];
+    dir: readonly [number, number, number];
+}
+
+/** Rotate a vector by a quaternion (q · v). Use the conjugate for the inverse rotation. */
+export function qRotate(
+    qx: number,
+    qy: number,
+    qz: number,
+    qw: number,
+    vx: number,
+    vy: number,
+    vz: number,
+): [number, number, number] {
+    const tx = 2 * (qy * vz - qz * vy);
+    const ty = 2 * (qz * vx - qx * vz);
+    const tz = 2 * (qx * vy - qy * vx);
+    return [
+        vx + qw * tx + qy * tz - qz * ty,
+        vy + qw * ty + qz * tx - qx * tz,
+        vz + qw * tz + qx * ty - qy * tx,
+    ];
+}
+
+/** constrain `value` to `[min, max]`: below `min` returns `min`, above `max` returns `max` */
+export function clamp(value: number, min: number, max: number): number {
+    return value < min ? min : value > max ? max : value;
+}
+
+/** linear interpolation from `a` to `b`, `t` in `[0, 1]` (not clamped; `t` outside the range extrapolates) */
+export function lerp(a: number, b: number, t: number): number {
+    return a + (b - a) * t;
+}
+
+/** spherical interpolation between two quaternions, t in [0, 1] */
+export function slerp(
+    fromX: number,
+    fromY: number,
+    fromZ: number,
+    fromW: number,
+    toX: number,
+    toY: number,
+    toZ: number,
+    toW: number,
+    t: number,
+): [number, number, number, number] {
+    if (
+        !Number.isFinite(fromX) ||
+        !Number.isFinite(fromY) ||
+        !Number.isFinite(fromZ) ||
+        !Number.isFinite(fromW) ||
+        !Number.isFinite(toX) ||
+        !Number.isFinite(toY) ||
+        !Number.isFinite(toZ) ||
+        !Number.isFinite(toW) ||
+        !Number.isFinite(t)
+    ) {
+        throw new Error(
+            `slerp received non-finite: from=[${fromX},${fromY},${fromZ},${fromW}], to=[${toX},${toY},${toZ},${toW}], t=${t}`,
+        );
+    }
+
+    let dot = fromX * toX + fromY * toY + fromZ * toZ + fromW * toW;
+
+    if (dot < 0) {
+        dot = -dot;
+        toX = -toX;
+        toY = -toY;
+        toZ = -toZ;
+        toW = -toW;
+    }
+
+    let s0: number, s1: number;
+    if (dot > 0.9995) {
+        s0 = 1 - t;
+        s1 = t;
+    } else {
+        const theta0 = Math.acos(dot);
+        const sinTheta0 = Math.sqrt(1 - dot * dot);
+        const theta = theta0 * t;
+        const sinTheta = Math.sin(theta);
+        s0 = Math.cos(theta) - (dot * sinTheta) / sinTheta0;
+        s1 = sinTheta / sinTheta0;
+    }
+
+    return [
+        s0 * fromX + s1 * toX,
+        s0 * fromY + s1 * toY,
+        s0 * fromZ + s1 * toZ,
+        s0 * fromW + s1 * toW,
+    ];
+}
+
+/** quaternion from euler angles in radians (XYZ order), as three.js `Quaternion.setFromEuler` */
+export function eulerToQuat(x: number, y: number, z: number): [number, number, number, number] {
+    const hx = x * 0.5;
+    const hy = y * 0.5;
+    const hz = z * 0.5;
+    const cx = Math.cos(hx),
+        sx = Math.sin(hx);
+    const cy = Math.cos(hy),
+        sy = Math.sin(hy);
+    const cz = Math.cos(hz),
+        sz = Math.sin(hz);
+
+    return [
+        sx * cy * cz + cx * sy * sz,
+        cx * sy * cz - sx * cy * sz,
+        cx * cy * sz + sx * sy * cz,
+        cx * cy * cz - sx * sy * sz,
+    ];
+}
+
+/** euler angles in radians (XYZ order) from a quaternion, as three.js `Euler.setFromQuaternion` */
+export function quatToEuler(x: number, y: number, z: number, w: number): [number, number, number] {
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z) || !Number.isFinite(w)) {
+        throw new Error(`quatToEuler received non-finite: q=[${x},${y},${z},${w}]`);
+    }
+    const x2 = x + x,
+        y2 = y + y,
+        z2 = z + z;
+    const xx = x * x2,
+        xy = x * y2,
+        xz = x * z2;
+    const yy = y * y2,
+        yz = y * z2,
+        zz = z * z2;
+    const wx = w * x2,
+        wy = w * y2,
+        wz = w * z2;
+
+    const m13 = xz + wy;
+    const ey = Math.asin(m13 < -1 ? -1 : m13 > 1 ? 1 : m13);
+
+    if (m13 > -0.9999999 && m13 < 0.9999999) {
+        return [Math.atan2(wx - yz, 1 - (xx + yy)), ey, Math.atan2(wz - xy, 1 - (yy + zz))];
+    } else {
+        return [Math.atan2(yz + wx, 1 - (xx + zz)), ey, 0];
+    }
+}
+
+/** apply an euler delta (radians, XYZ order) to a quaternion in its local frame: `q * eulerToQuat(dx, dy, dz)` */
+export function rotateQuatByEuler(
+    qx: number,
+    qy: number,
+    qz: number,
+    qw: number,
+    dx: number,
+    dy: number,
+    dz: number,
+): [number, number, number, number] {
+    const hx = dx * 0.5;
+    const hy = dy * 0.5;
+    const hz = dz * 0.5;
+    const cx = Math.cos(hx),
+        sx = Math.sin(hx);
+    const cy = Math.cos(hy),
+        sy = Math.sin(hy);
+    const cz = Math.cos(hz),
+        sz = Math.sin(hz);
+
+    const bx = sx * cy * cz + cx * sy * sz;
+    const by = cx * sy * cz - sx * cy * sz;
+    const bz = cx * cy * sz + sx * sy * cz;
+    const bw = cx * cy * cz - sx * sy * sz;
+
+    return [
+        qw * bx + qx * bw + qy * bz - qz * by,
+        qw * by - qx * bz + qy * bw + qz * bx,
+        qw * bz + qx * by - qy * bx + qz * bw,
+        qw * bw - qx * bx - qy * by - qz * bz,
+    ];
+}
+
+/** Infinite perspective projection mat4 (column-major), reverse-Z (near→1, infinity→0); fov in degrees */
+export function perspective(
+    fov: number,
+    aspect: number,
+    near: number,
+    out?: Float32Array,
+): Float32Array {
+    if (!Number.isFinite(fov) || fov <= 0) throw new Error(`Invalid FOV: ${fov} (must be > 0)`);
+    if (!Number.isFinite(aspect) || aspect <= 0)
+        throw new Error(`Invalid aspect ratio: ${aspect} (must be > 0)`);
+    if (!Number.isFinite(near) || near <= 0)
+        throw new Error(`Invalid near plane: ${near} (must be > 0)`);
+    if (!out) out = new Float32Array(16);
+    const f = 1 / Math.tan((fov * Math.PI) / 360);
+    out[0] = f / aspect;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    out[4] = 0;
+    out[5] = f;
+    out[6] = 0;
+    out[7] = 0;
+    out[8] = 0;
+    out[9] = 0;
+    // `w_clip = -z_view`; zeroing the depth coefficient maps infinity to 0 and the near plane to 1.
+    out[10] = 0;
+    out[11] = -1;
+    out[12] = 0;
+    out[13] = 0;
+    out[14] = near;
+    out[15] = 0;
+    return out;
+}
+
+/** orthographic projection mat4 (column-major), reverse-Z (near→1, far→0); size is the half-height in world units */
+export function orthographic(
+    size: number,
+    aspect: number,
+    near: number,
+    far: number,
+    out?: Float32Array,
+): Float32Array {
+    if (!Number.isFinite(size) || size <= 0)
+        throw new Error(`Invalid orthographic size: ${size} (must be > 0)`);
+    if (!Number.isFinite(aspect) || aspect <= 0)
+        throw new Error(`Invalid aspect ratio: ${aspect} (must be > 0)`);
+    if (!Number.isFinite(near) || !Number.isFinite(far) || near === far)
+        throw new Error(`Invalid depth planes: near === far (${near})`);
+    if (!out) out = new Float32Array(16);
+    const lr = 1 / (size * aspect);
+    const bt = 1 / size;
+    const nf = 1 / (near - far);
+    out[0] = lr;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    out[4] = 0;
+    out[5] = bt;
+    out[6] = 0;
+    out[7] = 0;
+    out[8] = 0;
+    out[9] = 0;
+    // Match perspective's reverse-Z convention so shadow maps and receivers agree.
+    out[10] = -nf;
+    out[11] = 0;
+    out[12] = 0;
+    out[13] = 0;
+    out[14] = -far * nf;
+    out[15] = 1;
+    return out;
+}
+
+/** column-major mat4 from translation (px, py, pz), quaternion (qx, qy, qz, qw), scale (sx, sy, sz) */
+export function composeMat4(
+    px: number,
+    py: number,
+    pz: number,
+    qx: number,
+    qy: number,
+    qz: number,
+    qw: number,
+    sx: number,
+    sy: number,
+    sz: number,
+    out?: Float32Array,
+): Float32Array {
+    if (!out) out = new Float32Array(16);
+    const x2 = qx + qx;
+    const y2 = qy + qy;
+    const z2 = qz + qz;
+    const xx = qx * x2;
+    const xy = qx * y2;
+    const xz = qx * z2;
+    const yy = qy * y2;
+    const yz = qy * z2;
+    const zz = qz * z2;
+    const wx = qw * x2;
+    const wy = qw * y2;
+    const wz = qw * z2;
+    out[0] = (1 - yy - zz) * sx;
+    out[1] = (xy + wz) * sx;
+    out[2] = (xz - wy) * sx;
+    out[3] = 0;
+    out[4] = (xy - wz) * sy;
+    out[5] = (1 - xx - zz) * sy;
+    out[6] = (yz + wx) * sy;
+    out[7] = 0;
+    out[8] = (xz + wy) * sz;
+    out[9] = (yz - wx) * sz;
+    out[10] = (1 - xx - yy) * sz;
+    out[11] = 0;
+    out[12] = px;
+    out[13] = py;
+    out[14] = pz;
+    out[15] = 1;
+    return out;
+}
+
+/**
+ * decompose a column-major TRS matrix into `[px,py,pz, qx,qy,qz,qw, sx,sy,sz]`, the inverse of
+ * {@link composeMat4}. Scale is each basis column's length (`sx` negated when the determinant is negative, so
+ * the extracted rotation stays proper); the quaternion is read from the scale-normalized rotation columns
+ * (Shepperd). Exact only for a similarity transform (T·R·scale); shear / non-uniform-scale-under-rotation
+ * can't be captured by a TRS triple, so a caller that may see either measures the residual against a
+ * recomposed matrix.
+ */
+export function decomposeMat4(m: Float32Array, out?: Float32Array): Float32Array {
+    if (!out) out = new Float32Array(10);
+    let sx = Math.hypot(m[0], m[1], m[2]);
+    const sy = Math.hypot(m[4], m[5], m[6]);
+    const sz = Math.hypot(m[8], m[9], m[10]);
+    const det =
+        m[0] * (m[5] * m[10] - m[6] * m[9]) -
+        m[4] * (m[1] * m[10] - m[2] * m[9]) +
+        m[8] * (m[1] * m[6] - m[2] * m[5]);
+    if (det < 0) sx = -sx;
+
+    const ix = sx !== 0 ? 1 / sx : 0;
+    const iy = sy !== 0 ? 1 / sy : 0;
+    const iz = sz !== 0 ? 1 / sz : 0;
+    // scale-normalized rotation, indexed mRC = element (row R, col C)
+    const m00 = m[0] * ix,
+        m10 = m[1] * ix,
+        m20 = m[2] * ix;
+    const m01 = m[4] * iy,
+        m11 = m[5] * iy,
+        m21 = m[6] * iy;
+    const m02 = m[8] * iz,
+        m12 = m[9] * iz,
+        m22 = m[10] * iz;
+
+    const trace = m00 + m11 + m22;
+    let qx: number, qy: number, qz: number, qw: number;
+    if (trace > 0) {
+        const s = Math.sqrt(trace + 1) * 2;
+        qw = 0.25 * s;
+        qx = (m21 - m12) / s;
+        qy = (m02 - m20) / s;
+        qz = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        const s = Math.sqrt(1 + m00 - m11 - m22) * 2;
+        qw = (m21 - m12) / s;
+        qx = 0.25 * s;
+        qy = (m01 + m10) / s;
+        qz = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        const s = Math.sqrt(1 + m11 - m00 - m22) * 2;
+        qw = (m02 - m20) / s;
+        qx = (m01 + m10) / s;
+        qy = 0.25 * s;
+        qz = (m12 + m21) / s;
+    } else {
+        const s = Math.sqrt(1 + m22 - m00 - m11) * 2;
+        qw = (m10 - m01) / s;
+        qx = (m02 + m20) / s;
+        qy = (m12 + m21) / s;
+        qz = 0.25 * s;
+    }
+    const ql = Math.hypot(qx, qy, qz, qw) || 1;
+    out[0] = m[12];
+    out[1] = m[13];
+    out[2] = m[14];
+    out[3] = qx / ql;
+    out[4] = qy / ql;
+    out[5] = qz / ql;
+    out[6] = qw / ql;
+    out[7] = sx;
+    out[8] = sy;
+    out[9] = sz;
+    return out;
+}
+
+/** mat4 × mat4, column-major. `out` must not alias `a` or `b` — the element-wise write-back corrupts the read. */
+export function multiplyMat4(a: Float32Array, b: Float32Array, out?: Float32Array): Float32Array {
+    if (!out) out = new Float32Array(16);
+    for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) {
+            out[j * 4 + i] =
+                a[i] * b[j * 4] +
+                a[i + 4] * b[j * 4 + 1] +
+                a[i + 8] * b[j * 4 + 2] +
+                a[i + 12] * b[j * 4 + 3];
+        }
+    }
+    return out;
+}
+
+/** general mat4 inverse; a singular matrix zeroes `out` and returns it (an all-zero matrix) */
+export function invertMat4(m: Float32Array, out?: Float32Array): Float32Array {
+    if (!out) out = new Float32Array(16);
+
+    const a00 = m[0],
+        a01 = m[1],
+        a02 = m[2],
+        a03 = m[3];
+    const a10 = m[4],
+        a11 = m[5],
+        a12 = m[6],
+        a13 = m[7];
+    const a20 = m[8],
+        a21 = m[9],
+        a22 = m[10],
+        a23 = m[11];
+    const a30 = m[12],
+        a31 = m[13],
+        a32 = m[14],
+        a33 = m[15];
+
+    const b00 = a00 * a11 - a01 * a10;
+    const b01 = a00 * a12 - a02 * a10;
+    const b02 = a00 * a13 - a03 * a10;
+    const b03 = a01 * a12 - a02 * a11;
+    const b04 = a01 * a13 - a03 * a11;
+    const b05 = a02 * a13 - a03 * a12;
+    const b06 = a20 * a31 - a21 * a30;
+    const b07 = a20 * a32 - a22 * a30;
+    const b08 = a20 * a33 - a23 * a30;
+    const b09 = a21 * a32 - a22 * a31;
+    const b10 = a21 * a33 - a23 * a31;
+    const b11 = a22 * a33 - a23 * a32;
+
+    let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+
+    // relative singularity threshold: Hadamard's inequality bounds |det| by the product of column
+    // norms, so |det| / Hadamard ∈ [0, 1] measures relative volume. A matrix is numerically singular
+    // when that ratio falls to the f32 rounding level (inputs are Float32Array, eps = 2^-23). The n
+    // factor (dimension = 4) accounts for the O(n) multiplications in the determinant expansion.
+    const col0 = Math.sqrt(a00 * a00 + a01 * a01 + a02 * a02 + a03 * a03);
+    const col1 = Math.sqrt(a10 * a10 + a11 * a11 + a12 * a12 + a13 * a13);
+    const col2 = Math.sqrt(a20 * a20 + a21 * a21 + a22 * a22 + a23 * a23);
+    // An affine matrix's determinant is its 3x3 basis determinant: translation does not
+    // affect invertibility, so its Hadamard bound must not grow with distance from the origin.
+    const affine = a03 === 0 && a13 === 0 && a23 === 0 && a33 === 1;
+    const col3 = affine ? 1 : Math.sqrt(a30 * a30 + a31 * a31 + a32 * a32 + a33 * a33);
+    const hadamard = col0 * col1 * col2 * col3;
+    if (hadamard === 0 || Math.abs(det) < 4 * 2 ** -23 * hadamard) {
+        out.fill(0);
+        return out;
+    }
+    det = 1 / det;
+
+    out[0] = (a11 * b11 - a12 * b10 + a13 * b09) * det;
+    out[1] = (a02 * b10 - a01 * b11 - a03 * b09) * det;
+    out[2] = (a31 * b05 - a32 * b04 + a33 * b03) * det;
+    out[3] = (a22 * b04 - a21 * b05 - a23 * b03) * det;
+    out[4] = (a12 * b08 - a10 * b11 - a13 * b07) * det;
+    out[5] = (a00 * b11 - a02 * b08 + a03 * b07) * det;
+    out[6] = (a32 * b02 - a30 * b05 - a33 * b01) * det;
+    out[7] = (a20 * b05 - a22 * b02 + a23 * b01) * det;
+    out[8] = (a10 * b10 - a11 * b08 + a13 * b06) * det;
+    out[9] = (a01 * b08 - a00 * b10 - a03 * b06) * det;
+    out[10] = (a30 * b04 - a31 * b02 + a33 * b00) * det;
+    out[11] = (a21 * b02 - a20 * b04 - a23 * b00) * det;
+    out[12] = (a11 * b07 - a10 * b09 - a12 * b06) * det;
+    out[13] = (a00 * b09 - a01 * b07 + a02 * b06) * det;
+    out[14] = (a31 * b01 - a30 * b03 - a32 * b00) * det;
+    out[15] = (a20 * b03 - a21 * b01 + a22 * b00) * det;
+
+    return out;
+}
+
+function assertFiniteAimLookAtParams(
+    name: string,
+    eyeX: number,
+    eyeY: number,
+    eyeZ: number,
+    targetX: number,
+    targetY: number,
+    targetZ: number,
+    upX: number,
+    upY: number,
+    upZ: number,
+): void {
+    if (
+        !Number.isFinite(eyeX) ||
+        !Number.isFinite(eyeY) ||
+        !Number.isFinite(eyeZ) ||
+        !Number.isFinite(targetX) ||
+        !Number.isFinite(targetY) ||
+        !Number.isFinite(targetZ) ||
+        !Number.isFinite(upX) ||
+        !Number.isFinite(upY) ||
+        !Number.isFinite(upZ)
+    ) {
+        throw new Error(
+            `${name} received non-finite: eye=[${eyeX},${eyeY},${eyeZ}], target=[${targetX},${targetY},${targetZ}], up=[${upX},${upY},${upZ}]`,
+        );
+    }
+}
+
+const _aim = new Float64Array(9);
+
+/** view matrix from eye looking at target */
+export function lookAt(
+    eyeX: number,
+    eyeY: number,
+    eyeZ: number,
+    targetX: number,
+    targetY: number,
+    targetZ: number,
+    upX = 0,
+    upY = 1,
+    upZ = 0,
+    out?: Float32Array,
+): Float32Array {
+    _aim[0] = eyeX;
+    _aim[1] = eyeY;
+    _aim[2] = eyeZ;
+    _aim[3] = targetX;
+    _aim[4] = targetY;
+    _aim[5] = targetZ;
+    _aim[6] = upX;
+    _aim[7] = upY;
+    _aim[8] = upZ;
+    return lookAtPacked(_aim, out);
+}
+
+/**
+ * {@link lookAt} from eye at 0, target at 3 and up at 6 of `aim`. Per-frame code calls this form: V8 does not
+ * inline lookAt, and optimized code boxes each non-integral number argument of an out-of-line call.
+ */
+export function lookAtPacked(aim: Float64Array, out?: Float32Array): Float32Array {
+    const eyeX = aim[0]!;
+    const eyeY = aim[1]!;
+    const eyeZ = aim[2]!;
+    const targetX = aim[3]!;
+    const targetY = aim[4]!;
+    const targetZ = aim[5]!;
+    const upX = aim[6]!;
+    const upY = aim[7]!;
+    const upZ = aim[8]!;
+    assertFiniteAimLookAtParams(
+        "lookAt",
+        eyeX,
+        eyeY,
+        eyeZ,
+        targetX,
+        targetY,
+        targetZ,
+        upX,
+        upY,
+        upZ,
+    );
+    let zx = eyeX - targetX;
+    let zy = eyeY - targetY;
+    let zz = eyeZ - targetZ;
+    let zLen = Math.sqrt(zx * zx + zy * zy + zz * zz);
+
+    // degeneracy: the eye-minus-target direction is garbage when |z| falls to the f64 rounding
+    // level of the subtraction (eps * max(|eye|, |target|)). The 1 floor avoids a zero threshold
+    // for origin-coincident coordinates, matching lookAtRotation's scale-relative threshold.
+    const _zScale = Math.max(
+        Math.abs(eyeX),
+        Math.abs(eyeY),
+        Math.abs(eyeZ),
+        Math.abs(targetX),
+        Math.abs(targetY),
+        Math.abs(targetZ),
+        1,
+    );
+    if (zLen < Number.EPSILON * _zScale) {
+        zx = 0;
+        zy = 0;
+        zz = 1;
+    } else {
+        zLen = 1 / zLen;
+        zx *= zLen;
+        zy *= zLen;
+        zz *= zLen;
+    }
+
+    let xx = upY * zz - upZ * zy;
+    let xy = upZ * zx - upX * zz;
+    let xz = upX * zy - upY * zx;
+    let xLen = Math.sqrt(xx * xx + xy * xy + xz * xz);
+
+    if (xLen < 1e-6) {
+        if (Math.abs(zy) > 0.9) {
+            xx = 1;
+            xy = 0;
+            xz = 0;
+        } else {
+            xx = -zz;
+            xy = 0;
+            xz = zx;
+        }
+        xLen = Math.sqrt(xx * xx + xy * xy + xz * xz);
+    }
+
+    xLen = 1 / xLen;
+    xx *= xLen;
+    xy *= xLen;
+    xz *= xLen;
+
+    const yx = zy * xz - zz * xy;
+    const yy = zz * xx - zx * xz;
+    const yz = zx * xy - zy * xx;
+
+    const tx = -(xx * eyeX + xy * eyeY + xz * eyeZ);
+    const ty = -(yx * eyeX + yy * eyeY + yz * eyeZ);
+    const tz = -(zx * eyeX + zy * eyeY + zz * eyeZ);
+
+    if (!out) out = new Float32Array(16);
+    out[0] = xx;
+    out[1] = yx;
+    out[2] = zx;
+    out[3] = 0;
+    out[4] = xy;
+    out[5] = yy;
+    out[6] = zy;
+    out[7] = 0;
+    out[8] = xz;
+    out[9] = yz;
+    out[10] = zz;
+    out[11] = 0;
+    out[12] = tx;
+    out[13] = ty;
+    out[14] = tz;
+    out[15] = 1;
+    return out;
+}
+
+const _rotation = new Float64Array(4);
+
+/** rotation quaternion that points an object at eye toward target */
+export function lookAtRotation(
+    eyeX: number,
+    eyeY: number,
+    eyeZ: number,
+    targetX: number,
+    targetY: number,
+    targetZ: number,
+    upX = 0,
+    upY = 1,
+    upZ = 0,
+): [number, number, number, number] {
+    _aim[0] = eyeX;
+    _aim[1] = eyeY;
+    _aim[2] = eyeZ;
+    _aim[3] = targetX;
+    _aim[4] = targetY;
+    _aim[5] = targetZ;
+    _aim[6] = upX;
+    _aim[7] = upY;
+    _aim[8] = upZ;
+    lookAtRotationInto(_aim, _rotation);
+    return [_rotation[0]!, _rotation[1]!, _rotation[2]!, _rotation[3]!];
+}
+
+/**
+ * Write {@link lookAtRotation} into four caller-owned f64 lanes. As in {@link lookAtPacked}, `aim` holds
+ * eye at 0, target at 3 and up at 6, avoiding boxed numeric call arguments. Output may alias `aim`.
+ */
+export function lookAtRotationInto(aim: Float64Array, out: Float64Array): void {
+    const eyeX = aim[0]!;
+    const eyeY = aim[1]!;
+    const eyeZ = aim[2]!;
+    const targetX = aim[3]!;
+    const targetY = aim[4]!;
+    const targetZ = aim[5]!;
+    let upX = aim[6]!;
+    const upY = aim[7]!;
+    let upZ = aim[8]!;
+    assertFiniteAimLookAtParams(
+        "lookAtRotation",
+        eyeX,
+        eyeY,
+        eyeZ,
+        targetX,
+        targetY,
+        targetZ,
+        upX,
+        upY,
+        upZ,
+    );
+
+    let zx = eyeX - targetX;
+    let zy = eyeY - targetY;
+    let zz = eyeZ - targetZ;
+    let zLen = Math.sqrt(zx * zx + zy * zy + zz * zz);
+
+    // degeneracy: the eye-minus-target direction is garbage when |z| falls to the f64 rounding
+    // level of the subtraction (eps * max(|eye|, |target|)). The 1 floor avoids a zero threshold
+    // for origin-coincident coordinates, matching lookAt's scale-relative threshold.
+    const _zScale = Math.max(
+        Math.abs(eyeX),
+        Math.abs(eyeY),
+        Math.abs(eyeZ),
+        Math.abs(targetX),
+        Math.abs(targetY),
+        Math.abs(targetZ),
+        1,
+    );
+    if (zLen < Number.EPSILON * _zScale) {
+        zz = 1;
+    } else {
+        zLen = 1 / zLen;
+        zx *= zLen;
+        zy *= zLen;
+        zz *= zLen;
+    }
+
+    let xx = upY * zz - upZ * zy;
+    let xy = upZ * zx - upX * zz;
+    let xz = upX * zy - upY * zx;
+    let xLen = Math.sqrt(xx * xx + xy * xy + xz * xz);
+
+    if (xLen < 1e-6) {
+        if (Math.abs(zz) > Math.abs(zx)) {
+            upX += 1e-4;
+        } else {
+            upZ += 1e-4;
+        }
+        xx = upY * zz - upZ * zy;
+        xy = upZ * zx - upX * zz;
+        xz = upX * zy - upY * zx;
+        xLen = Math.sqrt(xx * xx + xy * xy + xz * xz);
+    }
+
+    if (xLen < 1e-6) {
+        xx = 1;
+        xy = 0;
+        xz = 0;
+    } else {
+        xLen = 1 / xLen;
+        xx *= xLen;
+        xy *= xLen;
+        xz *= xLen;
+    }
+
+    const yx = zy * xz - zz * xy;
+    const yy = zz * xx - zx * xz;
+    const yz = zx * xy - zy * xx;
+
+    const trace = xx + yy + zz;
+    let qw: number, qx: number, qy: number, qz: number;
+
+    if (trace > 0) {
+        const s = 0.5 / Math.sqrt(trace + 1);
+        qw = 0.25 / s;
+        qx = (yz - zy) * s;
+        qy = (zx - xz) * s;
+        qz = (xy - yx) * s;
+    } else if (xx > yy && xx > zz) {
+        const s = 2 * Math.sqrt(1 + xx - yy - zz);
+        qw = (yz - zy) / s;
+        qx = 0.25 * s;
+        qy = (yx + xy) / s;
+        qz = (zx + xz) / s;
+    } else if (yy > zz) {
+        const s = 2 * Math.sqrt(1 + yy - xx - zz);
+        qw = (zx - xz) / s;
+        qx = (yx + xy) / s;
+        qy = 0.25 * s;
+        qz = (yz + zy) / s;
+    } else {
+        const s = 2 * Math.sqrt(1 + zz - xx - yy);
+        qw = (xy - yx) / s;
+        qx = (zx + xz) / s;
+        qy = (yz + zy) / s;
+        qz = 0.25 * s;
+    }
+
+    out[0] = qx;
+    out[1] = qy;
+    out[2] = qz;
+    out[3] = qw;
+}

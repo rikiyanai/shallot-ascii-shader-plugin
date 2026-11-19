@@ -1,0 +1,71 @@
+import type { Vec3 } from "../common/records";
+import { kernel } from "../kernel/kernel";
+import type { WorldState } from "../world/world";
+import { finishJointCreation, type Joint, type JointDef, writeJointDefinition } from "./joint";
+
+/** Motor joint definition (b3MotorJointDef), body handles resolved to a base JointDef. */
+export type MotorJointDef = {
+    base: JointDef;
+    linearVelocity: Vec3;
+    maxVelocityForce: number;
+    angularVelocity: Vec3;
+    maxVelocityTorque: number;
+    linearHertz: number;
+    linearDampingRatio: number;
+    maxSpringForce: number;
+    angularHertz: number;
+    angularDampingRatio: number;
+    maxSpringTorque: number;
+};
+
+/** @returns the ported motor joint definition defaults (b3DefaultMotorJointDef). */
+export function defaultMotorJointDef(base: JointDef): MotorJointDef {
+    return {
+        base,
+        linearVelocity: {
+            x: 0,
+            y: 0,
+            z: 0,
+        },
+        maxVelocityForce: 0,
+        angularVelocity: {
+            x: 0,
+            y: 0,
+            z: 0,
+        },
+        maxVelocityTorque: 0,
+        linearHertz: 0,
+        linearDampingRatio: 0,
+        maxSpringForce: 0,
+        angularHertz: 0,
+        angularDampingRatio: 0,
+        maxSpringTorque: 0,
+    };
+}
+/** Create a motor joint (b3CreateMotorJoint). @returns the joint handle. */
+export function createMotorJoint(
+    world: WorldState,
+    def: MotorJointDef,
+): {
+    joint: Joint;
+} {
+    const joint = kernel(world.ecsState).jointCreateMotor(
+        world.worldId,
+        writeJointDefinition(world, def.base),
+        def.linearVelocity.x,
+        def.linearVelocity.y,
+        def.linearVelocity.z,
+        def.maxVelocityForce,
+        def.angularVelocity.x,
+        def.angularVelocity.y,
+        def.angularVelocity.z,
+        def.maxVelocityTorque,
+        def.linearHertz,
+        def.linearDampingRatio,
+        def.maxSpringForce,
+        def.angularHertz,
+        def.angularDampingRatio,
+        def.maxSpringTorque,
+    );
+    return finishJointCreation(world, def.base, joint);
+}

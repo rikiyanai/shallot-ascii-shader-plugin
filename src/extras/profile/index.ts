@@ -1,0 +1,1249 @@
+import type { Plugin, System, World } from "../../engine";
+import { Diagnostic, DiagnosticsStore, mountOverlay } from "../../engine";
+import { cpuTotal } from "./cpu";
+import { EmptyFrames } from "./empty";
+import { formatBytes, msFmt } from "./format";
+import { FrameTimings, TIMING_FLOOR_MS } from "./frames";
+import { NetworkRows } from "./network";
+import { reorderRows } from "./reorder";
+
+const INDIRECT_FLOOR_US = 1;
+
+// Bevy joins span names as path components. WebGPU labels need not be valid components:
+// escape separators and percent signs, reserving a lone percent sign for the empty label.
+function encodeLabel(label: string): string {
+    return label.replaceAll("%", "%25").replaceAll("/", "%2F") || "%";
+}
+
+function decodeLabel(label: string): string {
+    if (label === "%") return "(unlabeled)";
+    return label.replace(/%25|%2F/g, (code) => (code === "%25" ? "%" : "/"));
+}
+
+interface LabelPaths {
+    cpu: string;
+    gpu: string;
+    indirect: string;
+    compile: string;
+}
+
+interface ResourceAlloc {
+    destroy: () => void;
+}
+
+// One timestamp result plus the pass names and count captured at its request. Staging belongs to the
+// world's readback pool; this metadata lets the shared `_passes` scratch be reused next frame.
+interface ReadSlot {
+    bytes: ArrayBuffer;
+    passes: string[];
+    count: number;
+    time: number;
+    ready: boolean;
+    empty: EmptyFrames;
+}
+
+// Bound the number of timestamp requests in flight. Metadata returns after the result is drained;
+// the world's pool owns mapping and staging reuse. Saturation skips a profiling sample, not gameplay.
+const READ_RING = 4;
+
+// GPU timings are optional; CPU timings and resource tracking work without them.
+const TIMESTAMP: readonly GPUFeatureName[] = ["timestamp-query"];
+const recorder = {
+    create: () => new DiagnosticsRecorder(),
+};
+
+class DiagnosticsRecorder {
+    store!: DiagnosticsStore;
+    ready: Promise<void> = Promise.resolve();
+    private _cpu!: FrameTimings;
+    private _gpu!: FrameTimings;
+    private readonly _gpuClock = new Float64Array(1);
+    private readonly _intervalOrder: number[] = [];
+    // Per-frame CPU-counted indirect draws for the overlay's validation-floor estimate.
+    readonly indirect = new Map<string, number>();
+    readonly sizes = new Map<object, ResourceAlloc>();
+    readonly measurement = new Float64Array(2);
+
+    private readonly _paths = new Map<string, LabelPaths>();
+    private _allocationId = 0;
+    private _compileEarliest = Infinity;
+    private _compileLatest = -Infinity;
+
+    private _querySet: GPUQuerySet | null = null;
+    private _resolveBuffer: GPUBuffer | null = null;
+    private _capacity = 0;
+    private _nextSlot = 0;
+    private readonly _passes: string[] = [];
+    private readonly _slotCache: GPUComputePassTimestampWrites[] = [];
+    private _readbackError: unknown;
+    private _readbackFailed = false;
+    // Bounded timestamp metadata: `_free` can accept a request; `_reads` preserves request order,
+    // including empty frames. Ready results cannot overtake pending ones. Neither owns staging.
+    private readonly _free: ReadSlot[] = [];
+    private readonly _reads: (ReadSlot | undefined)[] = new Array(READ_RING);
+    private _head = 0;
+    private _tail = 0;
+    private _pending = 0;
+    private _unsampled = 0;
+    private readonly _restorePatches: (() => void)[] = [];
+    private _disposed = false;
+
+    private paths(label: string): LabelPaths {
+        return this._paths.get(label) ?? this.createPaths(label);
+    }
+
+    private createPaths(label: string): LabelPaths {
+        const component = encodeLabel(label);
+        const paths = {
+            cpu: `render/${component}/elapsed_cpu`,
+            gpu: `render/${component}/elapsed_gpu`,
+            indirect: `render/${component}/indirect`,
+            compile: `compile/${component}/elapsed`,
+        };
+        this._paths.set(label, paths);
+        return paths;
+    }
+
+    attach(device: GPUDevice, capacity = 2048): void {
+        if (this._querySet) return;
+        const retire = (path: string) => {
+            if (!path.startsWith("render/")) return;
+            const label = path.slice(7, path.lastIndexOf("/"));
+            this._paths.delete(label === "%" ? "" : decodeLabel(label));
+        };
+        this._cpu = new FrameTimings(this.store, retire);
+        this._gpu = new FrameTimings(this.store, retire);
+        this.store.record("render/timestamp_query", 0);
+        this.store.record("render/gpu_unsampled_frames", 0, 0);
+        for (const path of ["fps", "frame_time", "fixed_steps", "pending", "throttled"]) {
+            if (!this.store.get(path))
+                this.store.add(new Diagnostic(path, { suffix: path === "frame_time" ? "ms" : "" }));
+        }
+        const origCompute = device.createComputePipelineAsync.bind(device);
+        device.createComputePipelineAsync = async (desc: GPUComputePipelineDescriptor) => {
+            const start = performance.now();
+            const pipeline = await origCompute(desc);
+            this.recordCompile(desc.label ?? "", start, performance.now());
+            return pipeline;
+        };
+        this._restorePatches.push(() => {
+            device.createComputePipelineAsync = origCompute;
+        });
+        const origRender = device.createRenderPipelineAsync.bind(device);
+        device.createRenderPipelineAsync = async (desc: GPURenderPipelineDescriptor) => {
+            const start = performance.now();
+            const pipeline = await origRender(desc);
+            this.recordCompile(desc.label ?? "", start, performance.now());
+            return pipeline;
+        };
+        this._restorePatches.push(() => {
+            device.createRenderPipelineAsync = origRender;
+        });
+
+        // The synchronous constructor returns before the driver finishes compiling. A precompile scope
+        // can record the later completion under the pipeline's own label.
+        const origComputeSync = device.createComputePipeline.bind(device);
+        device.createComputePipeline = (desc: GPUComputePipelineDescriptor) => {
+            const start = performance.now();
+            const pipeline = origComputeSync(desc);
+            this.recordCompile(desc.label ?? "", start, performance.now());
+            return pipeline;
+        };
+        this._restorePatches.push(() => {
+            device.createComputePipeline = origComputeSync;
+        });
+        const origRenderSync = device.createRenderPipeline.bind(device);
+        device.createRenderPipeline = (desc: GPURenderPipelineDescriptor) => {
+            const start = performance.now();
+            const pipeline = origRenderSync(desc);
+            this.recordCompile(desc.label ?? "", start, performance.now());
+            return pipeline;
+        };
+        this._restorePatches.push(() => {
+            device.createRenderPipeline = origRenderSync;
+        });
+
+        const origCreateBuffer = device.createBuffer.bind(device);
+        device.createBuffer = (desc) =>
+            this.trackAlloc(origCreateBuffer(desc), desc.label ?? "", desc.size, "buffer");
+        this._restorePatches.push(() => {
+            device.createBuffer = origCreateBuffer;
+        });
+
+        const origCreateTexture = device.createTexture.bind(device);
+        device.createTexture = (desc) =>
+            this.trackAlloc(
+                origCreateTexture(desc),
+                desc.label ?? "",
+                textureByteSize(desc),
+                "texture",
+            );
+        this._restorePatches.push(() => {
+            device.createTexture = origCreateTexture;
+        });
+
+        if (device.features.has("timestamp-query")) {
+            this.ready = this.enableTimestamps(device, capacity);
+        }
+    }
+
+    private async enableTimestamps(device: GPUDevice, capacity: number): Promise<void> {
+        device.pushErrorScope("validation");
+        const count = capacity * 2;
+        const bytes = count * 8;
+        const querySet = device.createQuerySet({ type: "timestamp", count });
+        const buffer = device.createBuffer({
+            label: "profile-resolve",
+            size: bytes,
+            usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+        });
+        const staging = device.createBuffer({
+            label: "profile-probe-staging",
+            size: bytes,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        const target = device.createTexture({
+            label: "profile-probe-target",
+            size: [1, 1],
+            format: "rgba8unorm",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        let error: GPUError | null;
+        try {
+            for (let frame = 0; frame < 2; frame++) {
+                const encoder = device.createCommandEncoder({ label: "profile-probe" });
+                for (const first of [0, count - 4]) {
+                    encoder
+                        .beginRenderPass({
+                            colorAttachments: [
+                                { view: target.createView(), loadOp: "clear", storeOp: "store" },
+                            ],
+                            timestampWrites: {
+                                querySet,
+                                beginningOfPassWriteIndex: first,
+                                endOfPassWriteIndex: first + 1,
+                            },
+                        })
+                        .end();
+                    encoder
+                        .beginComputePass({
+                            timestampWrites: {
+                                querySet,
+                                beginningOfPassWriteIndex: first + 2,
+                                endOfPassWriteIndex: first + 3,
+                            },
+                        })
+                        .end();
+                }
+                device.queue.submit([encoder.finish()]);
+                const resolve = device.createCommandEncoder({ label: "profile-probe-resolve" });
+                resolve.resolveQuerySet(querySet, 0, count, buffer, 0);
+                resolve.copyBufferToBuffer(buffer, 0, staging, 0, bytes);
+                device.queue.submit([resolve.finish()]);
+            }
+        } finally {
+            error = await device.popErrorScope();
+            target.destroy();
+            staging.destroy();
+        }
+        if (!error && !this._disposed) {
+            this.store.record("render/timestamp_query", 1);
+            this._capacity = capacity;
+            this._querySet = querySet;
+            this._resolveBuffer = buffer;
+            for (let i = 0; i < READ_RING; i++) {
+                this._free.push({
+                    bytes: new ArrayBuffer(0),
+                    passes: [],
+                    count: 0,
+                    time: 0,
+                    ready: false,
+                    empty: new EmptyFrames(),
+                });
+            }
+        } else {
+            querySet.destroy();
+            buffer.destroy();
+        }
+    }
+
+    private trackAlloc<T extends GPUBuffer | GPUTexture>(
+        obj: T,
+        label: string,
+        bytes: number,
+        kind: "buffer" | "texture",
+    ): T {
+        const totals = kind === "buffer" ? "bufferBytes" : "textureBytes";
+        const origDestroy = obj.destroy.bind(obj);
+        const path = `memory/allocations/${kind}/${encodeLabel(label)}#${this._allocationId++}`;
+        const allocation: ResourceAlloc = { destroy: origDestroy };
+        this.store.record(path, bytes, undefined, "B");
+        const totalPath = `memory/${totals}`;
+        this.store.record(
+            totalPath,
+            (this.store.get(totalPath)?.value() ?? 0) + bytes,
+            undefined,
+            "B",
+        );
+        this.sizes.set(obj, allocation);
+        (obj as { destroy: () => void }).destroy = () => {
+            if (this.sizes.get(obj) !== allocation) return;
+            this.store.record(
+                totalPath,
+                this.store.get(totalPath)!.value()! - bytes,
+                undefined,
+                "B",
+            );
+            this.sizes.delete(obj);
+            this.store.remove(path);
+            origDestroy();
+        };
+        return obj;
+    }
+
+    dispose(): void {
+        this._disposed = true;
+        this._readbackFailed = false;
+        this._readbackError = undefined;
+        for (const restore of this._restorePatches.reverse()) restore();
+        this._restorePatches.length = 0;
+        this._querySet?.destroy();
+        this._querySet = null;
+        this._resolveBuffer?.destroy();
+        this._resolveBuffer = null;
+        this._free.length = 0;
+        this._reads.fill(undefined);
+        this._head = this._tail = this._pending = 0;
+        for (const [resource, allocation] of this.sizes) {
+            (resource as { destroy: () => void }).destroy = allocation.destroy;
+        }
+        this.sizes.clear();
+        for (const diagnostic of this.store.iter()) {
+            if (diagnostic.path.path.startsWith("memory/allocations/"))
+                this.store.remove(diagnostic.path);
+        }
+        this.indirect.clear();
+        this._paths.clear();
+        this._slotCache.length = 0;
+        this._passes.length = 0;
+        this._capacity = 0;
+        this.store.record("memory/bufferBytes", 0, undefined, "B");
+        this.store.record("memory/textureBytes", 0, undefined, "B");
+    }
+
+    record(name: string, measurement: Readonly<Float64Array>): void {
+        this._cpu.add(this.paths(name).cpu, measurement[1]);
+    }
+
+    recordIndirect(name: string, count: number): void {
+        this.indirect.set(name, (this.indirect.get(name) ?? 0) + count);
+        this.store.record(this.paths(name).indirect, this.indirect.get(name)!);
+    }
+
+    reset(world: World): void {
+        this._cpu.finish(this.measurement);
+        this.measurement[0] += world.time.rawDeltaTime;
+        if (this.indirect.size) this.indirect.clear();
+        this._nextSlot = 0;
+    }
+
+    span(name: string): GPUComputePassTimestampWrites | undefined {
+        if (!this._querySet) return undefined;
+        const slot = this._nextSlot;
+        if (slot >= this._capacity) return undefined;
+        this._passes[slot] = name;
+        this._nextSlot = slot + 1;
+        let cached = this._slotCache[slot];
+        if (!cached) {
+            cached = {
+                querySet: this._querySet,
+                beginningOfPassWriteIndex: slot * 2,
+                endOfPassWriteIndex: slot * 2 + 1,
+            };
+            this._slotCache[slot] = cached;
+        }
+        return cached;
+    }
+
+    // Request prior-frame query timestamps at frame begin, before resetting query indices. Queue
+    // order puts the resolve and copy after every prior submission and before the next frame's writes.
+    // Capture pass names with the request so later frames cannot relabel an arriving result. The world
+    // pool owns staging; READ_RING bounds only the profiling metadata in flight.
+    resolve(world: World): void {
+        const querySet = this._querySet;
+        const resolveBuffer = this._resolveBuffer;
+        if (!querySet || !resolveBuffer) return;
+        const queryCount = this._nextSlot * 2;
+        if (queryCount === 0) {
+            if (this._pending > 0) {
+                const last = (this._tail + READ_RING - 1) % READ_RING;
+                this._reads[last]!.empty.push(this.measurement);
+            } else {
+                this._gpu.finish(this.measurement);
+            }
+            return;
+        }
+        const slot = this._free.pop();
+        if (!slot) {
+            // Bevy's diagnostic recorder finish_frame allocates a new FrameData when none has
+            // finished mapping. This bounded ring instead leaves an explicit gap, never a zero.
+            this.store.record(
+                "render/gpu_unsampled_frames",
+                ++this._unsampled,
+                this.measurement[0],
+            );
+            return;
+        }
+        slot.count = this._nextSlot;
+        slot.time = this.measurement[0];
+        slot.ready = false;
+        slot.empty.reset(slot.time);
+        this._reads[this._tail] = slot;
+        this._tail = (this._tail + 1) % READ_RING;
+        this._pending++;
+        for (let i = 0; i < this._nextSlot; i++) slot.passes[i] = this._passes[i];
+        world.readback
+            .request(queryCount * 8, "profile-timestamps", (encoder, staging) => {
+                encoder.resolveQuerySet(querySet, 0, queryCount, resolveBuffer, 0);
+                encoder.copyBufferToBuffer(resolveBuffer, 0, staging, 0, queryCount * 8);
+            })
+            .then(
+                (result) => {
+                    if (this._disposed) return;
+                    slot.bytes = result.bytes;
+                    slot.ready = true;
+                },
+                (error: unknown) => {
+                    if (this._disposed) return;
+                    this._free.push(slot);
+                    this._readbackError = error;
+                    this._readbackFailed = true;
+                },
+            );
+    }
+
+    drain(): void {
+        if (this._readbackFailed)
+            throw new Error("profile timestamp readback failed", { cause: this._readbackError });
+        while (this._pending > 0 && this._reads[this._head]!.ready) {
+            const slot = this._reads[this._head]!;
+            this._reads[this._head] = undefined;
+            this._head = (this._head + 1) % READ_RING;
+            this._pending--;
+            if (slot.count > 0) {
+                const data = new BigUint64Array(slot.bytes);
+                const order = this._intervalOrder;
+                order.length = slot.count;
+                // Godot's consecutive-timestamp delta, bounded by each WebGPU span: rows
+                // measure progress beyond earlier submitted passes, not overlapping wait time.
+                let maxEnd = 0n;
+                for (let i = 0; i < slot.count; i++) {
+                    order[i] = i;
+                    const name = slot.passes[i];
+                    const begin = data[i * 2];
+                    const end = data[i * 2 + 1];
+                    const start = begin > maxEnd ? begin : maxEnd;
+                    this._gpu.add(
+                        this.paths(name).gpu,
+                        Number(end > start ? end - start : 0n) / 1e6,
+                    );
+                    if (end > maxEnd) maxEnd = end;
+                }
+                // Pass envelopes can overlap on tile GPUs. Count their union, not exclusive costs
+                // or the first-to-last envelope, which would include gaps between passes.
+                order.sort((a, b) => (data[a * 2] < data[b * 2] ? -1 : 1));
+                let begin = data[order[0] * 2];
+                let end = data[order[0] * 2 + 1];
+                let total = 0n;
+                for (let i = 1; i < order.length; i++) {
+                    const nextBegin = data[order[i] * 2];
+                    const nextEnd = data[order[i] * 2 + 1];
+                    if (nextBegin > end) {
+                        total += end - begin;
+                        begin = nextBegin;
+                    }
+                    if (nextEnd > end) end = nextEnd;
+                }
+                // Frame diagnostics live outside Bevy's render/<span>/elapsed_gpu pass namespace.
+                this._gpu.add("frame/elapsed_gpu", Number(total + end - begin) / 1e6);
+            }
+            this._free.push(slot);
+            this._gpuClock[0] = slot.time;
+            this._gpu.finish(this._gpuClock);
+            slot.empty.drain(this._gpu);
+        }
+    }
+
+    /** @internal — also the `world.gpu.precompiled` sink for typed pipelines. */
+    recordCompile(label: string, start: number, end: number): void {
+        this.store.record(this.paths(label).compile, end - start, end / 1000, "ms");
+        if (start < this._compileEarliest) this._compileEarliest = start;
+        if (end > this._compileLatest) this._compileLatest = end;
+        this.store.record(
+            "compile/elapsed",
+            this._compileLatest - this._compileEarliest,
+            end / 1000,
+            "ms",
+        );
+    }
+}
+
+function texelBytes(format: string): number {
+    if (format.startsWith("rgba32")) return 16;
+    if (format.startsWith("rgba16")) return 8;
+    if (format.startsWith("rgba8") || format.startsWith("bgra8")) return 4;
+    if (format.startsWith("rg32")) return 8;
+    if (format.startsWith("rg16")) return 4;
+    if (format.startsWith("rg8")) return 2;
+    if (format.startsWith("r32")) return 4;
+    if (format.startsWith("r16")) return 2;
+    if (format.startsWith("r8")) return 1;
+    return 4;
+}
+
+function textureByteSize(desc: GPUTextureDescriptor): number {
+    const [w, h, d] = normalizeSize(desc.size);
+    const bpp = texelBytes(desc.format);
+    const mips = desc.mipLevelCount ?? 1;
+    let total = 0;
+    for (let i = 0; i < mips; i++) {
+        total += Math.max(1, w >> i) * Math.max(1, h >> i) * d * bpp;
+    }
+    return total;
+}
+
+function normalizeSize(size: GPUExtent3DStrict): [number, number, number] {
+    if (Array.isArray(size)) return [size[0], size[1] ?? 1, size[2] ?? 1];
+    const dict = size as GPUExtent3DDictStrict;
+    return [dict.width, dict.height ?? 1, dict.depthOrArrayLayers ?? 1];
+}
+
+interface ViewportData {
+    canvasWidth: number;
+    canvasHeight: number;
+    cssWidth: number;
+    cssHeight: number;
+    dpr: number;
+    fullscreen: boolean;
+}
+
+interface OverlayData {
+    fps: number;
+    frameTime: number;
+    fenceWaitMs: number;
+    gapMs: number;
+    fixedSteps: number;
+    throttled: boolean;
+    pending: number;
+    memBuffers: number;
+    memTextures: number;
+    memTotal: number;
+    memCount: number;
+    memDetails: { kind: string; label: string; bytes: number }[];
+    compileEntries: [string, number][];
+    compileTotalMs: number;
+    viewport: ViewportData | null;
+}
+
+interface Overlay {
+    bounds(): DOMRectReadOnly;
+    update(store: DiagnosticsStore): void;
+    destroy(): void;
+}
+
+const BG = "rgba(20,18,16,0.88)";
+const FG = "#cdc5bc";
+const FG_BRIGHT = "#f0e6d6";
+const DIM = "#706860";
+const ACCENT = "#d49560";
+const WARN = "#e05050";
+const BORDER = "rgba(255,255,255,0.06)";
+const MB = 1024 * 1024;
+const VALUE_WIDTH = "72px";
+const ROW_HEIGHT = "15px";
+
+function el(tag: string, styles?: Partial<CSSStyleDeclaration>): HTMLElement {
+    const e = document.createElement(tag);
+    if (styles) Object.assign(e.style, styles);
+    return e;
+}
+
+function makeRow(
+    parent: HTMLElement,
+    labelColor = DIM,
+    valueColor = FG,
+): { label: HTMLElement; value: HTMLElement; row: HTMLElement } {
+    const r = el("div", {
+        display: "flex",
+        alignItems: "baseline",
+        height: ROW_HEIGHT,
+        lineHeight: ROW_HEIGHT,
+    });
+    const label = el("span", {
+        color: labelColor,
+        flex: "1",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        minWidth: "0",
+    });
+    const value = el("span", {
+        color: valueColor,
+        width: VALUE_WIDTH,
+        flexShrink: "0",
+        textAlign: "right",
+        fontVariantNumeric: "tabular-nums",
+        whiteSpace: "nowrap",
+    });
+    r.append(label, value);
+    parent.append(r);
+    return { label, value, row: r };
+}
+
+interface RowPool {
+    container: HTMLElement;
+    rows: { label: HTMLElement; value: HTMLElement; row: HTMLElement }[];
+    order: string[];
+    values: Map<string, number>;
+}
+
+function createRowPool(parent: HTMLElement, initial: number): RowPool {
+    const container = el("div");
+    parent.append(container);
+    const rows: RowPool["rows"] = [];
+    for (let i = 0; i < initial; i++) {
+        const r = makeRow(container, DIM, ACCENT);
+        r.row.style.display = "none";
+        rows.push(r);
+    }
+    return {
+        container,
+        rows,
+        order: [],
+        values: new Map(),
+    };
+}
+
+function tickPool(pool: RowPool, entries: Iterable<[string, number]>): void {
+    pool.values.clear();
+    for (const [name, value] of entries) pool.values.set(name, value);
+}
+
+function flushPool(
+    pool: RowPool,
+    fmt: (v: number) => string,
+    cpu = false,
+): { rows: [string, string][]; total: number } {
+    let total = cpu ? cpuTotal(pool.values) : 0;
+    const live: [string, string, number][] = [];
+    for (const [name, value] of pool.values) {
+        if (!cpu) total += value;
+        live.push([name, fmt(value), value]);
+    }
+
+    const sorted = live.slice().sort((a, b) => b[2] - a[2]);
+    const rank = new Map<string, number>();
+    for (let i = 0; i < sorted.length; i++) rank.set(sorted[i][0], i);
+
+    const prev = pool.order;
+    if (prev.length !== sorted.length || sorted.some(([name]) => !prev.includes(name))) {
+        pool.order = sorted.map(([name]) => name);
+    } else {
+        pool.order = reorderRows(prev, rank);
+    }
+
+    const byName = new Map<string, [string, string]>();
+    for (const [name, formatted] of sorted) byName.set(name, [name, formatted]);
+    return { rows: pool.order.map((name) => byName.get(name)!), total };
+}
+
+function renderPool(pool: RowPool, entries: [string, string][]): void {
+    while (pool.rows.length < entries.length) {
+        const r = makeRow(pool.container, DIM, ACCENT);
+        r.row.style.display = "none";
+        pool.rows.push(r);
+    }
+    for (let i = 0; i < entries.length; i++) {
+        const r = pool.rows[i];
+        r.label.textContent = entries[i][0];
+        r.value.textContent = entries[i][1];
+        r.row.style.display = "flex";
+    }
+    for (let i = entries.length; i < pool.rows.length; i++) {
+        pool.rows[i].row.style.display = "none";
+    }
+}
+
+function section(parent: HTMLElement, title: string): { totalEl: HTMLElement; body: HTMLElement } {
+    const wrapper = el("div", {
+        marginTop: "2px",
+        paddingTop: "4px",
+        borderTop: `1px solid ${BORDER}`,
+    });
+
+    const headerRow = el("div", {
+        display: "flex",
+        alignItems: "baseline",
+        height: ROW_HEIGHT,
+        lineHeight: ROW_HEIGHT,
+        cursor: "pointer",
+        userSelect: "none",
+    });
+    const titleEl = el("span", {
+        color: DIM,
+        flex: "1",
+        fontSize: "10px",
+        letterSpacing: "0.05em",
+        textTransform: "uppercase",
+    });
+    titleEl.textContent = "▸ " + title;
+    const totalEl = el("span", {
+        color: FG_BRIGHT,
+        width: VALUE_WIDTH,
+        flexShrink: "0",
+        textAlign: "right",
+        fontVariantNumeric: "tabular-nums",
+        whiteSpace: "nowrap",
+    });
+    headerRow.append(titleEl, totalEl);
+
+    const body = el("div", { display: "none", paddingLeft: "8px" });
+    let open = false;
+    headerRow.addEventListener("click", () => {
+        open = !open;
+        body.style.display = open ? "block" : "none";
+        titleEl.textContent = (open ? "▾ " : "▸ ") + title;
+    });
+
+    wrapper.append(headerRow, body);
+    parent.append(wrapper);
+    return { totalEl, body };
+}
+
+function pad(v: string, len: number): string {
+    return v.length >= len ? v : " ".repeat(len - v.length) + v;
+}
+
+function createOverlay(): Overlay {
+    // Bound the profiler to the canvas so it cannot spill into an embedding host page.
+    const parent = mountOverlay(document.querySelector("canvas"));
+
+    const root = el("div", {
+        position: "absolute",
+        zIndex: "10000",
+        pointerEvents: "auto",
+        background: BG,
+        color: FG,
+        fontFamily: "'JetBrains Mono', ui-monospace, 'Cascadia Code', 'Fira Code', monospace",
+        fontSize: "10px",
+        lineHeight: ROW_HEIGHT,
+        padding: "8px 12px",
+        minWidth: "220px",
+        maxHeight: "90vh",
+        overflowY: "auto",
+        scrollbarGutter: "stable",
+        borderRadius: "4px",
+        border: `1px solid ${BORDER}`,
+        boxShadow: "0 2px 12px rgba(0,0,0,0.4)",
+        top: "0",
+        left: "0",
+        margin: "6px",
+    });
+    root.setAttribute("data-shallot-profile", "");
+
+    const style = document.createElement("style");
+    style.textContent = [
+        "[data-shallot-profile]::-webkit-scrollbar { width: 6px }",
+        "[data-shallot-profile]::-webkit-scrollbar-track { background: transparent }",
+        "[data-shallot-profile]::-webkit-scrollbar-thumb { background: transparent; border-radius: 4px }",
+        `[data-shallot-profile]:hover::-webkit-scrollbar-thumb { background: ${BORDER} }`,
+    ].join("\n");
+    root.append(style);
+
+    const hero = el("div", {
+        display: "flex",
+        alignItems: "baseline",
+        gap: "8px",
+        paddingBottom: "4px",
+        borderBottom: `1px solid ${BORDER}`,
+        marginBottom: "2px",
+    });
+    const fpsEl = el("span", {
+        color: FG_BRIGHT,
+        fontSize: "14px",
+        fontWeight: "600",
+        fontVariantNumeric: "tabular-nums",
+        letterSpacing: "-0.02em",
+    });
+    const ftEl = el("span", {
+        color: DIM,
+        fontSize: "10px",
+        fontVariantNumeric: "tabular-nums",
+    });
+    const warnEl = el("span", {
+        color: WARN,
+        fontSize: "9px",
+        marginLeft: "auto",
+    });
+    hero.append(fpsEl, ftEl, warnEl);
+    root.append(hero);
+
+    const frameGroup = el("div", { paddingTop: "2px" });
+    const fenceRow = makeRow(frameGroup);
+    // Submit-to-completion latency overlaps CPU work on subsequent frames; it is not a CPU stall.
+    fenceRow.label.textContent = "gpu latency";
+    const gapRow = makeRow(frameGroup);
+    gapRow.label.textContent = "gap (vsync/throttle)";
+    const fixedRow = makeRow(frameGroup);
+    fixedRow.label.textContent = "fixed steps";
+    const pendingRow = makeRow(frameGroup);
+    pendingRow.label.textContent = "pending";
+    root.append(frameGroup);
+
+    const view = section(root, "viewport");
+    const canvasRow = makeRow(view.body, DIM, ACCENT);
+    canvasRow.label.textContent = "canvas";
+    const cssRow = makeRow(view.body, DIM, ACCENT);
+    cssRow.label.textContent = "css";
+    const dprRow = makeRow(view.body, DIM, ACCENT);
+    dprRow.label.textContent = "dpr";
+    const fsRow = makeRow(view.body, DIM, ACCENT);
+    fsRow.label.textContent = "fullscreen";
+
+    const gpu = section(root, "gpu");
+    const gpuPool = createRowPool(gpu.body, 16);
+    const unsampledRow = makeRow(gpu.body);
+    unsampledRow.label.textContent = "unsampled frames";
+    unsampledRow.row.style.display = "none";
+    // Dawn's indirect-draw validation estimate is GPU work, not additive to GPU latency.
+    const indirectCaption = el("div", {
+        display: "flex",
+        alignItems: "baseline",
+        height: ROW_HEIGHT,
+        lineHeight: ROW_HEIGHT,
+        marginTop: "2px",
+    });
+    const indirectLabel = el("span", {
+        color: DIM,
+        flex: "1",
+        fontSize: "9px",
+        letterSpacing: "0.05em",
+        textTransform: "uppercase",
+    });
+    indirectLabel.textContent = "indirect floor (µs)";
+    const indirectTotalEl = el("span", {
+        color: DIM,
+        width: VALUE_WIDTH,
+        flexShrink: "0",
+        textAlign: "right",
+        fontVariantNumeric: "tabular-nums",
+    });
+    indirectCaption.append(indirectLabel, indirectTotalEl);
+    gpu.body.append(indirectCaption);
+    const indirectPool = createRowPool(gpu.body, 4);
+
+    const cpu = section(root, "cpu");
+    const cpuPool = createRowPool(cpu.body, 16);
+
+    const mem = section(root, "memory");
+    const memBufRow = makeRow(mem.body, DIM, ACCENT);
+    memBufRow.label.textContent = "buffers";
+    const memTexRow = makeRow(mem.body, DIM, ACCENT);
+    memTexRow.label.textContent = "textures";
+    const memPool = createRowPool(mem.body, 16);
+
+    const network = section(root, "network");
+    const networkWrapper = network.body.parentElement!;
+    networkWrapper.style.display = "none";
+    const networkPool = createRowPool(network.body, 0);
+    const networkRows = new NetworkRows();
+
+    const startup = section(root, "startup");
+    const startupPool = createRowPool(startup.body, 16);
+    let startupFrozen = false;
+
+    parent.append(root);
+
+    let lastRender = -Infinity;
+
+    return {
+        update(store: DiagnosticsStore) {
+            const now = performance.now();
+            const rows = networkRows.collect(store, now);
+            networkWrapper.style.display = rows.length ? "block" : "none";
+            network.totalEl.textContent = rows.some(([, value]) => value.includes("stale"))
+                ? "stale"
+                : rows.some(([, value]) => value === "no data")
+                  ? "no data"
+                  : "";
+            renderPool(networkPool, rows);
+            for (const row of networkPool.rows) row.value.style.width = "110px";
+            if (now - lastRender < 250) return;
+            lastRender = now;
+            tickPool(cpuPool, diagnosticEntries(store, "render/", "/elapsed_cpu"));
+            tickPool(gpuPool, diagnosticEntries(store, "render/", "/elapsed_gpu"));
+            tickPool(indirectPool, diagnosticEntries(store, "render/", "/indirect"));
+            const gpuTiming =
+                store.get("render/timestamp_query")?.value() === 1
+                    ? "available"
+                    : "requires timestamp-query";
+            const data = collectStats(store);
+            fpsEl.textContent = pad(data.fps > 0 ? data.fps.toFixed(0) : "--", 3) + " fps";
+            ftEl.textContent = (data.frameTime > 0 ? data.frameTime.toFixed(1) : "--") + " ms";
+            warnEl.textContent = data.throttled ? "throttled" : "";
+
+            fenceRow.value.textContent = data.fenceWaitMs.toFixed(2) + " ms";
+            gapRow.value.textContent = data.gapMs.toFixed(2) + " ms";
+            fixedRow.value.textContent = String(data.fixedSteps);
+            pendingRow.value.textContent = String(data.pending);
+
+            if (data.viewport) {
+                const vp = data.viewport;
+                const mp = (vp.canvasWidth * vp.canvasHeight) / 1e6;
+                view.totalEl.textContent = mp.toFixed(2) + " MP";
+                canvasRow.value.textContent = `${vp.canvasWidth}×${vp.canvasHeight}`;
+                cssRow.value.textContent = `${vp.cssWidth}×${vp.cssHeight}`;
+                dprRow.value.textContent = vp.dpr.toFixed(2);
+                fsRow.value.textContent = vp.fullscreen ? "yes" : "no";
+            }
+
+            const gpuFlush = flushPool(gpuPool, msFmt);
+            root.dataset.gpuTiming = gpuTiming;
+            const unsampled = store.get("render/gpu_unsampled_frames")?.value() ?? 0;
+            unsampledRow.value.textContent = String(unsampled);
+            unsampledRow.row.style.display = unsampled > 0 ? "flex" : "none";
+            gpu.totalEl.textContent =
+                gpuTiming === "available"
+                    ? msFmt(store.get("frame/elapsed_gpu")?.smoothed() ?? 0)
+                    : gpuTiming;
+            renderPool(gpuPool, gpuFlush.rows);
+
+            const indirectFlush = flushPool(indirectPool, (v) =>
+                (v * INDIRECT_FLOOR_US).toFixed(0),
+            );
+            indirectCaption.style.display = indirectFlush.rows.length > 0 ? "flex" : "none";
+            indirectTotalEl.textContent =
+                (indirectFlush.total * INDIRECT_FLOOR_US).toFixed(0) + " µs";
+            renderPool(indirectPool, indirectFlush.rows);
+
+            const cpuFlush = flushPool(cpuPool, msFmt, true);
+            cpu.totalEl.textContent = cpuFlush.total.toFixed(1) + " ms";
+            renderPool(cpuPool, cpuFlush.rows);
+
+            mem.totalEl.textContent =
+                data.memTotal.toFixed(1) +
+                " MB" +
+                (data.memCount > 0 ? " (" + data.memCount + ")" : "");
+            memBufRow.value.textContent = data.memBuffers.toFixed(1) + " MB";
+            memTexRow.value.textContent = data.memTextures.toFixed(1) + " MB";
+            renderPool(
+                memPool,
+                data.memDetails.map((a) => [
+                    (a.kind === "buffer" ? "column " : "tex ") + (a.label || "(unlabeled)"),
+                    formatBytes(a.bytes),
+                ]),
+            );
+
+            if (!startupFrozen && data.compileTotalMs > 0) {
+                startup.totalEl.textContent = data.compileTotalMs.toFixed(0) + " ms";
+                renderPool(
+                    startupPool,
+                    data.compileEntries
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([label, ms]) => [label, ms.toFixed(1) + " ms"]),
+                );
+                startupFrozen = true;
+            }
+        },
+        bounds: () => root.getBoundingClientRect(),
+        destroy() {
+            parent.remove(); // removes the sandboxed host (root lives inside it)
+        },
+    };
+}
+
+function collectViewport(): ViewportData | null {
+    if (typeof document === "undefined") return null;
+    const canvas = document.querySelector("canvas");
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    return {
+        canvasWidth: canvas.width,
+        canvasHeight: canvas.height,
+        cssWidth: Math.round(rect.width),
+        cssHeight: Math.round(rect.height),
+        dpr: window.devicePixelRatio || 1,
+        fullscreen: !!document.fullscreenElement,
+    };
+}
+
+/** @internal */
+export function* diagnosticEntries(
+    store: DiagnosticsStore,
+    prefix: string,
+    field: string,
+): IterableIterator<[string, number]> {
+    for (const diagnostic of store.iter()) {
+        const path = diagnostic.path.path;
+        if (path.startsWith(prefix) && path.endsWith(field)) {
+            const value = diagnostic.smoothed();
+            if (value !== undefined && (!field.startsWith("/elapsed_") || value >= TIMING_FLOOR_MS))
+                yield [decodeLabel(path.slice(prefix.length, -field.length)), value];
+        }
+    }
+}
+
+/** @internal */
+export function collectStats(store: DiagnosticsStore): OverlayData {
+    const value = (path: string) => store.get(path)?.value() ?? 0;
+    const rawMs = store.get("frame_time")?.smoothed() ?? 0;
+    const fenceWaitMs = store.get("frame/fence_wait")?.smoothed() ?? 0;
+    const memDetails: OverlayData["memDetails"] = [];
+    for (const diagnostic of store.iter()) {
+        const path = diagnostic.path.path;
+        const bytes = diagnostic.value() ?? 0;
+        if (!path.startsWith("memory/allocations/") || bytes === 0) continue;
+        const parts = path.slice(19).split("/");
+        memDetails.push({
+            kind: parts[0],
+            label: decodeLabel(parts[1].replace(/#\d+$/, "")),
+            bytes,
+        });
+    }
+    return {
+        fps: store.get("fps")?.smoothed() ?? 0,
+        frameTime: rawMs,
+        fenceWaitMs,
+        gapMs: Math.max(
+            0,
+            rawMs - cpuTotal(new Map(diagnosticEntries(store, "render/", "/elapsed_cpu"))),
+        ),
+        fixedSteps: value("fixed_steps"),
+        throttled: value("throttled") !== 0,
+        pending: value("pending"),
+        memBuffers: value("memory/bufferBytes") / MB,
+        memTextures: value("memory/textureBytes") / MB,
+        memTotal: (value("memory/bufferBytes") + value("memory/textureBytes")) / MB,
+        memCount: memDetails.length,
+        memDetails: memDetails.sort((a, b) => b.bytes - a.bytes),
+        compileEntries: [...diagnosticEntries(store, "compile/", "/elapsed")],
+        compileTotalMs: value("compile/elapsed"),
+        viewport: collectViewport(),
+    };
+}
+
+const profileUi = {
+    create: () => ({
+        overlay: null as Overlay | null,
+        visible: false,
+        chords: new Map<string, () => void>(),
+    }),
+};
+
+/** Register a physical KeyboardEvent.code under F3. Replaces any handler for that code.
+ * Requires DiagnosticsOverlayPlugin. The registration lasts until replaced or the World is disposed.
+ */
+export function registerDebugChord(world: World, code: string, handler: () => void): void {
+    world.resource(profileUi).chords.set(code, handler);
+}
+
+/** Measure the current profiler layout in viewport CSS pixels without changing visibility.
+ * Returns undefined without a document. Closed overlays are measured synchronously and removed
+ * before painting; an open overlay retains its expanded sections.
+ */
+export function profilerBounds(world: World): DOMRectReadOnly | undefined {
+    if (typeof document === "undefined") return undefined;
+    const ui = world.resource(profileUi);
+    const parent = document.querySelector("canvas")?.parentElement ?? document.body;
+    const position = parent.style.position;
+    const overlay = ui.overlay ?? createOverlay();
+    try {
+        overlay.update(world.resource(DiagnosticsStore));
+        return overlay.bounds();
+    } finally {
+        if (!ui.overlay) {
+            overlay.destroy();
+            parent.style.position = position;
+        }
+    }
+}
+
+/**
+ * show or hide the profiler overlay — the same HUD F3 toggles, driven from code. Off by default; call
+ * `showProfiler(world)` in a plugin `warm` to surface the numbers on open without a keypress. F3 still toggles
+ * it alongside. Returns the previous visibility. Requires {@link DiagnosticsOverlayPlugin}.
+ */
+export function showProfiler(world: World, show = true): boolean {
+    const _profileUi = world.resource(profileUi);
+    const previous = _profileUi.visible;
+    _profileUi.visible = show;
+    if (!_profileUi.visible && _profileUi.overlay) {
+        _profileUi.overlay.destroy();
+        _profileUi.overlay = null;
+    }
+    return previous;
+}
+
+// Resolve prior-frame queries before reset clears their count, and before new GPU work overwrites them.
+// Drain only completed readbacks; arrival may trail the sampled frame.
+const ProfileFrameBeginSystem: System = {
+    group: "setup",
+    first: true,
+    update(world: World) {
+        const profiler = world.resource(recorder);
+        profiler.drain();
+        profiler.resolve(world);
+        profiler.reset(world);
+    },
+};
+
+const ProfileFrameStatsSystem: System = {
+    group: "simulation",
+    first: true,
+    update(world) {
+        const t = world.time;
+        const store = world.resource(DiagnosticsStore);
+        const measurement = world.resource(recorder).measurement;
+        if (t.rawDeltaTime > 0) {
+            measurement[1] = 1 / t.rawDeltaTime;
+            store.get("fps")!.addMeasurementBuffer(measurement);
+            measurement[1] = t.rawDeltaTime * 1000;
+            store.get("frame_time")!.addMeasurementBuffer(measurement);
+        }
+        measurement[1] = t.fixedSteps;
+        store.get("fixed_steps")!.addMeasurementBuffer(measurement);
+        measurement[1] = world.gpu.pending();
+        store.get("pending")!.addMeasurementBuffer(measurement);
+        measurement[1] = Number(t.throttled);
+        store.get("throttled")!.addMeasurementBuffer(measurement);
+    },
+};
+
+// runs in the draw group's "last" bucket and refreshes the overlay from the drained per-frame state.
+// Resolve lives at the frame's start, not here — capturing queries at the tail races the render submit.
+const ProfileRenderSystem: System = {
+    group: "draw",
+    last: true,
+    update(world: World) {
+        const _profileUi = world.resource(profileUi);
+
+        if (typeof document === "undefined" || !_profileUi.visible) return;
+        if (!_profileUi.overlay) _profileUi.overlay = createOverlay();
+        _profileUi.overlay.update(world.resource(DiagnosticsStore));
+    },
+};
+
+/**
+ * Records CPU/GPU timings, memory and pipeline compilation into the World's DiagnosticsStore.
+ * Add DiagnosticsOverlayPlugin separately for the F3 HUD.
+ * Tracking starts at device acquisition, independent of plugin order. Composed systems
+ * may record phase timings through the world's record sink; this plugin adds no simulation.
+ * Each render/<span>/elapsed_gpu row measures its end minus the latest earlier pass end in
+ * submission order, starting no earlier than its own begin and clamped to zero. Nonoverlapping
+ * passes read their spans; contained passes read zero. frame/elapsed_gpu remains the span union.
+ * Repeated labels sum per presented frame; missing spans sample zero. CPU publishes at the next
+ * frame begin, GPU after readback in sampled-frame order. Smoothing uses unscaled frame time.
+ * Saturated GPU readbacks leave unsampled gaps, counted cumulatively in render/gpu_unsampled_frames.
+ */
+export const ProfilePlugin: Plugin = {
+    name: "Profile",
+    gpu: { preferredFeatures: TIMESTAMP },
+    systems: [ProfileFrameBeginSystem, ProfileFrameStatsSystem],
+    dependencies: [],
+
+    prepareGpu(world, compute) {
+        const profiler = world.resource(recorder);
+        profiler.store = world.resource(DiagnosticsStore);
+        world.onDispose(() => profiler.dispose());
+        profiler.attach(compute.device);
+
+        compute.span = (name) => profiler.span(name);
+        compute.indirect = (name, count) => profiler.recordIndirect(name, count);
+        compute.precompiled = (label, start, end) => profiler.recordCompile(label, start, end);
+        world.recordSink = (name, measurement) => profiler.record(name, measurement);
+        world.fenceWaitSink = (ms) => {
+            profiler.store.record("frame/fence_wait", ms, undefined, "ms");
+        };
+    },
+
+    async initialize(world) {
+        await world.resource(recorder).ready;
+    },
+
+    dispose(world: World) {
+        const compute = world.gpu;
+        compute.span = undefined;
+        compute.indirect = undefined;
+        compute.precompiled = undefined;
+        world.recordSink = undefined;
+        world.fenceWaitSink = undefined;
+    },
+};
+
+/** Optional F3 overlay reading the diagnostics collected by ProfilePlugin. */
+export const DiagnosticsOverlayPlugin: Plugin = {
+    name: "DiagnosticsOverlay",
+    dependencies: [ProfilePlugin],
+    systems: [ProfileRenderSystem],
+    initialize(world: World) {
+        const ui = world.resource(profileUi);
+        // World disposal must remove the DOM mount even without App.dispose().
+        world.onDispose(() => {
+            ui.overlay?.destroy();
+            ui.overlay = null;
+        });
+
+        if (typeof window !== "undefined") {
+            let held = false;
+            let chord = false;
+            const consumed = new Set<string>();
+            window.addEventListener(
+                "keydown",
+                (e: KeyboardEvent) => {
+                    if (e.code === "F3") {
+                        e.preventDefault();
+                        if (!held) chord = false;
+                        held = true;
+                        return;
+                    }
+                    if (consumed.has(e.code)) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        return;
+                    }
+                    if (!held) return;
+                    chord = true;
+                    const handler = ui.chords.get(e.code);
+                    if (!handler) return;
+                    consumed.add(e.code);
+                    e.stopPropagation();
+                    e.preventDefault();
+                    handler();
+                },
+                { capture: true, signal: world.signal },
+            );
+            window.addEventListener(
+                "keyup",
+                (e: KeyboardEvent) => {
+                    if (consumed.delete(e.code)) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                    }
+                    if (e.code !== "F3") return;
+                    e.preventDefault();
+                    if (held && !chord) showProfiler(world, !ui.visible);
+                    held = false;
+                },
+                { capture: true, signal: world.signal },
+            );
+            window.addEventListener(
+                "blur",
+                () => {
+                    held = false;
+                    consumed.clear();
+                },
+                { signal: world.signal },
+            );
+        }
+    },
+};

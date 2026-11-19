@@ -1,0 +1,10 @@
+{
+  "inclined": {
+    "source": "aahub-mlt/d0/d00be52734d552e88af8e0f9a70b8aee",
+    "url": "https://aahub.org/mlt/d00be52734d552e88af8e0f9a70b8aee",
+    "compact": {"entry": 2, "rows": ["　.／＼", "　|.｀Y´.|", "　.＼!／"]},
+    "growth": {"entry": 11, "ascending": ",.イア'´", "descending": "｀マヘ､"},
+    "rightPaperAdvance": 10,
+    "rule": "Provisional whole-word insertion between retained corners; native | rows grow between fork and foot. The compact right paper slot grows by two ordinary native spaces so arm words and overlapping posts share serializable axes. These growth rules are not additional observed source rows."
+  }
+}

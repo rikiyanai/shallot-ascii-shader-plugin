@@ -1,0 +1,11 @@
+[package]
+name = "shallot-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+count-alloc = []

@@ -1,0 +1,502 @@
+//! Continuous body sweeps from Box3D solver.c (Erin Catto, MIT).
+use crate::{
+    bodies, body, broad,
+    col::Col,
+    continuous_shape::shape_time_of_impact,
+    distance::Sweep,
+    math::{Quat, Transform, Vec3},
+    query::Shape,
+    shapes,
+};
+use body::flags::{ENLARGE_BOUNDS, HAD_TIME_OF_IMPACT, IS_BULLET};
+static mut BULLET_BODIES: *mut u32 = core::ptr::null_mut();
+static BULLET_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+static DEFERRED_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+const DEFERRED_BULLET: u32 = 1 << 31;
+
+pub(crate) unsafe fn reserve_bullets(world: usize, base: usize) {
+    BULLET_BODIES = base as *mut u32;
+    BULLET_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+    DEFERRED_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+    let _ = world;
+}
+
+pub(crate) unsafe fn add_deferred(sim: usize) {
+    DEFERRED_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    add_bullet(sim);
+}
+
+pub(crate) unsafe fn callback_body(world: usize, i: usize) -> bool {
+    if !crate::callbacks::filter_enabled(world) && !crate::callbacks::pre_solve_enabled(world) {
+        return false;
+    }
+    solve_impl(world, 0, i, true)
+}
+
+/// Non-bullets must finish before refit and the bullet sweep, exactly as in parallel finalize.
+pub(crate) unsafe fn finish_deferred(world: usize) {
+    if DEFERRED_COUNT.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    let list = core::slice::from_raw_parts_mut(BULLET_BODIES, bullet_count());
+    list.sort_unstable();
+    let mut bullets = 0;
+    for index in 0..list.len() {
+        let i = list[index] as usize;
+        if sim_u(world).get(i * body::SIM_STRIDE + body::FLAGS) & IS_BULLET != 0 {
+            list[bullets] = i as u32;
+            bullets += 1;
+        } else {
+            solve(world, 0, i);
+            #[cfg(target_arch = "wasm32")]
+            crate::finalize::finish_body(
+                world,
+                0,
+                i,
+                sim(world),
+                sim_u(world).get(i * body::SIM_STRIDE + body::BODY_ID) as usize,
+            );
+        }
+    }
+    BULLET_COUNT.store(bullets, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) unsafe fn add_bullet(sim: usize) {
+    let index = BULLET_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    *BULLET_BODIES.add(index) = sim as u32;
+}
+
+pub(crate) fn bullet_count() -> usize {
+    BULLET_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) unsafe fn bullet_body(index: usize) -> usize {
+    *BULLET_BODIES.add(index) as usize
+}
+
+static mut ROOTS: [i32; 3] = [-1; 3];
+static mut ENABLE_SLEEP: bool = true;
+static mut STEP_DT: f32 = 0.0;
+static mut GRAVITY: Vec3 = Vec3::ZERO;
+pub(crate) fn roots(roots: [i32; 3], enable_sleep: bool, dt: f32, gravity: [f32; 3]) {
+    unsafe {
+        ROOTS = roots;
+        ENABLE_SLEEP = enable_sleep;
+        STEP_DT = dt;
+        GRAVITY = Vec3::new(gravity[0], gravity[1], gravity[2]);
+    }
+}
+unsafe fn sim(world_index: usize) -> Col<'static, f32> {
+    Col::new(
+        bodies::sim_base(world_index) as *mut f32,
+        (bodies::body_cap_in_world(world_index) + 8) * body::SIM_STRIDE,
+    )
+}
+unsafe fn sim_u(world_index: usize) -> Col<'static, u32> {
+    Col::new(
+        bodies::sim_base(world_index) as *mut u32,
+        (bodies::body_cap_in_world(world_index) + 8) * body::SIM_STRIDE,
+    )
+}
+fn v(c: Col<f32>, o: usize) -> Vec3 {
+    Vec3::new(c.get(o), c.get(o + 1), c.get(o + 2))
+}
+fn put(c: Col<f32>, o: usize, v: Vec3) {
+    c.set(o, v.x);
+    c.set(o + 1, v.y);
+    c.set(o + 2, v.z);
+}
+fn q(c: Col<f32>, o: usize) -> Quat {
+    Quat {
+        v: v(c, o),
+        s: c.get(o + 3),
+    }
+}
+unsafe fn sweep(world_index: usize, i: usize, base: Vec3) -> Sweep {
+    let s = sim(world_index);
+    Sweep {
+        local_center: v(s, i * body::SIM_STRIDE + body::LOCAL_CENTER),
+        c1: v(s, i * body::SIM_STRIDE + body::CENTER0).sub(base),
+        c2: v(s, i * body::SIM_STRIDE + body::CENTER).sub(base),
+        q1: q(s, i * body::SIM_STRIDE + body::ROTATION0),
+        q2: q(s, i * body::SIM_STRIDE + body::ROTATION),
+    }
+}
+fn end(s: Sweep) -> Transform {
+    Transform {
+        p: s.c2.sub(s.q2.rotate(s.local_center)),
+        q: s.q2,
+    }
+}
+use crate::geometry_read::transform_bounds as box_transform;
+pub(crate) fn bounds(world_index: usize, id: usize, xf: Transform) -> [f32; 6] {
+    let r = shapes::col_f(world_index);
+    let o = id * shapes::SHAPE_STRIDE;
+    let kind = shapes::col(world_index).get(o + shapes::S_TYPE);
+    if kind == crate::finalize::TY_HULL {
+        return unsafe { crate::shape_geometry::bounds(world_index, id, xf) };
+    }
+    let geom: [f32; 7] = core::array::from_fn(|lane| r.get(o + shapes::S_GEOM + lane));
+    if crate::finalize::is_convex_refit(kind) {
+        return crate::finalize::convex_bounds(kind, &geom, xf);
+    }
+    let shape = unsafe { crate::query_abi::active_shape(world_index, id).0 };
+    let (lower, upper) = match shape {
+        Shape::Mesh(m) => {
+            let a = crate::mesh_query::mul(m.nodes[0].lower, m.scale);
+            let b = crate::mesh_query::mul(m.nodes[0].upper, m.scale);
+            (crate::mesh_query::min(a, b), crate::mesh_query::max(a, b))
+        }
+        Shape::Height(h) => (h.lower, h.upper),
+        Shape::Compound(c) => (c.nodes[0].lo, c.nodes[0].hi),
+        _ => unreachable!(),
+    };
+    box_transform(lower, upper, xf)
+}
+fn offset(mut b: [f32; 6], p: Vec3) -> [f32; 6] {
+    b[0] += p.x;
+    b[1] += p.y;
+    b[2] += p.z;
+    b[3] += p.x;
+    b[4] += p.y;
+    b[5] += p.z;
+    b
+}
+fn union(a: [f32; 6], b: [f32; 6]) -> [f32; 6] {
+    [
+        crate::math::minf(a[0], b[0]),
+        crate::math::minf(a[1], b[1]),
+        crate::math::minf(a[2], b[2]),
+        crate::math::maxf(a[3], b[3]),
+        crate::math::maxf(a[4], b[4]),
+        crate::math::maxf(a[5], b[5]),
+    ]
+}
+unsafe fn target_sweep(world_index: usize, id: usize, base: Vec3) -> Sweep {
+    let u = shapes::col(world_index);
+    let o = id * shapes::SHAPE_STRIDE;
+    let body_id = u.get(o + 1) as usize;
+    let record = bodies::record(world_index, body_id);
+    if record.set_index == crate::solver_set::AWAKE_SET {
+        return sweep(world_index, record.local_index as usize, base);
+    }
+    let sim = bodies::column(world_index, body_id, 1, body::SIM_STRIDE);
+    let c = v(sim, body::CENTER).sub(base);
+    let q = q(sim, body::ROTATION);
+    Sweep {
+        local_center: v(sim, body::LOCAL_CENTER),
+        c1: c,
+        c2: c,
+        q1: q,
+        q2: q,
+    }
+}
+/// # Safety
+/// The body columns must be reserved for the active world, no other thread may write the bodies in
+/// `[start, end)`, and no thread may grow memory while this runs.
+pub unsafe fn sleep_enabled() -> bool {
+    ENABLE_SLEEP
+}
+/// # Safety
+/// As `finalize`, and `reserve_at` must have reserved continuous rows for every body in `[start, end)`.
+pub unsafe fn bullets(world_index: usize, worker: usize, start: usize, end: usize) {
+    for index in start..end {
+        let i = bullet_body(index);
+        if callback_body(world_index, i) {
+            *BULLET_BODIES.add(index) = i as u32 | DEFERRED_BULLET;
+            crate::callback_work::note(world_index, crate::callback_work::Work::ContinuousSerial);
+        } else {
+            crate::callback_work::note(world_index, crate::callback_work::Work::ContinuousParallel);
+            solve(world_index, worker, i);
+        }
+    }
+}
+
+pub(crate) unsafe fn finish_bullets(world: usize) {
+    if !crate::callbacks::filter_enabled(world) && !crate::callbacks::pre_solve_enabled(world) {
+        return;
+    }
+    for index in 0..bullet_count() {
+        let entry = BULLET_BODIES.add(index);
+        if *entry & DEFERRED_BULLET != 0 {
+            *entry &= !DEFERRED_BULLET;
+            solve(world, 0, *entry as usize);
+        }
+    }
+}
+fn commit_bounds(
+    fat: Col<f32>,
+    u: Col<u32>,
+    f: Col<f32>,
+    su: Col<u32>,
+    i: usize,
+    o: usize,
+    b: [f32; 6],
+) {
+    let fb = (o / shapes::SHAPE_STRIDE) * shapes::FAT_STRIDE;
+    let cached = core::array::from_fn(|n| fat.get(fb + n));
+    let escaped = !crate::finalize::aabb_contains(&cached, &b);
+    if escaped {
+        let flags = u.get(o + shapes::S_FLAGS);
+        u.set(o + shapes::S_FLAGS, flags | shapes::ENLARGED_FLAG);
+        let margin = f.get(o + shapes::S_MARGIN);
+        for n in 0..3 {
+            fat.set(fb + n, b[n] - margin);
+            fat.set(fb + n + 3, b[n + 3] + margin);
+        }
+        if su.atomic_get(i * body::SIM_STRIDE + body::FLAGS) & IS_BULLET != 0 {
+            su.atomic_or(i * body::SIM_STRIDE + body::FLAGS, ENLARGE_BOUNDS);
+        }
+    }
+}
+
+pub(crate) unsafe fn solve(world_index: usize, worker: usize, i: usize) {
+    solve_impl(world_index, worker, i, false);
+}
+
+unsafe fn solve_impl(world_index: usize, worker: usize, i: usize, probe: bool) -> bool {
+    let u = shapes::col(world_index);
+    let f = shapes::col_f(world_index);
+    let records = shapes::col_slice(world_index);
+    let filter = |id: usize| {
+        shapes::Filter::read(&records[id * shapes::SHAPE_STRIDE..][..shapes::SHAPE_STRIDE])
+    };
+    let su = sim_u(world_index);
+    let sf = sim(world_index);
+    let base = v(sf, i * body::SIM_STRIDE + body::CENTER0);
+    let sw = sweep(world_index, i, base);
+    let end = end(sw);
+    let bullet = su.atomic_get(i * body::SIM_STRIDE + body::FLAGS) & IS_BULLET != 0;
+    let body_id = su.get(i * body::SIM_STRIDE + body::BODY_ID);
+    let mut fraction = 1.0;
+    let mut hits = [(0u32, 0u32, 0.0f32); 8];
+    let mut hit_count = 0;
+    let head = bodies::record(world_index, body_id as usize).head_shape_id as u32;
+    let mut id = head;
+    while id != u32::MAX {
+        let fast = id as usize;
+        let o = fast * shapes::SHAPE_STRIDE;
+        id = u.get(o + shapes::S_NEXT);
+        let old = [
+            f.get(o + shapes::S_AABB),
+            f.get(o + shapes::S_AABB + 1),
+            f.get(o + shapes::S_AABB + 2),
+            f.get(o + shapes::S_AABB + 3),
+            f.get(o + shapes::S_AABB + 4),
+            f.get(o + shapes::S_AABB + 5),
+        ];
+        let box2 = offset(bounds(world_index, fast, end), base);
+        if !probe {
+            for n in 0..6 {
+                f.set(o + shapes::S_AABB + n, box2[n]);
+            }
+        }
+        if matches!(
+            u.get(o + shapes::S_TYPE),
+            crate::finalize::TY_HEIGHT_FIELD | crate::finalize::TY_MESH
+        ) {
+            continue;
+        }
+        if u.get(o + 4) != u32::MAX {
+            continue;
+        }
+        let shape = crate::query_abi::active_shape(world_index, fast).0;
+        if !matches!(shape, Shape::Sphere(_) | Shape::Capsule(_) | Shape::Hull(_)) {
+            continue;
+        }
+        if !bullet {
+            let (centroid, min_extent, radius) = match &shape {
+                Shape::Sphere(s) => (s.center, s.radius, s.radius),
+                Shape::Capsule(s) => (
+                    s.center1.lerp(s.center2, 0.5),
+                    s.radius,
+                    0.5 * s.center1.distance(s.center2) + s.radius,
+                ),
+                Shape::Hull(h) => {
+                    let p = h.center;
+                    let [lo, hi] = h.bounds;
+                    let farthest = Vec3::new(
+                        if p.x - lo.x > hi.x - p.x { lo.x } else { hi.x },
+                        if p.y - lo.y > hi.y - p.y { lo.y } else { hi.y },
+                        if p.z - lo.z > hi.z - p.z { lo.z } else { hi.z },
+                    );
+                    (p, h.inner_radius, farthest.distance(p))
+                }
+                _ => unreachable!(),
+            };
+            let start = Transform {
+                p: sw.c1.sub(sw.q1.rotate(sw.local_center)),
+                q: sw.q1,
+            };
+            let centroid1 = start.point(centroid);
+            let centroid2 = end.point(centroid);
+            let rotation_chord = 2.0 * sw.q1.inv_mul(sw.q2).v.length();
+            let max_motion = centroid1.distance(centroid2) + rotation_chord * radius;
+            if max_motion
+                <= bodies::record(world_index, body_id as usize).safety_factor * min_extent
+            {
+                continue;
+            }
+        }
+        let swept = union(old, box2);
+        for t in 0..if bullet { 3 } else { 1 } {
+            if ROOTS[t] == -1 {
+                continue;
+            }
+            let mut needed = false;
+            broad::tree(world_index, t).query(
+                Vec3::new(swept[0], swept[1], swept[2]),
+                Vec3::new(swept[3], swept[4], swept[5]),
+                u64::MAX,
+                false,
+                |_, target| {
+                    let target = target as usize;
+                    let a = target * shapes::SHAPE_STRIDE;
+                    if target == fast || u.get(a + 1) == body_id {
+                        return true;
+                    }
+                    let sensor = u.get(a + 4) != u32::MAX;
+                    if sensor
+                        && (u.get(a + shapes::S_FLAGS) & shapes::SENSOR_FLAG == 0
+                            || u.get(o + shapes::S_FLAGS) & shapes::SENSOR_FLAG == 0)
+                        || !shapes::should_shapes_collide(filter(fast), filter(target))
+                    {
+                        return true;
+                    }
+                    let target_body = u.get(a + 1) as usize;
+                    let record = bodies::record(world_index, target_body);
+                    let target_flags = if record.set_index == crate::solver_set::AWAKE_SET {
+                        su.atomic_get(record.local_index as usize * body::SIM_STRIDE + body::FLAGS)
+                    } else {
+                        bodies::column(world_index, target_body, 1, body::SIM_STRIDE)
+                            .get(body::FLAGS)
+                            .to_bits()
+                    };
+                    if target_flags & IS_BULLET != 0 {
+                        return true;
+                    }
+                    if !crate::bodies::should_collide_in_world(world_index, body_id, u.get(a + 1)) {
+                        return true;
+                    }
+                    if probe {
+                        let flags = u.get(a + shapes::S_FLAGS) | u.get(o + shapes::S_FLAGS);
+                        needed = crate::callbacks::filter_enabled(world_index)
+                            && flags & shapes::CUSTOM_FILTERING_FLAG != 0
+                            || !sensor
+                                && crate::callbacks::pre_solve_enabled(world_index)
+                                && flags & shapes::PRE_SOLVE_FLAG != 0;
+                        return !needed;
+                    }
+                    if !crate::callbacks::filter(world_index, target, fast) {
+                        return true;
+                    }
+                    let target_shape = crate::query_abi::active_shape(world_index, target).0;
+                    let output = shape_time_of_impact(
+                        &target_shape,
+                        target_sweep(world_index, target, base),
+                        &shape,
+                        sw,
+                        fraction,
+                        sensor,
+                    );
+                    if sensor {
+                        if output.fraction <= fraction && hit_count < 8 {
+                            hits[hit_count] = (target as u32, fast as u32, output.fraction);
+                            hit_count += 1;
+                        }
+                    } else if output.fraction > 0.0 && output.fraction < fraction {
+                        let flags = u.get(a + shapes::S_FLAGS) | u.get(o + shapes::S_FLAGS);
+                        if flags & shapes::PRE_SOLVE_FLAG == 0
+                            || crate::callbacks::pre_solve(
+                                world_index,
+                                target,
+                                fast,
+                                base.add(output.point),
+                                output.normal,
+                            )
+                        {
+                            fraction = output.fraction;
+                            crate::arena::note_impact(world_index, worker, &output);
+                        }
+                    }
+                    true
+                },
+            );
+            if needed {
+                return true;
+            }
+        }
+    }
+    if probe {
+        return false;
+    }
+    if fraction < 1.0 {
+        let rotation = sw.q1.nlerp(sw.q2, fraction);
+        let c = sw.c1.lerp(sw.c2, fraction);
+        body::write_sim_rotation(sf, i, rotation);
+        body::write_sim_center(sf, i, base.add(c));
+        body::write_sim_transform_p(sf, i, base.add(c.sub(rotation.rotate(sw.local_center))));
+        su.atomic_or(i * body::SIM_STRIDE + body::FLAGS, HAD_TIME_OF_IMPACT);
+        let time_loss = (1.0 - fraction) * STEP_DT;
+        let mut dv = GRAVITY.scale(-time_loss * sf.get(i * body::SIM_STRIDE + body::GRAVITY_SCALE));
+        let flags = *(bodies::flags_base(world_index) as *const u32).add(i * body::STATE_STRIDE);
+        if flags & body::flags::LOCK_LINEAR_X != 0 {
+            dv.x = 0.0;
+        }
+        if flags & body::flags::LOCK_LINEAR_Y != 0 {
+            dv.y = 0.0;
+        }
+        if flags & body::flags::LOCK_LINEAR_Z != 0 {
+            dv.z = 0.0;
+        }
+        let state = Col::new(
+            bodies::state_base(world_index) as *mut f32,
+            (bodies::body_cap_in_world(world_index) + 8) * body::STATE_STRIDE,
+        );
+        let offset = i * body::STATE_STRIDE;
+        put(state, offset, v(state, offset).add(dv));
+        crate::events::write_move(world_index, i);
+    }
+    let rotation = q(sf, i * body::SIM_STRIDE + body::ROTATION);
+    put(sf, i * body::SIM_STRIDE + body::ROTATION0, rotation.v);
+    sf.set(i * body::SIM_STRIDE + body::ROTATION0 + 3, rotation.s);
+    put(
+        sf,
+        i * body::SIM_STRIDE + body::CENTER0,
+        v(sf, i * body::SIM_STRIDE + body::CENTER),
+    );
+    id = head;
+    if fraction < 1.0 {
+        let xf = Transform {
+            p: v(sf, i * body::SIM_STRIDE + body::TRANSFORM_P),
+            q: rotation,
+        };
+        while id != u32::MAX {
+            let o = id as usize * shapes::SHAPE_STRIDE;
+            let mut b = bounds(world_index, id as usize, xf);
+            for n in 0..3 {
+                b[n] -= 0.02;
+                b[n + 3] += 0.02;
+            }
+            for n in 0..6 {
+                f.set(o + shapes::S_AABB + n, b[n]);
+            }
+            commit_bounds(shapes::fat_col(world_index), u, f, su, i, o, b);
+            id = u.get(o + shapes::S_NEXT);
+        }
+    } else {
+        while id != u32::MAX {
+            let o = id as usize * shapes::SHAPE_STRIDE;
+            let b = core::array::from_fn(|n| f.get(o + shapes::S_AABB + n));
+            commit_bounds(shapes::fat_col(world_index), u, f, su, i, o, b);
+            id = u.get(o + shapes::S_NEXT);
+        }
+    }
+    for (sensor, visitor, t) in hits.into_iter().take(hit_count) {
+        if t < fraction {
+            crate::arena::push_sensor_hit(world_index, worker, sensor as usize, visitor as usize);
+        }
+    }
+    false
+}

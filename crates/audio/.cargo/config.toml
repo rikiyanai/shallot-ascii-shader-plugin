@@ -1,0 +1,6 @@
+# Scope SIMD to WASM so native tests use the host ISA.
+# Keep these flags aligned with scripts/audio.ts, which supplies RUSTFLAGS.
+# scripts/wasm-opt.ts must enable SIMD when optimizing the shipped artifact.
+[target.wasm32-unknown-unknown]
+# Strip the workspace-member prefix so embedded panic paths read src/x.rs.
+rustflags = ["-C", "target-feature=+simd128", "--remap-path-prefix=crates/audio/="]

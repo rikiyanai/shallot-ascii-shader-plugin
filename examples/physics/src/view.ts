@@ -1,0 +1,762 @@
+import {
+    AlphaMode,
+    BaseColor,
+    Camera,
+    DirectionalLight,
+    type EntityRef,
+    GlobalAmbientLight,
+    GlobalTransform,
+    lookAtRotation,
+    Materials,
+    Meshes,
+    type MeshHandle,
+    MeshInstance,
+    MeshMaterial,
+    MotorJoint,
+    NotShadowCaster,
+    qRotate,
+    Shape,
+    ShapeKind,
+    StandardMaterial,
+    StandardRenderer,
+    type System,
+    sphere,
+    Transform,
+    type World,
+} from "@dylanebert/shallot";
+import {
+    drawLine,
+    Gizmo,
+    GizmoAsset,
+    internText,
+    LinesPlugin,
+    Orbit,
+    OrbitMode,
+    OrbitPlugin,
+    registerGizmo,
+    Text,
+} from "@dylanebert/shallot/extras";
+import { Anchor, Billboard, worldToViewport } from "@dylanebert/shallot/rendering";
+import {
+    defaultDebugDraw,
+    drawPhysics,
+    shapeEdges,
+    shapeMesh,
+} from "@dylanebert/shallot/standard/physics";
+import type { MaterialHandle } from "@dylanebert/shallot/standard/rendering";
+import * as d from "typegpu/data";
+import { benchmarkVillageDrawing } from "./benchmark-village";
+import { drawCastView } from "./cast-presentation";
+import { characterDrawing, drawCharacterView } from "./character-presentation";
+import { collisionNames } from "./collision";
+import { debugDrawing, drawCollisionDebug } from "./collision-debug-presentation";
+import { collisionGeometryDrawing, drawCollisionGeometry } from "./collision-geometry-presentation";
+import { drawCollisionView } from "./collision-presentation";
+import { childGeometry, compoundChildren, largeCompound } from "./compound-presentation";
+import { ContinuousState } from "./continuous";
+import { drawQuerySpawn } from "./determinism-presentation";
+import { drawingBounds, drawSet } from "./draw-set";
+import { drawingHistory } from "./drawing-history";
+import { DrivingState } from "./driving";
+import { dynamicMoverDrawing } from "./dynamic-mover-presentation";
+import { DynamicMoverPlugin, DynamicMoverState } from "./dynamic-mover-scene";
+import { EventSample } from "./events";
+import { GeometricMoverState } from "./geometric-mover";
+import { drawGeometry } from "./geometry-presentation";
+import { Grab } from "./grab";
+import { drawHeightFieldView } from "./height-field-presentation";
+import { drawInkPoint } from "./ink-presentation";
+import { drawJointViews } from "./joint-presentation";
+import { ManifoldSample } from "./manifold";
+import {
+    drawManifoldDiagnostics,
+    manifoldDiagnosticDrawing,
+} from "./manifold-diagnostic-presentation";
+import { drawManifold, manifoldGeometry } from "./manifold-presentation";
+import { ShapeMaterial } from "./material";
+import { drawMeshViewerView } from "./mesh-inspector-presentation";
+import { drawPogoRay, pogoDrawing } from "./mover-presentation";
+import { mountPlayerControls } from "./player-controls";
+import { type ShapeGeometryCache, scenePresentation, shapePresentation } from "./presentation";
+import { castHeightField } from "./queries";
+import { restitutionScenes } from "./restitution";
+import { restitutionLines } from "./restitution-presentation";
+import { RigidBodyState } from "./rigid-body";
+import { type Scene, scenes } from "./scenes";
+import { ShapeMaterials, shapeMaterial } from "./shape-color";
+import { drawTreeBenchmark, treeGroundHeight } from "./tree-presentation";
+import { VillageState } from "./village";
+import { drawVillageView } from "./village-presentation";
+import { WorldSampleState } from "./world";
+
+function placeMarker(
+    world: World,
+    camera: number,
+    marker: number,
+    point: [number, number, number],
+    diameter: number,
+): void {
+    const transform = world.storage(Transform);
+    transform.translation.set(marker, ...point);
+    const q = world.storage(GlobalTransform).rotation;
+    // Project a camera-up meter at the attachment depth to keep the diameter in CSS pixels.
+    const cameraUp = qRotate(
+        q.x.get(camera),
+        q.y.get(camera),
+        q.z.get(camera),
+        q.w.get(camera),
+        0,
+        1,
+        0,
+    );
+    const center = worldToViewport(world, camera, point);
+    const up = worldToViewport(world, camera, [
+        point[0] + cameraUp[0],
+        point[1] + cameraUp[1],
+        point[2] + cameraUp[2],
+    ]);
+    if (center && up) {
+        const scale = diameter / Math.hypot(up[0] - center[0], up[1] - center[1]);
+        transform.scale.set(marker, scale, scale, scale);
+    }
+}
+
+import { drawEventMark, drawSensorHitViews } from "./event-presentation";
+
+const FreeSmoothness = { create: () => new Map<number, number>() };
+
+export const GrabFeedback = {
+    create: () => ({ marker: 0, attachment: [0, 0, 0] as [number, number, number] }),
+};
+
+export function createViewer(world: World): (world: World, scene: Scene) => () => void {
+    const ambient = world.resource(GlobalAmbientLight);
+    ambient.color = 0xd8e4ff;
+    ambient.brightness = 380;
+    const sun = world.create();
+    world.add(sun, Transform, { rotation: lookAtRotation(0, 0, 0, 1, -2, -0.35) });
+    world.add(sun, DirectionalLight, { color: 0xffe8cc, illuminance: 6000, shadowMapsEnabled: 1 });
+    const camera = world.create();
+    world.add(camera, Camera, { clearColor: 0x191816 });
+    world.add(camera, StandardRenderer);
+    world.add(camera, Orbit);
+    world.add(camera, Transform);
+    const moverMaterial = world
+        .resource(Materials)
+        .add(StandardMaterial({ baseColor: [0.04, 0.43, 0.53, 1], perceptualRoughness: 0.38 }), {
+            alphaMode: AlphaMode.Blend,
+        });
+    return (world, scene) => createView(world, scene, camera, moverMaterial);
+}
+
+export function setSceneCamera(world: World, scene: Scene, camera: number): void {
+    const view = scenes[scene].camera;
+    const orbit = world.storage(Orbit);
+    orbit.yaw.set(camera, (view.yaw * Math.PI) / 180);
+    orbit.pitch.set(camera, (view.pitch * Math.PI) / 180);
+    const phone = typeof window !== "undefined" && window.innerWidth <= 480;
+    const distance = phone && "phoneDistance" in view ? view.phoneDistance : view.distance;
+    world.storage(Camera).far.set(camera, Math.max(1000, 3 * distance));
+    orbit.maxDistance.set(camera, Math.max(900, 2 * distance));
+    orbit.distance.set(
+        camera,
+        phone && "phoneDistance" in view ? view.phoneDistance : view.distance,
+    );
+    const player =
+        scene === "dynamicMover" ||
+        scene === "geometricMover" ||
+        scene === "rigidBody" ||
+        scene === "village";
+    // A player scene snaps; leaving it restores the free camera's own smoothness.
+    const free = world.resource(FreeSmoothness);
+    if (player && !free.has(camera)) free.set(camera, orbit.smoothness.get(camera));
+    if (player) orbit.smoothness.set(camera, 1);
+    else if (free.has(camera)) {
+        orbit.smoothness.set(camera, free.get(camera)!);
+        free.delete(camera);
+    }
+    orbit.mode.set(camera, player ? OrbitMode.Manual : OrbitMode.Free);
+    const follow =
+        scene === "driving" ||
+        scene === "dynamicMover" ||
+        scene === "geometricMover" ||
+        scene === "rigidBody" ||
+        scene === "village";
+    orbit.target.set(
+        camera,
+        scene === "dynamicMover"
+            ? world.resource(DynamicMoverState).entity
+            : scene === "driving"
+              ? world.resource(DrivingState).chassis
+              : scene === "village"
+                ? world.resource(VillageState).entity
+                : scene === "geometricMover"
+                  ? world.resource(GeometricMoverState).entity
+                  : scene === "rigidBody"
+                    ? world.resource(RigidBodyState).character.body
+                    : 0,
+    );
+    // Sharing the orbit button prevents flythrough from detaching a follow camera.
+    orbit.flyButton.set(camera, follow ? orbit.orbitButton.get(camera) : 2);
+    const target = follow
+        ? [0, 0, 0]
+        : phone && "phoneTarget" in view
+          ? view.phoneTarget
+          : view.target;
+    orbit.pan.set(
+        camera,
+        scene === "farStack" ? world.resource(WorldSampleState).offset * 1000 : target[0]!,
+        target[1]!,
+        target[2]!,
+    );
+}
+
+function createView(
+    world: World,
+    scene: Scene,
+    camera: number,
+    moverMaterial: MaterialHandle,
+): () => void {
+    const systems: System[] = [];
+    function addSystem(system: System): void {
+        systems.push(system);
+        world.addSystem(system);
+    }
+    if (scene === "heightField")
+        addSystem({
+            name: "height-field-casts",
+            group: "draw",
+            before: LinesPlugin.systems,
+            update(world) {
+                castHeightField(world);
+                drawLine(world, [0, 0, 0], [0.4, 0, 0], 0xff0000);
+                drawLine(world, [0, 0, 0], [0, 0.4, 0], 0x00ff00);
+                drawLine(world, [0, 0, 0], [0, 0, 0.4], 0x0000ff);
+            },
+        });
+    setSceneCamera(world, scene, camera);
+    const disposePlayerControls =
+        scene === "dynamicMover" ||
+        scene === "geometricMover" ||
+        scene === "rigidBody" ||
+        scene === "village"
+            ? mountPlayerControls(world, scene === "dynamicMover")
+            : undefined;
+    const queryDrawing =
+        scene === "benchmarkVillage"
+            ? drawingHistory(benchmarkVillageDrawing)
+            : scene === "village"
+              ? drawingHistory((world) => world.resource(VillageState).drawing)
+              : scene === "capsulePlane" || scene === "moverOverlap"
+                ? drawingHistory((world) => characterDrawing(world).records)
+                : undefined;
+    for (const system of queryDrawing?.systems ?? []) addSystem(system);
+    const characterMover =
+        scene === "village"
+            ? world.resource(VillageState).mover
+            : scene === "geometricMover"
+              ? world.resource(GeometricMoverState).mover
+              : undefined;
+    const pogo = characterMover
+        ? drawingHistory(() => pogoDrawing(characterMover), "pogo")
+        : undefined;
+    for (const system of pogo?.systems ?? []) addSystem(system);
+    const materials = world.resource(Materials);
+    const geometry: ShapeGeometryCache = new Map();
+    const presentation = scenePresentation(world, scene, geometry);
+    const roles = {
+        ground: materials.add(presentation.materials.ground),
+        subject: world
+            .resource(ShapeMaterial)
+            .add({ ...presentation.materials.subject, restingColor: d.vec3f(0.52, 0.29, 0.065) }),
+        motorized: world
+            .resource(ShapeMaterial)
+            .add({ ...presentation.materials.motorized, restingColor: d.vec3f(0.055, 0.29, 0.35) }),
+        sensor: world
+            .resource(ShapeMaterial)
+            .add({ ...presentation.materials.sensor, restingColor: d.vec3f(0.055, 0.29, 0.35) }),
+    };
+    for (const [role, handle] of Object.entries(roles))
+        world.resource(ShapeMaterials).set(role as keyof typeof roles, handle);
+    const manifoldViews = manifoldGeometry(world).map((geometry, index) => {
+        const eid = world.create();
+        const mesh = world
+            .resource(Meshes)
+            .add({ name: `Manifold shape ${index}`, ...geometry.mesh });
+        const t = geometry.pose;
+        world.add(eid, Transform, {
+            translation: [t.p.x, t.p.y, t.p.z],
+            rotation: [t.q.v.x, t.q.v.y, t.q.v.z, t.q.s],
+        });
+        world.add(eid, MeshInstance, { mesh });
+        world.add(eid, MeshMaterial, roles[geometry.role]);
+        const edges = new GizmoAsset();
+        for (const [a, b] of geometry.edges) drawLine(edges, a, b, 0x000000);
+        world.add(eid, Gizmo, {
+            handle: registerGizmo(world, edges),
+            width: 1,
+            opacity: 0.45,
+            depthBias: -0.0001,
+        });
+        return { eid, mesh };
+    });
+    if (manifoldViews.length)
+        addSystem({
+            name: "manifold-shape-views",
+            group: "simulation",
+            update(w) {
+                const s = w.resource(ManifoldSample);
+                for (const [i, view] of manifoldViews.entries()) {
+                    const t = i === 0 ? s.a : s.b;
+                    w.storage(Transform).translation.set(view.eid, t.p.x, t.p.y, t.p.z);
+                    w.storage(Transform).rotation.set(view.eid, t.q.v.x, t.q.v.y, t.q.v.z, t.q.s);
+                }
+            },
+        });
+    let moverMesh: MeshHandle | undefined;
+    if (scene === "geometricMover" || scene === "village") {
+        const mover =
+            scene === "village"
+                ? world.resource(VillageState)
+                : world.resource(GeometricMoverState);
+        const shape = {
+            ...world.get([...world.query([Shape])][0]!, Shape)!,
+            kind: ShapeKind.Capsule,
+            radius: mover.mover.capsule.radius,
+            capsuleCenter1: [0, -0.5, 0] as [number, number, number],
+            capsuleCenter2: [0, 0.5, 0] as [number, number, number],
+            scale: [1, 1, 1] as [number, number, number],
+        };
+        const geometry = shapeMesh(world, shape)!;
+        moverMesh = world.resource(Meshes).add({ name: "Mover", ...geometry });
+        world.add(mover.entity, MeshInstance, { mesh: moverMesh });
+        world.add(mover.entity, MeshMaterial, roles.motorized);
+        const edges = new GizmoAsset();
+        for (const [a, b] of shapeEdges(world, shape)) drawLine(edges, a, b, 0x000000);
+        world.add(mover.entity, Gizmo, {
+            handle: registerGizmo(world, edges),
+            width: 1,
+            opacity: 0.45,
+            depthBias: -0.0001,
+        });
+    }
+    const initial = new Map(presentation.shapes.map((shape) => [world.ref(shape.eid), shape]));
+
+    const aimedMoverMaterial = scene === "dynamicMover" ? moverMaterial : undefined;
+    let moverOpacity = 1;
+    if (aimedMoverMaterial) {
+        let aimBlend = 0;
+        const orbit = world.storage(Orbit);
+        const radius = orbit.distance.get(camera);
+        const pivot = world.get(camera, Orbit)!.pan;
+        addSystem({
+            name: "dynamic-mover-aim-view",
+            group: "setup",
+            after: [DynamicMoverPlugin.systems![0]!],
+            update(world) {
+                const s = world.resource(DynamicMoverState);
+                aimBlend = Math.max(
+                    0,
+                    Math.min(
+                        1,
+                        aimBlend + ((s.keys.Aim ? 1 : -1) * world.time.realDeltaTime) / 0.2,
+                    ),
+                );
+                const blend = aimBlend * aimBlend * (3 - 2 * aimBlend);
+                const opacity = 1 - 0.7 * blend;
+                if (opacity === moverOpacity) return;
+                orbit.distance.set(camera, radius + blend * (Math.min(radius, 0.8) - radius));
+                orbit.pan.set(
+                    camera,
+                    pivot[0] + blend * 0.6 * s.right.x,
+                    pivot[1] + blend * 0.75,
+                    pivot[2] + blend * 0.6 * s.right.z,
+                );
+                moverOpacity = opacity;
+                for (const eid of world.query([Shape, BaseColor])) {
+                    if ((world.storage(Shape).body.get(eid) || eid) !== s.entity) continue;
+                    world.storage(BaseColor).color.w.set(eid, opacity);
+                    world.add(
+                        eid,
+                        MeshMaterial,
+                        opacity < 1 ? aimedMoverMaterial : roles.motorized,
+                    );
+                    if (world.has(eid, Gizmo))
+                        world.storage(Gizmo).opacity.set(eid, 0.45 * opacity);
+                }
+            },
+        });
+    }
+    const markerMesh = world.resource(Meshes).add({ name: "Grab point", ...sphere(0.5, 16, 12) });
+    const markerMaterial = materials.add(
+        StandardMaterial({ baseColor: [0.855, 0.815, 0.738, 1], unlit: true }),
+    );
+    const feedback = world.resource(GrabFeedback);
+    addSystem({
+        name: "grab-feedback",
+        group: "simulation",
+        update(world) {
+            const grab = world.resource(Grab);
+            if (!grab.mouse) {
+                if (feedback.marker) world.destroy(feedback.marker);
+                feedback.marker = 0;
+                return;
+            }
+            if (!feedback.marker) {
+                feedback.marker = world.create();
+                world.add(feedback.marker, Transform);
+                world.add(feedback.marker, NotShadowCaster);
+                world.add(feedback.marker, MeshInstance, { mesh: markerMesh });
+                world.add(feedback.marker, MeshMaterial, markerMaterial);
+            }
+            const pose = world.storage(GlobalTransform);
+            const anchor = world.storage(MotorJoint).localAnchorB;
+            const ax = anchor.x.get(grab.joint),
+                ay = anchor.y.get(grab.joint),
+                az = anchor.z.get(grab.joint);
+            const q = pose.rotation;
+            const offset = qRotate(
+                q.x.get(grab.body),
+                q.y.get(grab.body),
+                q.z.get(grab.body),
+                q.w.get(grab.body),
+                ax,
+                ay,
+                az,
+            );
+            const p = feedback.attachment;
+            p[0] = pose.translation.x.get(grab.body) + offset[0];
+            p[1] = pose.translation.y.get(grab.body) + offset[1];
+            p[2] = pose.translation.z.get(grab.body) + offset[2];
+            placeMarker(world, camera, feedback.marker, p, 8);
+            drawLine(world, p, grab.point, 0xeee9df);
+        },
+    });
+    const meshes = world.resource(Meshes);
+    let groundMesh: MeshHandle | undefined;
+    if (presentation.ground) {
+        const ground = world.create();
+        groundMesh = meshes.add(presentation.ground.mesh);
+        world.add(ground, Transform, { translation: presentation.ground.translation });
+        world.add(ground, MeshInstance, { mesh: groundMesh });
+        world.add(ground, MeshMaterial, roles.ground);
+    }
+    const grid = new GizmoAsset();
+    for (const { a, b, color } of presentation.grid.lines) drawLine(grid, a, b, color);
+    const gridEntity = world.create();
+    world.add(gridEntity, Transform);
+    world.add(gridEntity, Gizmo, {
+        handle: registerGizmo(world, grid),
+        width: presentation.grid.width,
+        opacity: presentation.grid.opacity,
+    });
+    if (presentation.explosion.length) {
+        const rings = world.create();
+        const asset = new GizmoAsset();
+        for (const { a, b, color } of presentation.explosion) drawLine(asset, a, b, color);
+        world.add(rings, Transform);
+        world.add(rings, Gizmo, { handle: registerGizmo(world, asset), width: 2 });
+    }
+    const childAssets = new Map<
+        string,
+        { mesh: MeshHandle; edges: ReturnType<typeof registerGizmo> }
+    >();
+    const compoundEntities: number[] = [];
+    for (const eid of world.query([Shape])) {
+        if (!largeCompound(world, eid)) continue;
+        for (const child of compoundChildren(world, eid)) {
+            let asset = childAssets.get(child.key);
+            if (!asset) {
+                const geometry = childGeometry(world, child);
+                const edges = new GizmoAsset();
+                for (const [a, b] of geometry.edges) drawLine(edges, a, b, 0x000000);
+                asset = { mesh: meshes.add(geometry.mesh), edges: registerGizmo(world, edges) };
+                childAssets.set(child.key, asset);
+            }
+            const entity = world.create();
+            compoundEntities.push(entity);
+            world.add(entity, Transform, {
+                translation: child.translation,
+                rotation: child.rotation,
+                scale: child.scale,
+            });
+            world.add(entity, MeshInstance, { mesh: asset.mesh });
+            world.add(entity, MeshMaterial, roles.ground);
+            world.add(entity, Gizmo, {
+                handle: asset.edges,
+                width: 1,
+                opacity: 0.45,
+                depthBias: -0.0001,
+            });
+        }
+    }
+    const views = new Map<EntityRef, MeshHandle>();
+    const shared = new Map<
+        object,
+        { mesh: MeshHandle; edges: ReturnType<typeof registerGizmo>; users: number }
+    >();
+    const meshKeys = new Map<MeshHandle, object>();
+    const labels: number[] = [];
+    function updateShapes(world: World): void {
+        let visible: Set<number> | undefined;
+        if (scene === "largeWorld") {
+            const pose = world.get(camera, Transform)!;
+            const forward = qRotate(...pose.rotation, 0, 0, -1);
+            visible = drawSet(
+                world,
+                drawingBounds(
+                    pose.translation,
+                    forward,
+                    typeof window === "undefined" ? 1 : window.innerWidth / window.innerHeight,
+                    world.storage(Camera).fov.get(camera),
+                ),
+            );
+        }
+        for (const [ref, mesh] of views) {
+            const eid = world.resolve(ref);
+            if (!eid || !world.has(eid, Shape) || (visible && !visible.has(eid))) {
+                if (eid) {
+                    world.remove(eid, MeshInstance);
+                    world.remove(eid, MeshMaterial);
+                    world.remove(eid, Gizmo);
+                }
+                const key = meshKeys.get(mesh)!;
+                const asset = shared.get(key)!;
+                if (--asset.users === 0) {
+                    meshes.remove(mesh);
+                    meshKeys.delete(mesh);
+                    shared.delete(key);
+                    for (const [geometryKey, entry] of geometry)
+                        if (entry.mesh === key) geometry.delete(geometryKey);
+                }
+                views.delete(ref);
+            }
+        }
+        const sample = world.resource(EventSample);
+        for (const eid of visible ?? world.query([Shape])) {
+            if (largeCompound(world, eid)) continue;
+            const ref = world.ref(eid);
+            if (views.has(ref) && meshes.has(views.get(ref)!)) continue;
+            const shape = initial.get(ref) ?? shapePresentation(world, eid, geometry);
+            initial.delete(ref);
+            let asset = shared.get(shape.mesh);
+            if (!asset) {
+                const edges = new GizmoAsset();
+                for (const [a, b] of shape.edges) drawLine(edges, a, b, 0x000000);
+                asset = {
+                    mesh: meshes.add(shape.mesh),
+                    edges: registerGizmo(world, edges),
+                    users: 0,
+                };
+                meshKeys.set(asset.mesh, shape.mesh);
+                shared.set(shape.mesh, asset);
+            }
+            const mesh = asset.mesh;
+            asset.users++;
+            views.set(ref, mesh);
+            const opacity =
+                aimedMoverMaterial && shape.body === world.resource(DynamicMoverState).entity
+                    ? moverOpacity
+                    : 1;
+            world.add(eid, Gizmo, {
+                handle: asset.edges,
+                width: 1,
+                opacity: 0.45 * opacity,
+                depthBias: -0.0001,
+            });
+            world.add(eid, MeshInstance, { mesh });
+            world.add(eid, MeshMaterial, opacity < 1 ? aimedMoverMaterial! : roles[shape.role]);
+            if (!world.has(eid, BaseColor)) {
+                const color = shapeMaterial(world, shape.role, eid).baseColor;
+                world.add(eid, BaseColor, {
+                    color: [color[0], color[1], color[2], color[3] * opacity],
+                });
+            }
+        }
+        drawSensorHitViews(world, camera, (a, b, color, options) =>
+            drawLine(world, a, b, color, options),
+        );
+        const debugLabels = debugDrawing(world).labels.concat(
+            collisionGeometryDrawing(world).labels,
+            manifoldDiagnosticDrawing(world).labels,
+        );
+        const marks = debugLabels
+            .map((mark) => ({ ...mark, end: mark.point }))
+            .concat(
+                sample.scene === "persistentContact"
+                    ? sample.contactMarks
+                    : sample.hits.map((hit) => ({
+                          point: [hit.point.x, hit.point.y, hit.point.z] as [
+                              number,
+                              number,
+                              number,
+                          ],
+                          end: [
+                              hit.point.x - hit.approachSpeed * hit.normal.x,
+                              hit.point.y - hit.approachSpeed * hit.normal.y,
+                              hit.point.z - hit.approachSpeed * hit.normal.z,
+                          ] as [number, number, number],
+                          label: `${hit.approachSpeed.toFixed(1)}, ${hit.userMaterialIdA}`,
+                      })),
+            );
+        while (labels.length > marks.length) world.destroy(labels.pop()!);
+        for (let i = 0; i < marks.length; i++) {
+            const mark = marks[i]!;
+            const point = mark.point;
+            if (!labels[i]) {
+                const label = world.create();
+                labels[i] = label;
+                world.add(label, Transform, {
+                    translation: point,
+                });
+                world.add(label, Text, {
+                    content: internText(world, mark.label),
+                    fontSize:
+                        i < debugLabels.length ? world.storage(Orbit).distance.get(camera) / 50 : 1,
+                    depthBias: -1,
+                    billboard: Billboard.Screen,
+                    color: 0xeee9df,
+                });
+                world.add(label, Anchor, { offset: [...Anchor.BOTTOM_LEFT] });
+            }
+            const label = labels[i]!;
+            world.storage(Transform).translation.set(label, ...point);
+            world.storage(Text).content.set(label, internText(world, mark.label));
+            if (i >= debugLabels.length)
+                drawEventMark(mark, (a, b, color, options) =>
+                    drawLine(world, a, b, color, options),
+                );
+        }
+    }
+    updateShapes(world);
+    addSystem({
+        name: "shape-views",
+        group: "simulation",
+        after: OrbitPlugin.systems,
+        update: updateShapes,
+    });
+    addSystem({
+        name: "joint-anchors",
+        group: "simulation",
+        after: OrbitPlugin.systems,
+        update(world) {
+            if (characterMover && pogo)
+                drawPogoRay(pogo.records(world), (a, b, color, options) =>
+                    drawLine(world, a, b, color, options),
+                );
+            if (scene === "capsulePlane" || scene === "moverOverlap")
+                drawCharacterView(
+                    world,
+                    camera,
+                    (a, b, color, options) => drawLine(world, a, b, color, options),
+                    queryDrawing!.records(world),
+                );
+            if (scene === "village" || scene === "benchmarkVillage")
+                drawVillageView(
+                    world,
+                    camera,
+                    (a, b, color, options) => drawLine(world, a, b, color, options),
+                    queryDrawing!.records(world),
+                );
+            if (scene === "meshHeightField")
+                drawHeightFieldView(world, camera, (a, b, color, options) =>
+                    drawLine(world, a, b, color, options),
+                );
+            if (scene === "treeBenchmark") {
+                world
+                    .storage(Transform)
+                    .translation.y.set(
+                        gridEntity,
+                        treeGroundHeight(world) + 0.005 - presentation.grid.lines[0]!.a[1],
+                    );
+                drawTreeBenchmark(world, camera, (a, b, color, options) =>
+                    drawLine(world, a, b, color, options),
+                );
+            }
+            if (scene in restitutionScenes)
+                for (const { a, b } of restitutionLines(world))
+                    drawLine(world, a, b, 0xeee9df, { width: 1, depthBias: -1 });
+            if (scene === "safetyFactor") {
+                const y = -world.resource(ContinuousState).safetyOverlap;
+                drawLine(world, [-3, y, 0], [3, y, 0], 0xeee9df, { width: 1, depthBias: -1 });
+            }
+            if (scene === "restitution") drawLine(world, [-40, 40.5, 0], [40, 40.5, 0], 0xff0000);
+            if (scene === "meshViewer")
+                drawMeshViewerView(world, (a, b, color, options) =>
+                    drawLine(world, a, b, color, options),
+                );
+            drawManifoldDiagnostics(world, camera, (a, b, color, options) =>
+                drawLine(world, a, b, color, options),
+            );
+            drawManifold(world, camera, (a, b, color, options) =>
+                drawLine(world, a, b, color, options),
+            );
+            drawGeometry(world, (a, b, color, options) => drawLine(world, a, b, color, options));
+            drawCollisionGeometry(world, camera, (a, b, color, options) =>
+                drawLine(world, a, b, color, options),
+            );
+            drawCollisionDebug(world, camera, (a, b, color, options) =>
+                drawLine(world, a, b, color, options),
+            );
+            if ((collisionNames as readonly string[]).includes(scene))
+                drawCollisionView(world, camera, (a, b, color, options) =>
+                    drawLine(world, a, b, color, options),
+                );
+            if (scene === "cast")
+                drawCastView(world, camera, (a, b, color, options) =>
+                    drawLine(world, a, b, color, options),
+                );
+            if (scene === "querySpawn")
+                drawQuerySpawn(world, (a, b, color, options) =>
+                    drawLine(world, a, b, color, options),
+                );
+            if (scene === "dynamicMover")
+                for (const { a, b, color, point, width = 1 } of dynamicMoverDrawing(world)) {
+                    drawLine(world, a, b, color, { width });
+                    if (point)
+                        drawInkPoint(
+                            world,
+                            camera,
+                            b,
+                            (a, b, color, options) => drawLine(world, a, b, color, options),
+                            color,
+                        );
+                }
+            drawJointViews(world, scene, camera, (a, b, color, options) =>
+                drawLine(world, a, b, color, options),
+            );
+        },
+    });
+    if (scene === "joint") {
+        const draw = defaultDebugDraw();
+        draw.drawJoints = true;
+        draw.drawSegment = (a, b) => drawLine(world, [a.x, a.y, a.z], [b.x, b.y, b.z], 0x38a4b5);
+        addSystem({
+            name: "joint-views",
+            group: "simulation",
+            update(world) {
+                drawPhysics(world, draw);
+            },
+        });
+    }
+    return () => {
+        disposePlayerControls?.();
+        for (const system of systems) world.removeSystem(system);
+        for (const entity of compoundEntities) if (world.exists(entity)) world.destroy(entity);
+        for (const asset of childAssets.values()) meshes.remove(asset.mesh);
+        for (const asset of shared.values()) meshes.remove(asset.mesh);
+        for (const view of manifoldViews) {
+            if (world.exists(view.eid)) world.destroy(view.eid);
+            meshes.remove(view.mesh);
+        }
+        meshes.remove(markerMesh);
+        if (moverMesh !== undefined) meshes.remove(moverMesh);
+        if (groundMesh !== undefined) meshes.remove(groundMesh);
+        materials.remove(roles.ground);
+        for (const role of ["subject", "motorized", "sensor"] as const)
+            world.resource(ShapeMaterial).remove(roles[role]);
+        world.resource(ShapeMaterials).clear();
+        materials.remove(markerMaterial);
+        Object.assign(feedback, GrabFeedback.create());
+    };
+}

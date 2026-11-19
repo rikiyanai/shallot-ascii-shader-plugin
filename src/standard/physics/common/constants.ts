@@ -1,0 +1,60 @@
+// Box3D constants.h / core.h (Erin Catto, MIT). Length units are fixed at one per meter;
+// changing this constant alone is insufficient because other modules contain length literals.
+
+const f32 = Math.fround;
+export const FLT_MAX = 3.4028234663852886e38;
+
+/** Length units per meter; not runtime-configurable. */
+export const LENGTH_UNITS_PER_METER = f32(1.0);
+
+/// A small length used as a collision and constraint tolerance (B3_LINEAR_SLOP).
+export const LINEAR_SLOP = f32(f32(0.005) * LENGTH_UNITS_PER_METER);
+
+/// Shapes are extended by this amount so speculative contacts can be created before touching
+/// (B3_SPECULATIVE_DISTANCE).
+export const SPECULATIVE_DISTANCE = f32(4.0 * LINEAR_SLOP);
+
+/// A contact is recycled rather than destroyed while the shapes stay within this distance
+/// (B3_CONTACT_RECYCLE_DISTANCE).
+export const CONTACT_RECYCLE_DISTANCE = f32(10.0 * LINEAR_SLOP);
+
+/// Coordinate sanity bound (B3_HUGE), 100 km at one length unit per meter.
+export const HUGE = f32(1.0e5 * LENGTH_UNITS_PER_METER);
+
+/// Number of solver graph colors (B3_GRAPH_COLOR_COUNT); the last is the serial overflow color.
+export const GRAPH_COLOR_COUNT = 24;
+
+/// The overflow color index (B3_OVERFLOW_INDEX): constraints that cannot fit a graph color (a
+/// dynamic body touching many others) spill here and are solved serially, scalar.
+export const OVERFLOW_INDEX = GRAPH_COLOR_COUNT - 1;
+
+/// Colors 0..DYNAMIC_COLOR_COUNT-1 hold dynamic-dynamic constraints (B3_DYNAMIC_COLOR_COUNT); the
+/// remaining non-overflow colors are reserved for dynamic-static constraints, kept at a higher
+/// solver priority (built from the high end) to reduce push-through tunneling.
+export const DYNAMIC_COLOR_COUNT = GRAPH_COLOR_COUNT - 4;
+
+/// Body name length including the null terminator in C (B3_BODY_NAME_LENGTH). Names are plain JS
+/// strings here; kept only to truncate to the reference limit.
+export const BODY_NAME_LENGTH = 18;
+
+/// Default collision category and mask bits: all bits set (B3_DEFAULT_CATEGORY_BITS /
+/// B3_DEFAULT_MASK_BITS = UINT64_MAX). Real u64 → bigint on the public filter types.
+export const DEFAULT_CATEGORY_BITS = 0xffffffffffffffffn;
+export const DEFAULT_MASK_BITS = 0xffffffffffffffffn;
+
+/// The same all-bits default in the internal u32-halves form, for the bigint-free tree paths.
+export const ALL_BITS_HI = 0xffffffff;
+export const ALL_BITS_LO = 0xffffffff;
+
+/// Solver-set roles (b3SetType). Sets 0-2 are permanent singletons created in this order at world
+/// construction; every set index >= firstSleeping is a sleeping island group.
+export const SetType = {
+    Static: 0,
+    Disabled: 1,
+    Awake: 2,
+    FirstSleeping: 3,
+} as const;
+export type SetType = (typeof SetType)[keyof typeof SetType];
+
+/// Most vertices a convex hull keeps (B3_MAX_HULL_VERTICES).
+export const MAX_HULL_VERTICES = 128;

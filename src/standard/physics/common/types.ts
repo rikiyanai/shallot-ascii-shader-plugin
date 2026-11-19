@@ -1,0 +1,260 @@
+// Box3D types.h and b3Default* factories in types.c (Erin Catto, MIT).
+// Definitions are reusable creation data; length units are fixed at one per meter.
+
+import type { SurfaceMaterial } from "../../../core/physics";
+import { DEFAULT_CATEGORY_BITS, DEFAULT_MASK_BITS, LENGTH_UNITS_PER_METER } from "./constants";
+import type { Pos, Quat, Vec3 } from "./records";
+
+const f32 = Math.fround;
+
+/** Body simulation type (b3BodyType). Numeric values are load-bearing: broadphase tree index and
+ * the proxy key's 2-bit type. */
+export const BodyType = {
+    /** Zero mass, zero velocity, may be moved manually. */
+    Static: 0,
+    /** Zero mass, velocity set by the user, moved by the solver. */
+    Kinematic: 1,
+    /** Positive mass, velocity from forces, moved by the solver. */
+    Dynamic: 2,
+} as const;
+export type BodyType = (typeof BodyType)[keyof typeof BodyType];
+
+/** Shape type (b3ShapeType). Numeric values index the contact-register dispatch table — keep them. */
+export const ShapeType = {
+    Capsule: 0,
+    Compound: 1,
+    HeightField: 2,
+    Hull: 3,
+    Mesh: 4,
+    Sphere: 5,
+} as const;
+export type ShapeType = (typeof ShapeType)[keyof typeof ShapeType];
+
+/** Per-axis translation and rotation locks (b3MotionLocks). */
+export type MotionLocks = {
+    linearX: boolean;
+    linearY: boolean;
+    linearZ: boolean;
+    angularX: boolean;
+    angularY: boolean;
+    angularZ: boolean;
+};
+
+/**
+ * Collision filtering data (b3Filter). Category/mask are real u64 bit sets → bigint (matching the
+ * broadphase tree convention). A non-zero group forces collision (positive) or skips it (negative),
+ * overriding the mask.
+ */
+export type Filter = {
+    categoryBits: bigint;
+    maskBits: bigint;
+    groupIndex: number;
+};
+
+/** @returns the default filter: all categories, all masks, no group (b3DefaultFilter). */
+export function defaultFilter(): Filter {
+    return { categoryBits: DEFAULT_CATEGORY_BITS, maskBits: DEFAULT_MASK_BITS, groupIndex: 0 };
+}
+
+/** A spatial query's collision filter (b3QueryFilter); the recording id/name fields are omitted. */
+export type QueryFilter = {
+    categoryBits: bigint;
+    maskBits: bigint;
+};
+
+/** @returns the default query filter: all categories, all masks (b3DefaultQueryFilter). */
+export function defaultQueryFilter(): QueryFilter {
+    return { categoryBits: DEFAULT_CATEGORY_BITS, maskBits: DEFAULT_MASK_BITS };
+}
+
+export type { SurfaceMaterial };
+
+/** @returns the default surface material: friction 0.6, everything else zero (b3DefaultSurfaceMaterial). */
+export function defaultSurfaceMaterial(): SurfaceMaterial {
+    return {
+        friction: f32(0.6),
+        restitution: 0,
+        rollingResistance: 0,
+        tangentVelocity: [0, 0, 0],
+        userMaterialId: 0n,
+        customColor: 0,
+    };
+}
+
+/** A deep copy of a surface material, so stored materials never alias caller-owned defs. */
+export function cloneMaterial(m: SurfaceMaterial): SurfaceMaterial {
+    return {
+        friction: m.friction,
+        restitution: m.restitution,
+        rollingResistance: m.rollingResistance,
+        tangentVelocity: [m.tangentVelocity[0], m.tangentVelocity[1], m.tangentVelocity[2]],
+        userMaterialId: m.userMaterialId,
+        customColor: m.customColor,
+    };
+}
+
+/** Optional initial pool capacities (b3Capacity). */
+export type Capacity = {
+    staticShapeCount: number;
+    dynamicShapeCount: number;
+    staticBodyCount: number;
+    dynamicBodyCount: number;
+    contactCount: number;
+};
+
+/** Mixing callback signature for friction/restitution (b3FrictionCallback / b3RestitutionCallback). */
+export type MixCallback = (
+    a: number,
+    userMaterialIdA: bigint,
+    b: number,
+    userMaterialIdB: bigint,
+) => number;
+
+/**
+ * World creation parameters (b3WorldDef). Reusable pure data. Threading, task-system, and
+ * debug-draw fields of the C def are omitted; friction/restitution mixing
+ * callbacks default to the built-in mix functions when left undefined.
+ */
+export type WorldDef = {
+    gravity: Vec3;
+    restitutionThreshold: number;
+    /** Restitution passes, clamped to an integer in [0, 63]; defaults to two. */
+    restitutionIterations: number;
+    /** Allow restitution impulses through non-bouncy contacts; defaults to false. */
+    enableRestitutionPropagation: boolean;
+    hitEventThreshold: number;
+    contactHertz: number;
+    contactDampingRatio: number;
+    contactSpeed: number;
+    maximumLinearSpeed: number;
+    /**
+     * Disable gyroscopic torque on nearly isotropic inertia tensors. Clamped to [0, 1]; defaults
+     * to 0.2. A sphere is 0 and a 1×1×2 box is 0.5. Applied at the next fixed sync; existing bodies
+     * use the new tolerance only when their mass data is updated.
+     */
+    isotropicInertiaTolerance: number;
+    frictionCallback?: MixCallback;
+    restitutionCallback?: MixCallback;
+    enableSleep: boolean;
+    enableContinuous: boolean;
+    userData?: unknown;
+    capacity?: Capacity;
+};
+
+/** @returns the default world definition (b3DefaultWorldDef), bit-exact at length unit 1.0. */
+export function defaultWorldDef(): WorldDef {
+    const lu = LENGTH_UNITS_PER_METER;
+    return {
+        gravity: { x: 0, y: f32(-10.0), z: 0 },
+        restitutionThreshold: f32(1.0 * lu),
+        restitutionIterations: 2,
+        enableRestitutionPropagation: false,
+        hitEventThreshold: f32(1.0 * lu),
+        contactHertz: f32(30.0),
+        contactDampingRatio: f32(10.0),
+        contactSpeed: f32(3.0 * lu),
+        maximumLinearSpeed: f32(400.0 * lu),
+        isotropicInertiaTolerance: f32(0.2),
+        enableSleep: true,
+        enableContinuous: true,
+    };
+}
+
+/** Rigid body creation parameters (b3BodyDef). Shapes are added after construction. */
+export type BodyDef = {
+    type: BodyType;
+    position: Pos;
+    rotation: Quat;
+    linearVelocity: Vec3;
+    angularVelocity: Vec3;
+    linearDamping: number;
+    angularDamping: number;
+    gravityScale: number;
+    sleepThreshold: number;
+    safetyFactor: number;
+    /** Optional debug name, truncated to BODY_NAME_LENGTH-1 characters. */
+    name?: string;
+    userData?: unknown;
+    motionLocks: MotionLocks;
+    enableSleep: boolean;
+    isAwake: boolean;
+    isBullet: boolean;
+    isEnabled: boolean;
+    allowFastRotation: boolean;
+    enableContactRecycling: boolean;
+};
+
+/** @returns the default body definition (b3DefaultBodyDef): a static, awake, enabled body. */
+export function defaultBodyDef(): BodyDef {
+    return {
+        type: BodyType.Static,
+        position: { x: 0, y: 0, z: 0 },
+        rotation: { v: { x: 0, y: 0, z: 0 }, s: 1 },
+        linearVelocity: { x: 0, y: 0, z: 0 },
+        angularVelocity: { x: 0, y: 0, z: 0 },
+        linearDamping: 0,
+        angularDamping: 0,
+        gravityScale: f32(1.0),
+        sleepThreshold: f32(f32(0.05) * LENGTH_UNITS_PER_METER),
+        safetyFactor: 0.5,
+        motionLocks: {
+            linearX: false,
+            linearY: false,
+            linearZ: false,
+            angularX: false,
+            angularY: false,
+            angularZ: false,
+        },
+        enableSleep: true,
+        isAwake: true,
+        isBullet: false,
+        isEnabled: true,
+        allowFastRotation: false,
+        enableContactRecycling: true,
+    };
+}
+
+/** Shape creation parameters (b3ShapeDef). */
+export type ShapeDef = {
+    userData?: unknown;
+    /** Optional debug name; immutable strings stay keyed by shape id in the host. */
+    name?: string;
+    /** Per-triangle materials for mesh shapes; ignored for convex and compound shapes. */
+    materials?: SurfaceMaterial[];
+    /** The base surface material (ignored for compound shapes). */
+    baseMaterial: SurfaceMaterial;
+    density: number;
+    explosionScale: number;
+    filter: Filter;
+    enableCustomFiltering: boolean;
+    isSensor: boolean;
+    enableSensorEvents: boolean;
+    enableContactEvents: boolean;
+    enableHitEvents: boolean;
+    enablePreSolveEvents: boolean;
+    enableSpeculativeContact: boolean;
+    invokeContactCreation: boolean;
+    updateBodyMass: boolean;
+};
+
+/** @returns the default shape definition (b3DefaultShapeDef): water density, all-pass filter. */
+export function defaultShapeDef(): ShapeDef {
+    const lu = LENGTH_UNITS_PER_METER;
+    return {
+        name: "",
+        baseMaterial: defaultSurfaceMaterial(),
+        // density of water
+        density: f32(1000.0 / f32(f32(lu * lu) * lu)),
+        explosionScale: f32(1.0),
+        filter: defaultFilter(),
+        enableCustomFiltering: false,
+        isSensor: false,
+        enableSensorEvents: false,
+        enableContactEvents: false,
+        enableHitEvents: false,
+        enablePreSolveEvents: false,
+        enableSpeculativeContact: true,
+        invokeContactCreation: true,
+        updateBodyMass: true,
+    };
+}

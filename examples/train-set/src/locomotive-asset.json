@@ -1,0 +1,103 @@
+{
+  "sourceSha256": "43e19825fbe56b8548d285c76987288533e3c3440fe485e60c412b28fbb86419",
+  "wheelGauge": 0.6,
+  "halfExtents": [
+    0.7238396007964745,
+    0.6245291944929311,
+    3.3811608512752906
+  ],
+  "hullOffset": 0.3245291944929311,
+  "sourceFrames": [
+    1,
+    21
+  ],
+  "sourceFps": 24,
+  "bodies": {
+    "locomotive": {
+      "nodes": [
+        "body2",
+        "cab1",
+        "coupling_rods_mesh",
+        "extra",
+        "glass",
+        "link",
+        "locolmotive:link",
+        "locolmotive:pCylinder22",
+        "locolmotive:pCylinder25",
+        "locolmotive:piston",
+        "locolmotive:radius_rod",
+        "locolmotive:valve_rods",
+        "locolmotive:wheel1",
+        "locolmotive:wheel2",
+        "locolmotive:wheel3",
+        "locolmotive:wheel4",
+        "locolmotive:wheel5",
+        "pCube4",
+        "r:coupling_rods_mesh",
+        "r:link",
+        "r:locolmotive:link",
+        "r:locolmotive:pCylinder22",
+        "r:locolmotive:pCylinder25",
+        "r:locolmotive:piston",
+        "r:locolmotive:radius_rod",
+        "r:locolmotive:valve_rods",
+        "r:locolmotive:wheel1",
+        "r:locolmotive:wheel2",
+        "r:locolmotive:wheel3",
+        "r:locolmotive:wheel4",
+        "r:locolmotive:wheel5",
+        "r:pCube4",
+        "r:rotatelink6",
+        "r:wheel_small",
+        "rotatelink6",
+        "wheel_small"
+      ],
+      "pivot": [
+        0,
+        0,
+        1.3270311170313722
+      ],
+      "halfExtents": [
+        0.7238396007964745,
+        0.6245291668517946,
+        2.054129734243918
+      ],
+      "hullOffset": 0.3245292221340677,
+      "coupler": [
+        0,
+        -0.03378835410278852,
+        -1.882965259492644
+      ]
+    },
+    "tender": {
+      "nodes": [
+        "r:wheel_small1",
+        "r:wheel_small2",
+        "r:wheel_small3",
+        "r:wheel_small4",
+        "tender2",
+        "tender_base",
+        "wheel_small1",
+        "wheel_small2",
+        "wheel_small3",
+        "wheel_small4"
+      ],
+      "pivot": [
+        0,
+        0,
+        -1.9440607915742103
+      ],
+      "halfExtents": [
+        0.4410807206921184,
+        0.5695206465405401,
+        1.4371000597010803
+      ],
+      "hullOffset": 0.26952064654054014,
+      "coupler": [
+        0,
+        -0.03378835410278852,
+        1.3881266491129385
+      ]
+    }
+  }
+}

@@ -1,0 +1,1173 @@
+import tgpu from "typegpu";
+import * as d from "typegpu/data";
+import * as std from "typegpu/std";
+import { ShadowFilteringMethodMode, ViewUniforms } from "../../core/rendering";
+import {
+    clusterCell,
+    IndirectLightInput,
+    indirectLight,
+    LightClusters,
+    LightingGpu,
+    MAX_POINT_CASTERS,
+    PointLightGpu,
+    pointCastersSchema,
+    pointShadowRef,
+    SunShadow,
+    sampleSunShadow,
+    tileRectsSchema,
+} from "../../standard/rendering";
+import {
+    directionalInScatter,
+    equiangularInScatter,
+    FOG_SLICES,
+    FogGpu,
+    fogDensity,
+    henyeyGreenstein,
+    reconstructWorld,
+    WORKGROUP,
+} from "./medium";
+import { HALTON, HISTORY_WEIGHT, TEMPORAL_FRAMES } from "./temporal";
+
+export const FogHistory = d.struct({
+    clipFromWorld: d.mat4x4f,
+    eye: d.vec4f,
+    forward: d.vec4f,
+    range: d.vec4f,
+    /** x indexes the Halton sequence; w enables history. */
+    jitter: d.vec4f,
+});
+
+export const fogGridLayout = tgpu
+    .bindGroupLayout({
+        feedback: {
+            storageTexture: d.textureStorage3d("rgba16float", "write-only"),
+            visibility: ["compute"],
+        },
+        surface: {
+            storageTexture: d.textureStorage2d("r32float", "write-only"),
+            visibility: ["compute"],
+        },
+        history: { texture: d.texture3d(d.f32), visibility: ["compute"] },
+        /** The previous frame's `surface`. */
+        historySurface: {
+            texture: d.texture2d(d.f32),
+            sampleType: "unfilterable-float",
+            visibility: ["compute"],
+        },
+        /** `fogDepthKernel`'s deepest surface per column and the uv of the pixel that sees it. */
+        deepest: {
+            texture: d.texture2d(d.f32),
+            sampleType: "unfilterable-float",
+            visibility: ["compute"],
+        },
+        historySampler: { sampler: "filtering", visibility: ["compute"] },
+        surfaceSampler: { sampler: "non-filtering", visibility: ["compute"] },
+        temporal: { uniform: FogHistory, visibility: ["compute"] },
+        view: { uniform: ViewUniforms, visibility: ["compute"] },
+        fog: { uniform: FogGpu, visibility: ["compute"] },
+    })
+    .$idx(0);
+
+/** The deepest surface each column's pixels see, as HDRP's MaxZ mask holds per tile, and the pixel seeing it. */
+export const fogDepthLayout = tgpu
+    .bindGroupLayout({
+        deepest: {
+            storageTexture: d.textureStorage2d("rgba32float", "write-only"),
+            visibility: ["compute"],
+        },
+        view: { uniform: ViewUniforms, visibility: ["compute"] },
+        depthTex: { texture: d.textureDepth2d(), visibility: ["compute"] },
+    })
+    .$idx(0);
+
+export const fogDepthLayoutMultisampled = tgpu
+    .bindGroupLayout({
+        deepest: {
+            storageTexture: d.textureStorage2d("rgba32float", "write-only"),
+            visibility: ["compute"],
+        },
+        view: { uniform: ViewUniforms, visibility: ["compute"] },
+        depthTex: { texture: d.textureDepthMultisampled2d(), visibility: ["compute"] },
+    })
+    .$idx(0);
+
+/** Godot's separable fog filter, with Gaussian weights: one 7-tap pass along x into the spent history texture. */
+export const fogFilterLayout = tgpu
+    .bindGroupLayout({
+        output: {
+            storageTexture: d.textureStorage3d("rgba16float", "write-only"),
+            visibility: ["compute"],
+        },
+        lighting: { texture: d.texture3d(d.f32), visibility: ["compute"] },
+        surface: {
+            texture: d.texture2d(d.f32),
+            sampleType: "unfilterable-float",
+            visibility: ["compute"],
+        },
+        view: { uniform: ViewUniforms, visibility: ["compute"] },
+        fog: { uniform: FogGpu, visibility: ["compute"] },
+    })
+    .$idx(0);
+
+export const fogIntegrateLayout = tgpu
+    .bindGroupLayout({
+        filtered: {
+            storageTexture: d.textureStorage3d("rgba16float", "write-only"),
+            visibility: ["compute"],
+        },
+        output: {
+            storageTexture: d.textureStorage3d("rgba16float", "write-only"),
+            visibility: ["compute"],
+        },
+        lighting: { texture: d.texture3d(d.f32), visibility: ["compute"] },
+        surface: {
+            texture: d.texture2d(d.f32),
+            sampleType: "unfilterable-float",
+            visibility: ["compute"],
+        },
+        view: { uniform: ViewUniforms, visibility: ["compute"] },
+        fog: { uniform: FogGpu, visibility: ["compute"] },
+    })
+    .$idx(0);
+
+export const fogReadLayout = tgpu
+    .bindGroupLayout({
+        grid: { texture: d.texture3d(d.f32), visibility: ["fragment"] },
+        feedback: { texture: d.texture3d(d.f32), visibility: ["fragment"] },
+        filtered: { texture: d.texture3d(d.f32), visibility: ["fragment"] },
+        gridSampler: { sampler: "filtering", visibility: ["fragment"] },
+        view: { uniform: ViewUniforms, visibility: ["fragment"] },
+        fog: { uniform: FogGpu, visibility: ["fragment"] },
+        lighting: { uniform: LightingGpu, visibility: ["fragment"] },
+    })
+    .$idx(3);
+
+export const fogLayout0 = tgpu
+    .bindGroupLayout({
+        depthTex: { texture: d.textureDepth2d(), visibility: ["fragment"] },
+    })
+    .$idx(0);
+
+/** Shared multisampled prepass depth: equal-depth pixels apply once; edges apply per sample. */
+export const fogLayout0Multisampled = tgpu
+    .bindGroupLayout({
+        depthTex: { texture: d.textureDepthMultisampled2d(), visibility: ["fragment"] },
+    })
+    .$idx(0);
+
+/** The camera's prepass depth, which bounds where each grid column samples the medium. */
+export const fogGridDepthLayout = tgpu
+    .bindGroupLayout({
+        depthTex: { texture: d.textureDepth2d(), visibility: ["compute"] },
+    })
+    .$idx(2);
+
+export const fogGridDepthLayoutMultisampled = tgpu
+    .bindGroupLayout({
+        depthTex: { texture: d.textureDepthMultisampled2d(), visibility: ["compute"] },
+    })
+    .$idx(2);
+
+// Schema instances are scoped to this resolve, independent of standard's declarations.
+const _pointCastersGpu = pointCastersSchema();
+const _tileRectsGpu = tileRectsSchema(MAX_POINT_CASTERS * 6);
+
+/** group 1: the camera-independent light + shadow service — render's compacted lights + light grid, standard's
+ *  point atlas + caster uniform + comparison sampler + sun shadow map + params, and the `Lighting` UBO.
+ *  Cached across cameras on resource identity (`index.ts`'s `_lights`). @internal */
+export const fogLayout1 = tgpu
+    .bindGroupLayout({
+        pointLights: { storage: LightClusters, access: "readonly", visibility: ["compute"] },
+        pointAtlas: { texture: d.textureDepth2d(), visibility: ["compute"] },
+        pointShadows: { uniform: _pointCastersGpu, visibility: ["compute"] },
+        shadowSamp: { sampler: "comparison", visibility: ["compute"] },
+        shadowMap: { texture: d.textureDepth2d(), visibility: ["compute"] },
+        sunShadow: { uniform: SunShadow, visibility: ["compute"] },
+        lighting: { uniform: LightingGpu, visibility: ["compute"] },
+        tileRects: { uniform: _tileRectsGpu, visibility: ["compute"] },
+    })
+    .$idx(1);
+
+// Resolve the host-side getter outside TGSL so the kernel captures a transpileable tgpu.fn.
+const pointShadowOf = pointShadowRef();
+
+const loadDepth = tgpu.fn(
+    [d.vec2i],
+    d.f32,
+)((px) => {
+    "use gpu";
+    return std.textureLoad(fogLayout0.$.depthTex, px, 0);
+});
+const loadDepthMultisampled = tgpu.fn(
+    [d.vec2i, d.u32],
+    d.f32,
+)((px, sample) => {
+    "use gpu";
+    return std.textureLoad(fogLayout0Multisampled.$.depthTex, px, sample);
+});
+
+const loadGridDepth = tgpu.fn(
+    [d.vec2f, d.vec2f],
+    d.f32,
+)((uv, resolution) => {
+    "use gpu";
+    const size = d.vec2u(resolution);
+    const px = std.min(d.vec2u(std.mul(uv, d.vec2f(size))), std.sub(size, d.vec2u(1)));
+    return std.textureLoad(fogGridDepthLayout.$.depthTex, d.vec2i(px), 0);
+});
+const loadGridDepthMultisampled = tgpu.fn(
+    [d.vec2f, d.vec2f],
+    d.f32,
+)((uv, resolution) => {
+    "use gpu";
+    const size = d.vec2u(resolution);
+    const px = std.min(d.vec2u(std.mul(uv, d.vec2f(size))), std.sub(size, d.vec2u(1)));
+    return std.textureLoad(fogGridDepthLayoutMultisampled.$.depthTex, d.vec2i(px), 0);
+});
+
+const loadColumnPixel = tgpu.fn(
+    [d.vec2i],
+    d.f32,
+)((px) => {
+    "use gpu";
+    return std.textureLoad(fogDepthLayout.$.depthTex, px, 0);
+});
+const loadColumnPixelMultisampled = tgpu.fn(
+    [d.vec2i],
+    d.f32,
+)((px) => {
+    "use gpu";
+    return std.textureLoad(fogDepthLayoutMultisampled.$.depthTex, px, 0);
+});
+
+/** The least depth among a column's pixels, as f32 bits: non-negative floats order as their bits. */
+const columnLeast = tgpu.workgroupVar(d.atomic(d.u32));
+/** A pixel holding `columnLeast`, x in the low 16 bits and y in the high. */
+const columnPixel = tgpu.workgroupVar(d.atomic(d.u32));
+
+/**
+ * Store the deepest surface among each column's pixels, measured from the near plane as the grid's surface is,
+ * or infinity where any pixel is clear, with the uv of a pixel that sees it. One workgroup reduces one column, as
+ * HDRP's ComputeMaxZ reduces a tile. Sample zero stands for an MSAA pixel, as in the grid.
+ */
+function createDepthKernel(multisampled: boolean) {
+    const layout = multisampled ? fogDepthLayoutMultisampled : fogDepthLayout;
+    const loadPixel = multisampled ? loadColumnPixelMultisampled : loadColumnPixel;
+    return tgpu
+        .computeFn({
+            workgroupSize: [WORKGROUP, WORKGROUP],
+            in: { wid: d.builtin.workgroupId, lid: d.builtin.localInvocationId },
+        })((input) => {
+            "use gpu";
+            const dim = std.textureDimensions(layout.$.deepest);
+            const camView = layout.$.view;
+            const size = d.vec2u(camView.resolution);
+            // The pixels this column spans, rounded outward.
+            const first = std.div(std.mul(input.wid.xy, size), dim.xy);
+            const last = std.min(
+                std.div(
+                    std.add(std.mul(std.add(input.wid.xy, 1), size), std.sub(dim.xy, 1)),
+                    dim.xy,
+                ),
+                size,
+            );
+            if (input.lid.x === 0 && input.lid.y === 0) {
+                std.atomicStore(columnLeast.$, std.bitcastF32toU32(d.f32(1)));
+                std.atomicStore(columnPixel.$, first.x | (first.y << 16));
+            }
+            std.workgroupBarrier();
+            // Reverse Z: the deepest surface has the least depth, and a clear pixel has zero.
+            let least = d.f32(1);
+            let pixel = d.vec2u(first);
+            let y = first.y + input.lid.y;
+            while (y < last.y) {
+                let x = first.x + input.lid.x;
+                while (x < last.x) {
+                    const depth = std.max(loadPixel(d.vec2i(d.i32(x), d.i32(y))), 0);
+                    if (depth < least) {
+                        least = depth;
+                        pixel = d.vec2u(x, y);
+                    }
+                    x = x + WORKGROUP;
+                }
+                y = y + WORKGROUP;
+            }
+            std.atomicMin(columnLeast.$, std.bitcastF32toU32(least));
+            std.workgroupBarrier();
+            const deepestDepth = std.bitcastU32toF32(std.atomicLoad(columnLeast.$));
+            if (least === deepestDepth && least < 1)
+                std.atomicStore(columnPixel.$, pixel.x | (pixel.y << 16));
+            std.workgroupBarrier();
+            if (input.lid.x !== 0 || input.lid.y !== 0) return;
+            const packed = std.atomicLoad(columnPixel.$);
+            const deepUv = std.div(
+                std.add(d.vec2f(d.f32(packed & 0xffff), d.f32(packed >>> 16)), 0.5),
+                camView.resolution,
+            );
+            let deepest = d.f32(3.4e38);
+            if (deepestDepth > 0) {
+                const forward = std.neg(std.mul(d.vec4f(0, 0, 1, 0), camView.viewFromWorld).xyz);
+                const hit = reconstructWorld(camView.worldFromClip, deepUv, deepestDepth);
+                deepest = std.dot(std.sub(hit, camView.eye.xyz), forward) - camView.projection.x;
+            }
+            std.textureStore(layout.$.deepest, d.vec2i(input.wid.xy), d.vec4f(deepest, deepUv, 0));
+        })
+        .$name("fogDepth");
+}
+
+export const fogDepthKernel = createDepthKernel(false);
+export const fogDepthKernelMultisampled = createDepthKernel(true);
+
+/** Whether slice i lies past the first cell beyond a column's surface, both measured from the near plane. */
+const pastSurface = tgpu.fn(
+    [d.u32, d.f32, d.f32],
+    d.bool,
+)((i, extent, surface) => {
+    "use gpu";
+    const previous = std.max(d.f32(i) - 1, 0) / FOG_SLICES;
+    return i > 0 && extent * previous * previous >= surface * 0.999;
+});
+
+/** Bits 0 and 4 mark slices low and high of one history column as on the side `beyond` names. */
+const sameSide = tgpu.fn(
+    [d.u32, d.u32, d.f32, d.f32, d.bool],
+    d.u32,
+)((low, high, extent, surface, beyond) => {
+    "use gpu";
+    let bits = d.u32(0);
+    if (pastSurface(low, extent, surface) === beyond) bits = 1;
+    if (pastSurface(high, extent, surface) === beyond) bits = bits | 16;
+    return bits;
+});
+
+/** Stratified equiangular samples per volumetric point or spot light and cell. */
+const LIGHT_STRATA = 2;
+
+/** The history footprint's corners on each face, bit x + 2y + 4z: x low, x high, y low, y high, z low, z high. */
+const FACES = tgpu.const(d.arrayOf(d.u32, 6), [0x55, 0xaa, 0x33, 0xcc, 0x0f, 0xf0]);
+
+/** Light and reproject one frustum column per invocation. */
+function createGridKernel(multisampled: boolean) {
+    const layout = fogGridLayout;
+    const loadDepth = multisampled ? loadGridDepthMultisampled : loadGridDepth;
+    return tgpu
+        .computeFn({
+            workgroupSize: [WORKGROUP, WORKGROUP],
+            in: { gid: d.builtin.globalInvocationId },
+        })((input) => {
+            "use gpu";
+            const dim = std.textureDimensions(layout.$.feedback);
+            if (input.gid.x >= dim.x || input.gid.y >= dim.y) return;
+            const px = d.vec2i(input.gid.xy);
+            // Decorrelate neighboring columns without changing their shared ray offset. Godot's volumetric fog
+            // gives every cell one Halton phase per frame; HDRP hashes only the depth variate per pixel. Each column
+            // here starts the sequence at its own phase, so the spatial filter below averages neighbors that sample
+            // different offsets within one frame. Under a shared phase every column moves together each frame, and
+            // the filter would leave the frame-to-frame swing that stage 6 measured it removing.
+            const seed = (input.gid.x + input.gid.y * dim.x) * 747796405 + 2891336453;
+            const word = ((seed >>> ((seed >>> 28) + 4)) ^ seed) * 277803737;
+            const phaseOffset = ((word >>> 22) ^ word) % TEMPORAL_FRAMES;
+            const jitter =
+                HALTON.$[(d.u32(layout.$.temporal.jitter.x) + phaseOffset) % TEMPORAL_FRAMES];
+            const uv = std.div(std.add(d.vec2f(input.gid.xy), 0.5), d.vec2f(dim.xy));
+            const sampleUv = std.div(std.add(d.vec2f(input.gid.xy), jitter.xy), d.vec2f(dim.xy));
+            const nearWorld = reconstructWorld(layout.$.view.worldFromClip, uv, 1);
+            const farWorld = reconstructWorld(layout.$.view.worldFromClip, uv, 0.0001);
+            // Phase uses the unjittered ray, so moving the sample cannot jitter anisotropy.
+            const dir = std.normalize(std.sub(farWorld, nearWorld));
+            // The angle one froxel subtends: twice HDRP's _HalfVoxelArcLength.
+            const edgeUv = std.div(
+                std.add(d.vec2f(input.gid.xy), d.vec2f(0.5, 1)),
+                d.vec2f(dim.xy),
+            );
+            const edgeNear = reconstructWorld(layout.$.view.worldFromClip, edgeUv, 1);
+            const froxelArc =
+                2 *
+                std.length(
+                    std.sub(
+                        std.normalize(
+                            std.sub(
+                                reconstructWorld(layout.$.view.worldFromClip, edgeUv, 0.0001),
+                                edgeNear,
+                            ),
+                        ),
+                        dir,
+                    ),
+                );
+            const sampleNear = reconstructWorld(layout.$.view.worldFromClip, sampleUv, 1);
+            const sampleDir = std.normalize(
+                std.sub(
+                    reconstructWorld(layout.$.view.worldFromClip, sampleUv, 0.0001),
+                    sampleNear,
+                ),
+            );
+
+            // `cfg`/`camView` — not `fog`/`view` — to avoid colliding with the group-0 binding keys of the same
+            // name (a local named identically to its own binding forces a confusing double-pointer alias)
+            const cfg = layout.$.fog;
+            const density = cfg.medium.x;
+            const base = cfg.medium.y;
+            const falloff = cfg.medium.z;
+            const extent = std.max(cfg.medium.w - layout.$.view.projection.x, 0.001);
+            const g = cfg.extra.y;
+
+            const camView = layout.$.view;
+            const near = camView.projection.x;
+            const far = camView.projection.y;
+            const forward = std.neg(std.mul(d.vec4f(0, 0, 1, 0), camView.viewFromWorld).xyz);
+            const slot = d.u32(camView.projection.w);
+
+            const rayScale = 1 / std.max(std.dot(dir, forward), 1e-6);
+            // Center depth keeps the spatial-filter mask independent of temporal jitter.
+            const centerDepth = loadDepth(uv, camView.resolution);
+            let centerSurface = d.f32(extent);
+            if (centerDepth > 0) {
+                const hit = reconstructWorld(camView.worldFromClip, uv, centerDepth);
+                centerSurface = std.dot(std.sub(hit, camView.eye.xyz), forward) - near;
+            }
+            std.textureStore(layout.$.surface, px, d.vec4f(centerSurface));
+            // The deepest surface any pixel reading this column sees. A pixel's trilinear read blends the columns
+            // either side of it, so the per-column depths dilate by one column, as HDRP dilates its MaxZ mask.
+            let deep = d.vec4f(0, uv, 0);
+            const lastColumn = std.sub(d.vec2i(dim.xy), 1);
+            let dy = d.i32(-1);
+            while (dy <= 1) {
+                let dx = d.i32(-1);
+                while (dx <= 1) {
+                    const column = std.clamp(std.add(px, d.vec2i(dx, dy)), d.vec2i(0), lastColumn);
+                    const texel = std.textureLoad(layout.$.deepest, column, 0);
+                    if (texel.x > deep.x) deep = d.vec4f(texel);
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+            const deepest = deep.x;
+            // The ray of the pixel that sees that surface, clear up to it by that pixel's depth sample.
+            const deepUv = deep.yz;
+            const deepNear = reconstructWorld(layout.$.view.worldFromClip, deepUv, 1);
+            const deepDir = std.normalize(
+                std.sub(reconstructWorld(layout.$.view.worldFromClip, deepUv, 0.0001), deepNear),
+            );
+            const sceneDepth = loadDepth(sampleUv, camView.resolution);
+            let surface = d.f32(extent);
+            if (sceneDepth > 0) {
+                const hit = reconstructWorld(layout.$.view.worldFromClip, sampleUv, sceneDepth);
+                surface = std.dot(std.sub(hit, camView.eye.xyz), forward) - near;
+            }
+            // Shadow receivers use free binding names invisible to the call-graph walk.
+            // Feed these reads into the feedback so transpilation retains their declarations.
+            const forcedZero =
+                (fogLayout1.$.pointShadows.casters[0].pos.x +
+                    fogLayout1.$.tileRects.rects[0].x +
+                    fogLayout1.$.sunShadow.enabled +
+                    std.textureSampleCompareLevel(
+                        fogLayout1.$.pointAtlas,
+                        fogLayout1.$.shadowSamp,
+                        d.vec2f(0, 0),
+                        0,
+                    ) +
+                    std.textureSampleCompareLevel(
+                        fogLayout1.$.shadowMap,
+                        fogLayout1.$.shadowSamp,
+                        d.vec2f(0, 0),
+                        0,
+                    )) *
+                0;
+            let i = d.u32(0);
+            while (i < FOG_SLICES) {
+                const a = d.f32(i) / FOG_SLICES;
+                const b = d.f32(i + 1) / FOG_SLICES;
+                // Quadratic view-depth boundaries crowd slices near the camera.
+                const start = extent * a * a;
+                const end = extent * b * b;
+                const center = std.add(nearWorld, std.mul(dir, (start + end) * 0.5 * rayScale));
+                const sampleScale = 1 / std.max(std.dot(sampleDir, forward), 1e-6);
+                // Near-side light fills the first cell wholly past the surface, the one a trilinear read at the
+                // surface reaches; HDRP lights that cell where it is. Cells beyond it take the light of the air
+                // the pixels reading them see: repeating near-side light through them lit the far haze beside a
+                // silhouette. HDRP lights them where they are on the voxel's own ray, up to its dilated maximum
+                // depth (the MaxZ mask), accepting "a temporally stable light leak". Beside a grazing wall that ray
+                // runs through the lit air outside the room: a hall's ceiling and side walls, ending meters short
+                // of the far wall their neighbors see, lit its seams' haze as a comb of columns. Here they are lit
+                // on the ray of the pixel that sees that depth, clear up to it by that pixel's depth, local lights
+                // included. Past that depth, which no pixel reading the column sees, HDRP zeroes cells; here
+                // they take the light there, so a column whose sample hits one wall of a corner cannot light air
+                // outside the other from beyond the room (stage 12).
+                let limit = surface * 0.999;
+                let rayUv = d.vec2f(sampleUv);
+                let rayNear = d.vec3f(sampleNear);
+                let rayDir = d.vec3f(sampleDir);
+                let rayStep = d.f32(sampleScale);
+                let lightNear = d.vec3f(nearWorld);
+                let lightDir = d.vec3f(dir);
+                let lightStep = d.f32(rayScale);
+                if (pastSurface(i, extent, surface)) {
+                    limit = std.min(deepest, extent) * 0.999;
+                    rayUv = d.vec2f(deepUv);
+                    rayNear = d.vec3f(deepNear);
+                    rayDir = d.vec3f(deepDir);
+                    rayStep = 1 / std.max(std.dot(deepDir, forward), 1e-6);
+                    lightNear = d.vec3f(deepNear);
+                    lightDir = d.vec3f(deepDir);
+                    lightStep = d.f32(rayStep);
+                }
+                const p = std.add(
+                    rayNear,
+                    std.mul(
+                        rayDir,
+                        std.mix(std.min(start, limit), std.min(end, limit), jitter.z) * rayStep,
+                    ),
+                );
+                let dens = fogDensity(p, density, base, falloff);
+                // Local lights sample the center ray, bounded where the jittered sample is, until the cell lies past
+                // the surface. The center's own depth repeated near-side light past a silhouette: a band above a
+                // pillar rose 14% (stage 10).
+                const lightStart = std.min(start, limit) * lightStep;
+                const lightEnd = std.min(end, limit) * lightStep;
+
+                const viewZ = std.max(std.dot(std.sub(p, camView.eye.xyz), forward), near);
+                const entry =
+                    fogLayout1.$.pointLights.grid[
+                        clusterCell(
+                            rayUv.x,
+                            rayUv.y,
+                            viewZ,
+                            near,
+                            far,
+                            camView.projection.z > 0.5,
+                            slot,
+                        )
+                    ];
+                const ambient = indirectLight(
+                    IndirectLightInput({
+                        worldPosition: p,
+                        normal: std.neg(dir),
+                        view: std.neg(dir),
+                        materialOcclusion: 1,
+                        ambientRadiance: camView.ambientColor.rgb,
+                    }),
+                );
+                // Uniform ambient radiance against a normalized phase integrates to itself (Hillaire 2015).
+                let lstep = std.mul(ambient, camView.exposure);
+                let j = d.u32(0);
+                while (j < entry.y) {
+                    // the array-element read is a pointer, not a copy — wrap in the element schema to
+                    // pass it by value into inScatterContribution / pointShadowRef
+                    const light = PointLightGpu(
+                        fogLayout1.$.pointLights.lights.lights[
+                            fogLayout1.$.pointLights.indices[entry.x + j]
+                        ],
+                    );
+                    // Negative params.x marks VolumetricLight.
+                    if (light.params.x >= 0) {
+                        j = j + 1;
+                        continue;
+                    }
+                    // HDRP raises a light's radius to the froxel's size at the segment's entry, so a ray through
+                    // the lamp cannot sample its singular core; it compares a squared radius with a length, so
+                    // this takes the intent, the froxel's width, and keeps the glow's brightness (stage 10).
+                    // Local lights take the column's center ray, or past the surface the deepest pixel's, as HDRP takes the voxel center for anisotropy to
+                    // keep it out of the jitter: a ray jittered above or below a spot's apex inside one column
+                    // flips the lamp's cell between dark and lit. Two depth strata settle the cone's penumbra
+                    // along the segment. A lamp swings 0.0160 with neither, 0.0098 or 0.0088 with one, 0.0011 with both.
+                    // As in HDRP, the light's shadow and cone are read at its own samples while density, ambient
+                    // and the sun keep the jittered one; the light list is the jittered sample's cluster, and
+                    // the falloff is HDRP's 1 / (d² + r²) rather than standard's 1 / max(d², r²).
+                    // Unlike HDRP, the phase is read at each sample too. HDRP takes anisotropy at the voxel center
+                    // because it reprojects phase-free radiance; here history holds complete lighting, so the
+                    // cell's estimate must weight each sample by its own phase. Taken at the center, a lamp
+                    // inside the cell scatters wholly forward or backward as the center passes it: walking at
+                    // 1.5 m/s toward a lamp swung a patch just below it between 0.015 and 0.095 each slice (stage 11).
+                    const froxelWidth = froxelArc * lightStart;
+                    let stratum = d.u32(0);
+                    while (stratum < LIGHT_STRATA) {
+                        const sample = equiangularInScatter(
+                            light,
+                            lightNear,
+                            lightDir,
+                            lightStart,
+                            lightEnd,
+                            (d.f32(stratum) + jitter.z) / LIGHT_STRATA,
+                            froxelWidth * froxelWidth,
+                        );
+                        const shadow = pointShadowOf(
+                            light,
+                            d.vec3f(0),
+                            sample.position,
+                            d.u32(ShadowFilteringMethodMode.Hardware2x2),
+                        );
+                        const phase =
+                            camView.exposure *
+                            henyeyGreenstein(
+                                g,
+                                std.dot(
+                                    dir,
+                                    std.normalize(std.sub(light.posRange.xyz, sample.position)),
+                                ),
+                            );
+                        lstep = d.vec3f(
+                            std.add(
+                                lstep,
+                                std.mul(sample.radiance, (shadow * phase) / LIGHT_STRATA),
+                            ),
+                        );
+                        stratum = stratum + 1;
+                    }
+                    j = j + 1;
+                }
+                // Only the selected directional caster samples the atlas; every volumetric sun scatters.
+                let k = d.u32(0);
+                while (k < fogLayout1.$.lighting.directionalCount) {
+                    const light = fogLayout1.$.lighting.directionalLights[k];
+                    if (light.params.z > 0) {
+                        let visibility = d.f32(1);
+                        if (light.params.y > 0) {
+                            visibility = sampleSunShadow(
+                                p,
+                                d.vec3f(0),
+                                d.u32(ShadowFilteringMethodMode.Hardware2x2),
+                            );
+                        }
+                        lstep = d.vec3f(
+                            std.add(
+                                lstep,
+                                std.mul(
+                                    directionalInScatter(
+                                        std.mul(light.color.rgb, light.params.x * camView.exposure),
+                                        light.direction.xyz,
+                                        dir,
+                                        g,
+                                    ),
+                                    visibility,
+                                ),
+                            ),
+                        );
+                    }
+                    k = k + 1;
+                }
+                // Reproject complete lighting as Godot does: a current phase ratio flickers
+                // when jitter changes the balance of ambient and shadowed direct light.
+                // Angular scattering in history remains approximate when the camera turns.
+                const prev = layout.$.temporal;
+                const beyond = pastSurface(i, extent, centerSurface);
+                const clip = std.mul(prev.clipFromWorld, d.vec4f(center, 1));
+                const prevUv = std.add(std.mul(std.div(clip.xy, clip.w), d.vec2f(0.5, -0.5)), 0.5);
+                const depth = std.dot(std.sub(center, prev.eye.xyz), prev.forward.xyz);
+                const sliceDepth = (depth - prev.range.x) / prev.range.y;
+                // Centers lie at (i²+i+0.5)/N²; invert that, not the slice boundaries.
+                const z = fogCellCoordinate(depth, prev.range.x, prev.range.y);
+                if (
+                    prev.jitter.w > 0 &&
+                    clip.w > 0 &&
+                    prevUv.x > 0 &&
+                    prevUv.x < 1 &&
+                    prevUv.y > 0 &&
+                    prevUv.y < 1 &&
+                    depth > prev.range.x &&
+                    sliceDepth < 1
+                ) {
+                    // Trilinear history from only the cells on the same side of their column's surface as this
+                    // one, by the jitter-free center depth, so a still camera's history is its own cell's.
+                    // Wronski (2014) finds a frustum grid's history valid behind geometry only without
+                    // depth-based culling, and HDRP, which clips cells at the surface, reprojects every cell and
+                    // accepts the leak. Here a cell past a surface is lit beyond the wall, on another ray: blended
+                    // into air in front of a surface, it lit a room's seams and edges from outside while the
+                    // camera walked or turned (stage 11). Where all eight cells agree, the sampler filters them.
+                    const coord = std.sub(
+                        std.mul(d.vec3f(prevUv, z), d.vec3f(d.vec2f(dim.xy), FOG_SLICES)),
+                        0.5,
+                    );
+                    const first = std.floor(coord);
+                    const fraction = std.sub(coord, first);
+                    const last = d.vec3i(d.i32(dim.x) - 1, d.i32(dim.y) - 1, FOG_SLICES - 1);
+                    const low = std.clamp(d.vec3i(first), d.vec3i(0), last);
+                    const high = std.clamp(std.add(d.vec3i(first), 1), d.vec3i(0), last);
+                    // The four columns of the bilinear footprint, gathered as (x0 y1, x1 y1, x1 y0, x0 y0).
+                    const columns = std.textureGather(
+                        0,
+                        layout.$.historySurface,
+                        layout.$.surfaceSampler,
+                        prevUv,
+                    );
+                    const zLow = d.u32(low.z);
+                    const zHigh = d.u32(high.z);
+                    const range = prev.range.y;
+                    // Bit x + 2y + 4z marks corner (x, y, z) as on this cell's side.
+                    const same =
+                        sameSide(zLow, zHigh, range, columns.w, beyond) |
+                        (sameSide(zLow, zHigh, range, columns.z, beyond) << 1) |
+                        (sameSide(zLow, zHigh, range, columns.x, beyond) << 2) |
+                        (sameSide(zLow, zHigh, range, columns.y, beyond) << 3);
+                    // Where some disagree, sample the face of the footprint on this side that the trilinear
+                    // weights favor, else its heaviest corner: the sampler then weights only those cells.
+                    let target = d.vec3f(fraction);
+                    let best = d.f32(-1);
+                    if (same !== 255) {
+                        let face = d.u32(0);
+                        while (face < 6) {
+                            const axis = face >>> 1;
+                            const upper = (face & 1) === 1;
+                            if ((same & FACES.$[face]) === FACES.$[face]) {
+                                const along = std.select(
+                                    std.select(fraction.z, fraction.y, axis === 1),
+                                    fraction.x,
+                                    axis === 0,
+                                );
+                                const weight = std.select(1 - along, along, upper);
+                                if (weight > best) {
+                                    best = weight;
+                                    const side = std.select(d.f32(0), 1, upper);
+                                    target = std.select(
+                                        fraction,
+                                        d.vec3f(side),
+                                        d.vec3b(axis === 0, axis === 1, axis === 2),
+                                    );
+                                }
+                            }
+                            face = face + 1;
+                        }
+                        // With no face on this side, its heaviest corner.
+                        if (best < 0) {
+                            let corner = d.u32(0);
+                            while (corner < 8) {
+                                if (((same >>> corner) & 1) === 1) {
+                                    const offset = d.vec3f(
+                                        d.f32(corner & 1),
+                                        d.f32((corner >>> 1) & 1),
+                                        d.f32((corner >>> 2) & 1),
+                                    );
+                                    const axes = std.mix(
+                                        std.sub(d.vec3f(1), fraction),
+                                        fraction,
+                                        offset,
+                                    );
+                                    const weight = axes.x * axes.y * axes.z;
+                                    if (weight > best) {
+                                        best = weight;
+                                        target = d.vec3f(offset);
+                                    }
+                                }
+                                corner = corner + 1;
+                            }
+                        }
+                    }
+                    // A cell with no such neighbor takes the current sample alone, as out of the frustum.
+                    if (same === 255 || best >= 0) {
+                        const old = std.textureSampleLevel(
+                            layout.$.history,
+                            layout.$.historySampler,
+                            std.div(
+                                std.add(std.add(first, target), 0.5),
+                                d.vec3f(d.vec2f(dim.xy), FOG_SLICES),
+                            ),
+                            0,
+                        );
+                        lstep = std.mix(
+                            lstep,
+                            std.mul(old.rgb, camView.exposure / std.max(prev.range.z, 1e-8)),
+                            HISTORY_WEIGHT,
+                        );
+                        dens = std.mix(dens, old.a, HISTORY_WEIGHT);
+                    }
+                }
+                std.textureStore(
+                    layout.$.feedback,
+                    d.vec3i(px, d.i32(i)),
+                    d.vec4f(lstep, dens + forcedZero),
+                );
+                i = i + 1;
+            }
+        })
+        .$name("fogGrid");
+}
+
+export const fogGridKernel = createGridKernel(false);
+export const fogGridKernelMultisampled = createGridKernel(true);
+
+// A sampled Gaussian of σ = 1.6 cells, its ±3 tails at 17% of the center. Godot's weights
+// (0.071303 … 0.214607) fit σ ≈ 2.0 cut at ±3, about 1.5σ: nearly a box, whose separable product draws a hot
+// cell as a square (stage 10). σ = 1.6 is the narrowest that keeps stage 6's shaft-edge claims with margin
+// natively and on lavapipe, where 1.5 reached 0.00499 of their 0.005.
+const GAUSSIAN = tgpu.const(
+    d.arrayOf(d.f32, 7),
+    [0.044147, 0.117223, 0.210611, 0.256038, 0.210611, 0.117223, 0.044147],
+);
+
+/**
+ * Blur extinction-weighted light (σt·L, σt) along x, as Godot blurs σs·L with σt; the integration kernel blurs
+ * along y and divides by σt. Blurring L and σt apart would light dense shadowed air with its thin lit neighbor.
+ * Both passes skip taps past their own column's surface and renormalize the rest.
+ */
+export const fogFilterKernel = tgpu
+    .computeFn({
+        workgroupSize: [WORKGROUP, WORKGROUP],
+        in: { gid: d.builtin.globalInvocationId },
+    })((input) => {
+        "use gpu";
+        const dim = std.textureDimensions(fogFilterLayout.$.output);
+        if (input.gid.x >= dim.x || input.gid.y >= dim.y) return;
+        const cell = d.vec3i(input.gid);
+        const last = d.i32(dim.x) - 1;
+        const extent = std.max(
+            fogFilterLayout.$.fog.medium.w - fogFilterLayout.$.view.projection.x,
+            0.001,
+        );
+        const a = d.f32(cell.z) / FOG_SLICES;
+        const b = (d.f32(cell.z) + 1) / FOG_SLICES;
+        const surface = std.textureLoad(fogFilterLayout.$.surface, cell.xy, 0).x;
+        const weight = std.clamp((surface - extent * a * a) / (extent * (b * b - a * a)), 0, 1);
+        const own = std.textureLoad(fogFilterLayout.$.lighting, cell, 0);
+        // Neither HDRP's 3×3 nor Godot's 7-tap fog filter is depth-aware; blend continuously at the surface.
+        // A tap past its own column's surface holds air beside it that some neighbor sees, not this column's,
+        // and is left out: lit from a ray up to a column and a half away, it would carry that offset three
+        // columns, and the haze above a pillar's edge rose 0.0007 against silhouette.node.ts's 0.0005.
+        if (weight <= 0) {
+            std.textureStore(
+                fogFilterLayout.$.output,
+                cell,
+                d.vec4f(std.mul(own.xyz, own.w), own.w),
+            );
+            return;
+        }
+        let sum = d.vec4f(0);
+        let total = d.f32(0);
+        let k = d.i32(-3);
+        while (k <= 3) {
+            const column = d.vec2i(std.clamp(cell.x + k, 0, last), cell.y);
+            const tapSurface = std.textureLoad(fogFilterLayout.$.surface, column, 0).x;
+            if (!pastSurface(d.u32(cell.z), extent, tapSurface)) {
+                const tap = std.textureLoad(fogFilterLayout.$.lighting, d.vec3i(column, cell.z), 0);
+                sum = std.add(
+                    sum,
+                    std.mul(d.vec4f(std.mul(tap.xyz, tap.w), tap.w), GAUSSIAN.$[k + 3]),
+                );
+                total = total + GAUSSIAN.$[k + 3];
+            }
+            k = k + 1;
+        }
+        sum = std.div(sum, total);
+        std.textureStore(
+            fogFilterLayout.$.output,
+            cell,
+            std.mix(d.vec4f(std.mul(own.xyz, own.w), own.w), sum, weight),
+        );
+    })
+    .$name("fogFilter");
+
+/**
+ * Filter along y and integrate one frustum column per invocation. As in Godot and HDRP, reprojected lighting is
+ * blurred across columns before integration while history keeps it unfiltered: neighbors sample different
+ * jitter phases, so a shadow edge that one column's depth sample flips across averages within the frame.
+ */
+export const fogIntegrateKernel = tgpu
+    .computeFn({
+        workgroupSize: [WORKGROUP, WORKGROUP],
+        in: { gid: d.builtin.globalInvocationId },
+    })((input) => {
+        "use gpu";
+        const dim = std.textureDimensions(fogIntegrateLayout.$.output);
+        if (input.gid.x >= dim.x || input.gid.y >= dim.y) return;
+        const px = d.vec2i(input.gid.xy);
+        const last = d.i32(dim.y) - 1;
+        const uv = std.div(std.add(d.vec2f(input.gid.xy), 0.5), d.vec2f(dim.xy));
+        const camView = fogIntegrateLayout.$.view;
+        const nearWorld = reconstructWorld(camView.worldFromClip, uv, 1);
+        const dir = std.normalize(
+            std.sub(reconstructWorld(camView.worldFromClip, uv, 0.0001), nearWorld),
+        );
+        const forward = std.neg(std.mul(d.vec4f(0, 0, 1, 0), camView.viewFromWorld).xyz);
+        const rayScale = 1 / std.max(std.dot(dir, forward), 1e-6);
+        const cfg = fogIntegrateLayout.$.fog;
+        const extent = std.max(cfg.medium.w - camView.projection.x, 0.001);
+        const albedo = cfg.extra.z;
+        const gain = cfg.extra.w;
+        const surface = std.textureLoad(fogIntegrateLayout.$.surface, px, 0).x;
+        std.textureStore(fogIntegrateLayout.$.output, d.vec3i(px, 0), d.vec4f(0, 0, 0, 1));
+        let trans = d.f32(1);
+        let inScatter = d.vec3f(0);
+        let i = d.u32(0);
+        while (i < FOG_SLICES) {
+            const a = d.f32(i) / FOG_SLICES;
+            const b = d.f32(i + 1) / FOG_SLICES;
+            const ds = extent * (b * b - a * a) * rayScale;
+            const slice = d.i32(i);
+            let cell = d.vec4f(0);
+            const weight = std.clamp((surface - extent * a * a) / (extent * (b * b - a * a)), 0, 1);
+            const wall = weight <= 0;
+            let k = std.select(d.i32(-3), d.i32(0), wall);
+            const radius = std.select(d.i32(3), d.i32(0), wall);
+            let total = d.f32(0);
+            while (k <= radius) {
+                const column = d.vec2i(px.x, std.clamp(px.y + k, 0, last));
+                const tapSurface = std.textureLoad(fogIntegrateLayout.$.surface, column, 0).x;
+                if (wall || !pastSurface(i, extent, tapSurface)) {
+                    const tapWeight = std.select(GAUSSIAN.$[k + 3], 1, wall);
+                    cell = std.add(
+                        cell,
+                        std.mul(
+                            std.textureLoad(
+                                fogIntegrateLayout.$.lighting,
+                                d.vec3i(column, slice),
+                                0,
+                            ),
+                            tapWeight,
+                        ),
+                    );
+                    total = total + tapWeight;
+                }
+                k = k + 1;
+            }
+            cell = std.div(cell, total);
+            const own = std.textureLoad(fogIntegrateLayout.$.lighting, d.vec3i(px, slice), 0);
+            cell = std.mix(own, cell, weight);
+            std.textureStore(fogIntegrateLayout.$.filtered, d.vec3i(px, slice), cell);
+            const opticalDepth = cell.w * ds;
+            const sampleTrans = std.exp(-opticalDepth);
+            // Hillaire's closed-form cell integral S*(1-exp(-sigma*ds))/sigma, with S = albedo*(sigma*lstep)
+            // filtered; the series keeps the clear-medium limit S*ds.
+            let span = ds * (1 - opticalDepth * 0.5);
+            if (opticalDepth > 1e-3) span = (1 - sampleTrans) / cell.w;
+            inScatter = d.vec3f(
+                std.add(inScatter, std.mul(cell.xyz, trans * albedo * gain * span)),
+            );
+            trans = trans * sampleTrans;
+            std.textureStore(
+                fogIntegrateLayout.$.output,
+                d.vec3i(px, slice + 1),
+                d.vec4f(inScatter, trans),
+            );
+            i = i + 1;
+        }
+    })
+    .$name("fogIntegrate");
+
+const fogCellCoordinate = tgpu.fn(
+    [d.f32, d.f32, d.f32],
+    d.f32,
+)((depth, near, extent) => {
+    "use gpu";
+    return std.sqrt(std.max((depth - near) / extent - 0.25 / (FOG_SLICES * FOG_SLICES), 0));
+});
+
+const fogTail = tgpu
+    .fn(
+        [FogGpu, ViewUniforms, d.vec3f, d.vec3f, d.f32, d.vec4f],
+        d.vec4f,
+    )((cfg, view, start, dir, distance, integrated) => {
+        "use gpu";
+        const x = cfg.medium.z * dir.y * distance;
+        // The series avoids cancellation for horizontal rays and zero height falloff.
+        let integral = d.f32(1 - x * 0.5 + (x * x) / 6);
+        if (std.abs(x) > 0.001) integral = (1 - std.exp(-x)) / x;
+        const opticalDepth =
+            fogDensity(start, cfg.medium.x, cfg.medium.y, cfg.medium.z) * distance * integral;
+        const trans = std.exp(-opticalDepth);
+        const light = fogTailLight(cfg, view, dir);
+        return d.vec4f(
+            std.add(
+                integrated.xyz,
+                std.mul(light, integrated.w * cfg.extra.z * cfg.extra.w * (1 - trans)),
+            ),
+            integrated.w * trans,
+        );
+    })
+    .$name("fogTail");
+
+// The distant medium has no resolved occluders or local lights.
+const fogTailLight = tgpu
+    .fn(
+        [FogGpu, ViewUniforms, d.vec3f],
+        d.vec3f,
+    )((cfg, view, dir) => {
+        "use gpu";
+        let light = std.mul(view.ambientColor.rgb, view.exposure);
+        let k = d.u32(0);
+        while (k < fogReadLayout.$.lighting.directionalCount) {
+            const sun = fogReadLayout.$.lighting.directionalLights[k];
+            if (sun.params.z > 0) {
+                light = d.vec3f(
+                    std.add(
+                        light,
+                        directionalInScatter(
+                            std.mul(sun.color.rgb, sun.params.x * view.exposure),
+                            sun.direction.xyz,
+                            dir,
+                            cfg.extra.y,
+                        ),
+                    ),
+                );
+            }
+            k = k + 1;
+        }
+        return light;
+    })
+    .$name("fogTailLight");
+
+/**
+ * Read camera-exposed local in-scatter radiance per unit scattering, before the medium's albedo: Fog's own
+ * light plus the scene's lights times lightIntensity.
+ * A particle adds albedo × coverage × readFogInScatter(p) × readFog(p).a; apply no exposure.
+ * Returns zero without FogPlugin/Fog, with NoFog, at/before near, or beyond maxDistance. Bind
+ * fogReadBindGroup at group 3 with fogReadLayout after this frame's fog draw system. Light is trilinear
+ * at cell resolution, filtered across columns like the haze, with phase toward the camera along the cell ray;
+ * history lags moving lights and cameras.
+ */
+export const readFogInScatter = tgpu
+    .fn(
+        [d.vec3f],
+        d.vec3f,
+    )((point) => {
+        "use gpu";
+        const view = fogReadLayout.$.view;
+        const cfg = fogReadLayout.$.fog;
+        if (cfg.medium.x === 0) return d.vec3f(0);
+        const forward = std.neg(std.mul(d.vec4f(0, 0, 1, 0), view.viewFromWorld).xyz);
+        const viewZ = std.dot(std.sub(point, view.eye.xyz), forward);
+        if (viewZ <= view.projection.x) return d.vec3f(0);
+        const clip = std.mul(view.clipFromWorld, d.vec4f(point, 1));
+        const uv = std.add(std.mul(std.div(clip.xy, clip.w), d.vec2f(0.5, -0.5)), 0.5);
+        const nearWorld = reconstructWorld(view.worldFromClip, uv, 1);
+        const dir = std.normalize(std.sub(point, nearWorld));
+        const cosine = std.max(std.dot(dir, forward), 1e-6);
+        if (viewZ > cfg.extra.x * cosine || cfg.extra.x <= 0) return d.vec3f(0);
+        const own = std.mul(cfg.color.xyz, view.exposure);
+        if (viewZ > cfg.medium.w)
+            return std.add(own, std.mul(fogTailLight(cfg, view, dir), cfg.extra.w));
+        const z = fogCellCoordinate(
+            viewZ,
+            view.projection.x,
+            std.max(cfg.medium.w - view.projection.x, 0.001),
+        );
+        const cell = std.textureSampleLevel(
+            fogReadLayout.$.filtered,
+            fogReadLayout.$.gridSampler,
+            d.vec3f(uv, z),
+            0,
+        );
+        let light = std.textureSampleLevel(
+            fogReadLayout.$.feedback,
+            fogReadLayout.$.gridSampler,
+            d.vec3f(uv, z),
+            0,
+        ).rgb;
+        // Clear air retains its local light even though it scatters none into the haze.
+        if (cell.w > 0) light = std.div(cell.rgb, cell.w);
+        return std.add(own, std.mul(light, cfg.extra.w));
+    })
+    .$name("readFogInScatter");
+
+/**
+ * Read added RGB radiance (camera-exposed) and alpha transmittance to a world-space point, bounded by
+ * Fog.maxDistance. A custom fragment shader resolves this TGSL function through TypeGPU and binds
+ * fogReadBindGroup(world, camera) at group 3 with fogReadLayout. Raw WebGPU pipeline layouts must fill
+ * unused earlier indices with explicit empty layouts: TypeGPU leaves sparse group indices unfilled.
+ */
+export const readFog = tgpu
+    .fn(
+        [d.vec3f],
+        d.vec4f,
+    )((point) => {
+        "use gpu";
+        const camView = fogReadLayout.$.view;
+        const cfg = fogReadLayout.$.fog;
+        if (cfg.medium.x === 0) return d.vec4f(0, 0, 0, 1);
+        const clip = std.mul(camView.clipFromWorld, d.vec4f(point, 1));
+        const uv = std.add(std.mul(std.div(clip.xy, clip.w), d.vec2f(0.5, -0.5)), 0.5);
+        const forward = std.neg(std.mul(d.vec4f(0, 0, 1, 0), camView.viewFromWorld).xyz);
+        const nearWorld = reconstructWorld(camView.worldFromClip, uv, 1);
+        const dir = std.normalize(std.sub(point, nearWorld));
+        const surfaceZ = std.dot(std.sub(point, camView.eye.xyz), forward);
+        const cosine = std.max(std.dot(dir, forward), 1e-6);
+        const viewZ = std.min(surfaceZ, std.max(camView.projection.x, cfg.extra.x * cosine));
+        const extent = std.max(cfg.medium.w - camView.projection.x, 0.001);
+        const slice = std.sqrt(std.clamp((viewZ - camView.projection.x) / extent, 0, 1));
+        // Texels hold slice boundaries, including the identity at the near plane.
+        const z = (slice * FOG_SLICES + 0.5) / (FOG_SLICES + 1);
+        const integrated = std.textureSampleLevel(
+            fogReadLayout.$.grid,
+            fogReadLayout.$.gridSampler,
+            d.vec3f(uv, z),
+            0,
+        );
+        let volume = d.vec4f(integrated);
+        if (viewZ > cfg.medium.w) {
+            const rayScale = 1 / cosine;
+            volume = fogTail(
+                cfg,
+                camView,
+                std.add(nearWorld, std.mul(dir, extent * rayScale)),
+                dir,
+                (viewZ - cfg.medium.w) * rayScale,
+                integrated,
+            );
+        }
+        // The medium's own light is uniform, so its in-scatter along any density is albedo · L · (1 − T).
+        const own = std.mul(cfg.color.xyz, camView.exposure * cfg.extra.z * (1 - volume.w));
+        return d.vec4f(std.add(own, volume.xyz), volume.w);
+    })
+    .$name("readFog");
+
+const applyFog = tgpu.fn(
+    [d.vec4f, d.f32],
+    d.vec4f,
+)((position, depth) => {
+    "use gpu";
+    const uv = std.div(position.xy, fogReadLayout.$.view.resolution);
+    const camView = fogReadLayout.$.view;
+    let point = reconstructWorld(camView.worldFromClip, uv, depth);
+    if (depth === 0 && camView.projection.z > 0.5) {
+        const nearWorld = reconstructWorld(camView.worldFromClip, uv, 1);
+        const dir = std.normalize(std.sub(nearWorld, camView.eye.xyz));
+        point = std.add(
+            camView.eye.xyz,
+            std.mul(dir, std.max(fogReadLayout.$.fog.extra.x, camView.projection.x + 0.001)),
+        );
+    }
+    return readFog(point);
+});
+
+export const fogKernel = tgpu
+    .fragmentFn({ in: { position: d.builtin.position }, out: d.vec4f })((input) => {
+        "use gpu";
+        return applyFog(input.position, loadDepth(d.vec2i(input.position.xy)));
+    })
+    .$name("fogApply");
+
+// Exact depth equality keeps every discontinuity on the sample-rate path. Sloped surfaces may
+// also take that path; a tolerance could instead merge distinct surfaces and lose their fog edge.
+const isEdge = tgpu.fn(
+    [d.vec2i],
+    d.bool,
+)((pixel) => {
+    "use gpu";
+    const z = loadDepthMultisampled(pixel, 0);
+    // Unrolled for core rendering's SAMPLE_COUNT = 4 to keep sample loads and short-circuiting static.
+    return (
+        z !== loadDepthMultisampled(pixel, 1) ||
+        z !== loadDepthMultisampled(pixel, 2) ||
+        z !== loadDepthMultisampled(pixel, 3)
+    );
+});
+
+export const fogKernelInterior = tgpu
+    .fragmentFn({ in: { position: d.builtin.position }, out: d.vec4f })((input) => {
+        "use gpu";
+        const pixel = d.vec2i(input.position.xy);
+        if (isEdge(pixel)) std.discard();
+        return applyFog(input.position, loadDepthMultisampled(pixel, 0));
+    })
+    .$name("fogApply");
+
+export const fogKernelMultisampled = tgpu
+    .fragmentFn({
+        in: { position: d.builtin.position, sample: d.builtin.sampleIndex },
+        out: d.vec4f,
+    })((input) => {
+        "use gpu";
+        if (!isEdge(d.vec2i(input.position.xy))) std.discard();
+        return applyFog(
+            input.position,
+            loadDepthMultisampled(d.vec2i(input.position.xy), input.sample),
+        );
+    })
+    .$name("fogApply");

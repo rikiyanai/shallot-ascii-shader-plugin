@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="description" content="Build a little railway: sculpt an island, connect tracks and run toy trains.">
+    <title>Train set</title>
+    <style>*{box-sizing:border-box;margin:0}html,body{width:100%;height:100%;overflow:hidden}body{background:#f9f6ec}canvas{display:block;width:100%;height:100%;touch-action:none}button{user-select:none;-webkit-user-select:none}[data-shallot-bootstrap]{position:fixed;inset:0;display:grid;place-items:center;background:#fffaf0;color:#38291c;font:16px system-ui}</style>
+  </head>
+  <body>
+    <canvas id="canvas" aria-label="Editable train set"></canvas>
+    <div data-shallot-bootstrap role="status">Opening the train set…</div>
+    <script type="module">
+      import {runApp,shallotDark} from '@dylanebert/shallot';
+      import {AppPlugin} from './src/app';
+      await runApp({plugins:[AppPlugin],loading:shallotDark({bootstrap:document.querySelector('[data-shallot-bootstrap]')})});
+    </script>
+  </body>
+</html>

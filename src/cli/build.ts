@@ -1,0 +1,33 @@
+import { basename, relative } from "node:path";
+import { bundleNativeLinux, bundleNativeMac, bundleNativeWindows, nativeOutDir } from "../native";
+import { buildWeb, normalizePath, requireBackend } from "../project";
+
+export type NativeTarget = "windows" | "mac" | "linux";
+
+export async function buildProject(
+    projectDir: string,
+    opts: {
+        target: NativeTarget;
+        release?: boolean;
+        portable?: boolean;
+        args?: string[];
+        dev?: boolean;
+    },
+): Promise<number> {
+    const target = opts.target;
+    const release = opts.release ?? false;
+    const portable = opts.portable ?? false;
+    requireBackend(target, portable);
+
+    if (!opts.dev) await buildWeb(projectDir, {}, opts.args);
+
+    const outputDir = nativeOutDir(projectDir, target, release, portable, opts.dev);
+    const label = normalizePath(relative(projectDir, outputDir));
+    console.log(`\n  building ${basename(projectDir)} → ${label}/\n`);
+    const bundleOpts = { release, portable, dev: opts.dev };
+    if (target === "windows") await bundleNativeWindows(projectDir, outputDir, bundleOpts);
+    else if (target === "mac") await bundleNativeMac(projectDir, outputDir, bundleOpts);
+    else await bundleNativeLinux(projectDir, outputDir, bundleOpts);
+    console.log(`\n  done. ${label}/\n`);
+    return 0;
+}

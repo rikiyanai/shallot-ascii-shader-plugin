@@ -1,0 +1,246 @@
+// Internal renderer for the default loading screen and generated icons. Its source data lives in
+// assets/branding; brand-data.ts embeds that data so published source needs no branding files.
+import { DARK, FONT, MARK, NAME } from "./brand-data";
+
+export { DARK };
+
+type Tone = "gold" | "dim" | "ink";
+
+/** Rows of pixels; `null` is transparent. */
+export type Grid = (Tone | null)[][];
+
+/** Hex per tone and ground, one set per theme. */
+export type Palette = { gold: string; dim: string; ink: string; bg: string };
+
+/** Half-block rows → bitmap of the given tone. Width is the longest row. */
+export function fromBlocks(rows: readonly string[], tone: Tone = "gold"): Grid {
+    const width = Math.max(...rows.map((r) => r.length));
+    const grid: Grid = [];
+    for (const row of rows) {
+        const top: (Tone | null)[] = [];
+        const bottom: (Tone | null)[] = [];
+        for (let x = 0; x < width; x++) {
+            const ch = row[x] ?? " ";
+            top.push(ch === "█" || ch === "▀" ? tone : null);
+            bottom.push(ch === "█" || ch === "▄" ? tone : null);
+        }
+        grid.push(top, bottom);
+    }
+    return grid;
+}
+
+/** The name set in the bitmap face, one pixel between letters. */
+function word(text: string = NAME, tone: Tone = "ink"): Grid {
+    const rows: Grid = Array.from({ length: 7 }, () => []);
+    [...text].forEach((ch, i) => {
+        const glyph = FONT[ch];
+        if (!glyph) throw new Error(`no glyph for "${ch}"`);
+        glyph.forEach((line, y) => {
+            const row = rows[y] as (Tone | null)[];
+            if (i > 0) row.push(null);
+            for (const c of line) row.push(c === "#" ? tone : null);
+        });
+    });
+    return rows;
+}
+
+/** A placed bitmap. `x` in pixels, `y` in pixels. */
+type Layer = { grid: Grid; x: number; y: number };
+
+/** Later layers cover earlier ones; transparent pixels do not erase them. Clips to width/height.
+ * Pixel rows must be even for half blocks. */
+export function compose(width: number, height: number, layers: readonly Layer[]): Grid {
+    const out: Grid = Array.from({ length: height }, () => Array<Tone | null>(width).fill(null));
+    for (const { grid, x, y } of layers) {
+        grid.forEach((row, gy) => {
+            row.forEach((tone, gx) => {
+                const px = x + gx;
+                const py = y + gy;
+                if (tone && py >= 0 && py < height && px >= 0 && px < width) {
+                    (out[py] as (Tone | null)[])[px] = tone;
+                }
+            });
+        });
+    }
+    return out;
+}
+
+/** Pixel grid → SVG of square rects, one per pixel, crisp edges. Transparent ground. */
+export function toSvg(grid: Grid, palette: Palette, scale: number = 1): string {
+    const height = grid.length;
+    const width = grid[0]?.length ?? 0;
+    const rects = grid
+        .flatMap((row, y) =>
+            row.map((tone, x) =>
+                tone
+                    ? `<rect x="${x * scale}" y="${y * scale}" width="${scale}" height="${scale}" fill="${palette[tone]}"/>`
+                    : "",
+            ),
+        )
+        .filter(Boolean)
+        .join("");
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width * scale} ${height * scale}" width="${width * scale}" height="${height * scale}" shape-rendering="crispEdges">${rects}</svg>`;
+}
+
+// --- splash ---------------------------------------------------------------------------------
+
+const TICK_RATE = 35;
+const TICK_MS = 1000 / TICK_RATE;
+const ANTICIPATION = 3;
+const BEATS = [2, 2, 2, 1, 1, 1, 1] as const;
+const COUNTS = [2, 3, 5, 7, 9, 11] as const;
+const LETTER_TICKS = 2;
+const CURSOR_TICKS = 6;
+const BAYER = [
+    [0, 8, 2, 10],
+    [12, 4, 14, 6],
+    [3, 11, 1, 9],
+    [15, 7, 13, 5],
+] as const;
+
+/** Tick of the hit: the last beat, when the remaining pixels land and the name starts. */
+const HIT_TICK = ANTICIPATION + BEATS.reduce((a, b) => a + b, 0);
+
+/** Last tick with any change; the frame after it is the lockup. */
+export const END_TICK = HIT_TICK + NAME.length * LETTER_TICKS + CURSOR_TICKS;
+
+type Point = { x: number; y: number };
+
+const beatStart = (k: number): number =>
+    ANTICIPATION + BEATS.slice(0, k).reduce<number>((a, b) => a + b, 0);
+
+function lcg(seed: number): () => number {
+    let s = seed;
+    return () => {
+        s = (s * 16807) % 2147483647;
+        return s / 2147483647;
+    };
+}
+
+function landing(grid: Grid): Map<Point, number> {
+    const pixels: Point[] = [];
+    grid.forEach((row, y) => {
+        row.forEach((tone, x) => {
+            if (tone) pixels.push({ x, y });
+        });
+    });
+    const rnd = lcg(5);
+    const jitter = new Map(pixels.map((p) => [p, rnd()]));
+    const key = (p: Point) => (BAYER[p.y % 4] as readonly number[])[p.x % 4] as number;
+    // Center-first ordering makes sparse early beats read as one growing cluster.
+    const cx = pixels.reduce((a, p) => a + p.x, 0) / pixels.length;
+    const cy = pixels.reduce((a, p) => a + p.y, 0) / pixels.length;
+    const radius = (p: Point) => (p.x - cx) ** 2 + (p.y - cy) ** 2;
+    pixels.sort(
+        (a, b) =>
+            key(a) - key(b) || radius(a) - radius(b) || (jitter.get(a) ?? 0) - (jitter.get(b) ?? 0),
+    );
+    const ticks = new Map<Point, number>();
+    let i = 0;
+    COUNTS.forEach((n, k) => {
+        for (let c = 0; c < n && i < pixels.length; c++, i++)
+            ticks.set(pixels[i] as Point, beatStart(k));
+    });
+    for (; i < pixels.length; i++) ticks.set(pixels[i] as Point, HIT_TICK);
+    return ticks;
+}
+
+const MARK_GRID = fromBlocks(MARK.m);
+const LANDING = landing(MARK_GRID);
+const MARK_W = MARK_GRID[0]?.length ?? 0;
+const NAME_X = MARK_W + 4;
+const NAME_Y = 5;
+const GLYPHS = [...NAME].map((ch) => word(ch));
+
+/** The splash at a tick, as the lockup-sized grid. Ticks past `END_TICK` return the lockup. */
+function splashFrame(tick: number): Grid {
+    const name = word();
+    const width = NAME_X + (name[0]?.length ?? 0);
+    const out: Grid = Array.from({ length: MARK_GRID.length }, () =>
+        Array<Tone | null>(width).fill(null),
+    );
+    if (tick < ANTICIPATION) {
+        if (tick >= 1) (out[7] as (Tone | null)[])[5] = tick === 1 ? "dim" : "gold";
+        return out;
+    }
+    for (const [p, land] of LANDING) {
+        if (tick >= land) (out[p.y] as (Tone | null)[])[p.x] = tick - land < 1 ? "dim" : "gold";
+    }
+    const typed = Math.max(0, Math.min(NAME.length, Math.floor((tick - HIT_TICK) / LETTER_TICKS)));
+    let x = NAME_X;
+    for (let i = 0; i < typed; i++) {
+        const glyph = GLYPHS[i] as Grid;
+        glyph.forEach((row, gy) => {
+            row.forEach((tone, gx) => {
+                if (tone) (out[NAME_Y + gy] as (Tone | null)[])[x + gx] = "ink";
+            });
+        });
+        x += (glyph[0]?.length ?? 0) + 1;
+    }
+    if (tick >= HIT_TICK && tick < END_TICK) {
+        for (let y = 2; y < 7; y++)
+            for (let k = 0; k < 4; k++) (out[NAME_Y + y] as (Tone | null)[])[x + k] = "gold";
+    }
+    return out;
+}
+
+export interface Splash {
+    seek(tick: number): void;
+    play(from?: number): Promise<void>;
+    cancel(): void;
+}
+
+/**
+ * Replaces `el`'s contents with `render` output. `seek` draws a tick and skips a repeat;
+ * `play` cancels any pending play, runs from `from` at 35 ticks a second and resolves once
+ * the lockup is drawn. `cancel` stops a pending play and resolves it without drawing another frame.
+ * Reduced motion rests on the lockup
+ * for any tick and resolves at once.
+ */
+export function splash(el: Element, render: (grid: Grid) => string, reduced = false): Splash {
+    const Rest = END_TICK + 1;
+    let last = -1;
+    let raf = 0;
+    let settle: (() => void) | null = null;
+
+    const seek = (tick: number) => {
+        const t = reduced ? Rest : Math.min(tick, Rest);
+        if (t === last) return;
+        last = t;
+        el.innerHTML = render(splashFrame(t));
+    };
+
+    const cancel = (): void => {
+        cancelAnimationFrame(raf);
+        raf = 0;
+        const pending = settle;
+        settle = null;
+        pending?.();
+    };
+
+    const play = (from = 0): Promise<void> => {
+        cancel();
+        if (reduced) {
+            seek(Rest);
+            return Promise.resolve();
+        }
+        const start = performance.now();
+        return new Promise<void>((resolve) => {
+            settle = resolve;
+            const frame = () => {
+                const tick = from + Math.floor((performance.now() - start) / TICK_MS);
+                seek(tick);
+                if (tick <= END_TICK) {
+                    raf = requestAnimationFrame(frame);
+                    return;
+                }
+                raf = 0;
+                settle = null;
+                resolve();
+            };
+            frame();
+        });
+    };
+
+    return { seek, play, cancel };
+}

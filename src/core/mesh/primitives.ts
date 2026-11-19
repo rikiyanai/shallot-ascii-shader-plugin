@@ -1,0 +1,302 @@
+import type { World } from "../../engine";
+import { Meshes, type MeshHandle } from "./mesh";
+
+/**
+ * add the built-in default cube, unit-sized with flat per-face normals. Other primitive
+ * constructors return geometry for the game to add when needed.
+ */
+export function initMeshes(world: World): MeshHandle {
+    return world.resource(Meshes).add({ name: "cube", ...cube() });
+}
+
+interface Vert {
+    px: number;
+    py: number;
+    pz: number;
+    nx: number;
+    ny: number;
+    nz: number;
+    u: number;
+    v: number;
+}
+
+function pack(verts: Vert[]): Float32Array {
+    const out = new Float32Array(verts.length * 8);
+    for (let i = 0; i < verts.length; i++) {
+        const w = verts[i];
+        const o = i * 8;
+        out[o] = w.px;
+        out[o + 1] = w.py;
+        out[o + 2] = w.pz;
+        out[o + 3] = w.u;
+        out[o + 4] = w.nx;
+        out[o + 5] = w.ny;
+        out[o + 6] = w.nz;
+        out[o + 7] = w.v;
+    }
+    return out;
+}
+
+/**
+ * Box with the supplied xyz full lengths (default 1), flat-shaded: four vertices per face for
+ * per-face normals, each face's uv running (0,0)→(1,0)→(1,1)→(0,1) over its
+ * BL→BR→TR→TL corners. Winding is CCW outward, matching standard's default back-face cull
+ */
+export function cube(size: readonly [number, number, number] = [1, 1, 1]): {
+    vertices: Float32Array;
+    indices: Uint32Array;
+} {
+    const uv = [
+        [0, 0],
+        [1, 0],
+        [1, 1],
+        [0, 1],
+    ];
+    const faces = [
+        {
+            normal: [0, 0, 1],
+            corners: [
+                [-0.5, -0.5, 0.5],
+                [0.5, -0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+            ],
+        },
+        {
+            normal: [0, 0, -1],
+            corners: [
+                [0.5, -0.5, -0.5],
+                [-0.5, -0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+                [0.5, 0.5, -0.5],
+            ],
+        },
+        {
+            normal: [0, 1, 0],
+            corners: [
+                [-0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [0.5, 0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+        },
+        {
+            normal: [0, -1, 0],
+            corners: [
+                [-0.5, -0.5, -0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, -0.5, 0.5],
+                [-0.5, -0.5, 0.5],
+            ],
+        },
+        {
+            normal: [1, 0, 0],
+            corners: [
+                [0.5, -0.5, 0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [0.5, 0.5, 0.5],
+            ],
+        },
+        {
+            normal: [-1, 0, 0],
+            corners: [
+                [-0.5, -0.5, -0.5],
+                [-0.5, -0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+        },
+    ];
+
+    const verts: Vert[] = [];
+    const indices: number[] = [];
+    for (const { normal, corners } of faces) {
+        const base = verts.length;
+        for (let i = 0; i < 4; i++) {
+            verts.push({
+                px: corners[i][0] * size[0],
+                py: corners[i][1] * size[1],
+                pz: corners[i][2] * size[2],
+                nx: normal[0],
+                ny: normal[1],
+                nz: normal[2],
+                u: uv[i][0],
+                v: uv[i][1],
+            });
+        }
+        indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+
+    return { vertices: pack(verts), indices: new Uint32Array(indices) };
+}
+
+function requireCount(parameter: string, value: number, minimum: number): void {
+    if (!Number.isInteger(value) || value < minimum) {
+        throw new RangeError(`${parameter} must be an integer >= ${minimum}; received ${value}`);
+    }
+}
+
+/**
+ * UV sphere with the supplied radius (default 0.5), smooth-shaded (vertex normal = surface direction).
+ * `segments` divisions around the axis, `rings` from pole to pole.
+ * Throws unless segments is an integer >= 3 and rings is an integer >= 2.
+ * For positive radius, every triangle is CCW outward, matching standard's default back-face cull.
+ */
+export function sphere(
+    radius = 0.5,
+    segments = 32,
+    rings = 16,
+): { vertices: Float32Array; indices: Uint32Array } {
+    requireCount("segments", segments, 3);
+    requireCount("rings", rings, 2);
+    const verts: Vert[] = [];
+    const indices: number[] = [];
+
+    for (let y = 0; y <= rings; y++) {
+        const v = y / rings;
+        const theta = v * Math.PI;
+        for (let x = 0; x <= segments; x++) {
+            const u = x / segments;
+            const phi = u * Math.PI * 2;
+            const nx = Math.sin(theta) * Math.cos(phi);
+            const ny = Math.cos(theta);
+            const nz = Math.sin(theta) * Math.sin(phi);
+            verts.push({ px: nx * radius, py: ny * radius, pz: nz * radius, nx, ny, nz, u, v });
+        }
+    }
+
+    const stride = segments + 1;
+    for (let y = 0; y < rings; y++) {
+        for (let x = 0; x < segments; x++) {
+            const a = y * stride + x;
+            const b = a + stride;
+            if (y > 0) indices.push(a, a + 1, b);
+            if (y < rings - 1) indices.push(a + 1, b + 1, b);
+        }
+    }
+
+    return { vertices: pack(verts), indices: new Uint32Array(indices) };
+}
+
+/**
+ * Capsule with the supplied radius (default 0.5) and cylindrical mid-section full length
+ * (default 1): two hemispherical caps over the mid-section, smooth-shaded.
+ * `segments` divisions around the axis, `rings` from cap pole to cap pole
+ * (rounded down to an even count).
+ * Throws unless segments is an integer >= 3 and rings is an integer >= 2.
+ * For positive radius and mid-section length, every triangle is CCW outward,
+ * matching standard's default back-face cull.
+ */
+export function capsule(
+    radius = 0.5,
+    length = 1,
+    segments = 32,
+    rings = 16,
+): { vertices: Float32Array; indices: Uint32Array } {
+    requireCount("segments", segments, 3);
+    requireCount("rings", rings, 2);
+    const halfHeight = length / 2;
+    const verts: Vert[] = [];
+    const indices: number[] = [];
+    const halfRings = Math.floor(rings / 2);
+
+    for (let y = 0; y <= halfRings; y++) {
+        const theta = (y / halfRings) * (Math.PI / 2);
+        const v = (y / halfRings) * 0.25;
+        for (let x = 0; x <= segments; x++) {
+            const u = x / segments;
+            const phi = u * Math.PI * 2;
+            const nx = Math.sin(theta) * Math.cos(phi);
+            const ny = Math.cos(theta);
+            const nz = Math.sin(theta) * Math.sin(phi);
+            verts.push({
+                px: nx * radius,
+                py: ny * radius + halfHeight,
+                pz: nz * radius,
+                nx,
+                ny,
+                nz,
+                u,
+                v,
+            });
+        }
+    }
+
+    for (let x = 0; x <= segments; x++) {
+        const u = x / segments;
+        const phi = u * Math.PI * 2;
+        const nx = Math.cos(phi);
+        const nz = Math.sin(phi);
+        verts.push({ px: nx * radius, py: halfHeight, pz: nz * radius, nx, ny: 0, nz, u, v: 0.25 });
+    }
+    for (let x = 0; x <= segments; x++) {
+        const u = x / segments;
+        const phi = u * Math.PI * 2;
+        const nx = Math.cos(phi);
+        const nz = Math.sin(phi);
+        verts.push({
+            px: nx * radius,
+            py: -halfHeight,
+            pz: nz * radius,
+            nx,
+            ny: 0,
+            nz,
+            u,
+            v: 0.75,
+        });
+    }
+
+    for (let y = 0; y <= halfRings; y++) {
+        const theta = (y / halfRings) * (Math.PI / 2);
+        const v = 0.75 + (y / halfRings) * 0.25;
+        for (let x = 0; x <= segments; x++) {
+            const u = x / segments;
+            const phi = u * Math.PI * 2;
+            const nx = Math.sin(theta) * Math.cos(phi);
+            const ny = -Math.cos(theta);
+            const nz = Math.sin(theta) * Math.sin(phi);
+            verts.push({
+                px: nx * radius,
+                py: ny * radius - halfHeight,
+                pz: nz * radius,
+                nx,
+                ny,
+                nz,
+                u,
+                v,
+            });
+        }
+    }
+
+    const stride = segments + 1;
+    for (let y = 0; y < halfRings; y++) {
+        for (let x = 0; x < segments; x++) {
+            const a = y * stride + x;
+            const b = a + stride;
+            if (y > 0) indices.push(a, a + 1, b);
+            indices.push(a + 1, b + 1, b);
+        }
+    }
+
+    const cylTop = (halfRings + 1) * stride;
+    const cylBot = cylTop + stride;
+    for (let x = 0; x < segments; x++) {
+        const a = cylTop + x;
+        const b = cylBot + x;
+        indices.push(a, a + 1, b, a + 1, b + 1, b);
+    }
+
+    const botStart = cylBot + stride;
+    for (let y = 0; y < halfRings; y++) {
+        for (let x = 0; x < segments; x++) {
+            const a = botStart + y * stride + x;
+            const b = a + stride;
+            // The bottom cap faces down, so its winding is reversed relative to the top cap.
+            if (y > 0) indices.push(a, b, a + 1);
+            indices.push(a + 1, b, b + 1);
+        }
+    }
+
+    return { vertices: pack(verts), indices: new Uint32Array(indices) };
+}

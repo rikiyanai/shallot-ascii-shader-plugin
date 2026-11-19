@@ -1,0 +1,161 @@
+import type { Resource, World } from "../../engine";
+import { component, f32, u32 } from "../../engine";
+import { Transform } from "../transform";
+
+/** Ambient illumination used unless a camera carries an {@link AmbientLight} override. */
+export interface GlobalAmbientLightState {
+    /** Linearized from this sRGB hex color when packed. */
+    color: number;
+    /** Scene luminance in cd/m². */
+    brightness: number;
+}
+
+/** The world's default ambient source, measured in cd/m². */
+export const GlobalAmbientLight: Resource<GlobalAmbientLightState> = {
+    create: () => ({ color: 0xffffff, brightness: 80 }),
+};
+
+/** Per-camera ambient override. Color is sRGB hex; brightness is luminance in cd/m². */
+export const AmbientLight = component(
+    "AmbientLight",
+    { color: f32, brightness: f32 },
+    { defaults: () => ({ color: 0xffffff, brightness: 80 }) },
+);
+
+/** Directional illumination in lux. Light travels along the entity's transformed local -Z. */
+export const DirectionalLight = component(
+    "DirectionalLight",
+    {
+        color: f32,
+        illuminance: f32,
+        shadowMapsEnabled: u32,
+        maximumDistance: f32,
+        numCascades: u32,
+        firstCascadeFarBound: f32,
+        overlapProportion: f32,
+        /** Receiver offset toward this light in world units. */
+        depthBias: f32,
+        /** Receiver offset in shadow texels along the surface normal. */
+        shadowNormalBias: f32,
+    },
+    {
+        defaults: () => ({
+            color: 0xffffff,
+            illuminance: 10_000,
+            shadowMapsEnabled: 0,
+            maximumDistance: 150,
+            numCascades: 4,
+            firstCascadeFarBound: 10,
+            overlapProportion: 0.2,
+            depthBias: 0.02,
+            shadowNormalBias: 1.8,
+        }),
+        requires: [Transform],
+    },
+);
+
+/** Spherical source with luminous flux in lumens. Placement, range and radius use world units. */
+export const PointLight = component(
+    "PointLight",
+    {
+        color: f32,
+        /** Total emitted luminous flux in lumens. */
+        intensity: f32,
+        range: f32,
+        radius: f32,
+        shadowMapsEnabled: u32,
+        /** Receiver offset toward this light in world units. */
+        depthBias: f32,
+        shadowNormalBias: f32,
+    },
+    {
+        defaults: () => ({
+            color: 0xffffff,
+            intensity: 1_000_000,
+            range: 20,
+            radius: 0,
+            shadowMapsEnabled: 0,
+            depthBias: 0.08,
+            shadowNormalBias: 0.6,
+        }),
+        requires: [Transform],
+    },
+);
+
+/** Cone source with luminous flux in lumens. It points down GlobalTransform's local -Z. */
+export const SpotLight = component(
+    "SpotLight",
+    {
+        color: f32,
+        /** Total emitted luminous flux in lumens. */
+        intensity: f32,
+        range: f32,
+        radius: f32,
+        /** Inner half-angle in radians, at most `outerAngle`; full brightness inside it. */
+        innerAngle: f32,
+        /**
+         * Outer half-angle in radians, below `Math.PI / 2`; dark beyond it.
+         * Standard rendering warns for values at or above π/2 and uses π/2 − 1e-4,
+         * limiting innerAngle to that effective outer without changing the authored fields.
+         */
+        outerAngle: f32,
+        shadowMapsEnabled: u32,
+        /** Receiver offset toward this light in world units. */
+        depthBias: f32,
+        shadowNormalBias: f32,
+    },
+    {
+        defaults: () => ({
+            color: 0xffffff,
+            intensity: 1_000_000,
+            range: 20,
+            radius: 0,
+            innerAngle: 0,
+            outerAngle: Math.PI / 4,
+            shadowMapsEnabled: 0,
+            depthBias: 0.02,
+            shadowNormalBias: 1.8,
+        }),
+        requires: [Transform],
+    },
+);
+
+/** Apparent solar diameter in radians. */
+export const SUN_DISK_EARTH_ANGULAR_SIZE = 0.00930842;
+
+/** Visible disk attached to a directional light. Sky's angular size and glow are independent of illumination. */
+export const SunDisk = component(
+    "SunDisk",
+    {
+        /** Apparent disk diameter in radians. */
+        angularSize: f32,
+        /** Visual multiplier; does not change the light or its shadows. */
+        intensity: f32,
+        /** Per-light sky glow, independent of illumination. */
+        glow: f32,
+    },
+    {
+        defaults: () => ({ angularSize: SUN_DISK_EARTH_ANGULAR_SIZE, intensity: 1, glow: 0.5 }),
+        requires: [DirectionalLight],
+    },
+);
+
+/** Opt a light into FogPlugin's volumetric scattering. Without fog this marker is inert. */
+export const VolumetricLight = component("VolumetricLight", {});
+
+/** Membership in 32 rendering layers: bit n selects layer n. Missing means layer 0; zero matches
+ * nothing. Cameras select meshes and lights by intersection; lights select their shadow casters.
+ * Changes take effect next frame. */
+export const RenderLayers = component(
+    "RenderLayers",
+    { mask: u32 },
+    { defaults: () => ({ mask: 1 }) },
+);
+
+/** An entity's RenderLayers mask, or layer 0 (mask 1) without one. */
+export function renderLayers(world: World, eid: number): number {
+    return world.has(eid, RenderLayers) ? world.storage(RenderLayers).mask.get(eid) : 1;
+}
+
+/** Exclude a mesh from shadow views without removing it from the main view. */
+export const NotShadowCaster = component("NotShadowCaster", {});

@@ -1,0 +1,574 @@
+import type { Entity } from "./entity";
+import type { World } from "./world";
+
+/** SoA component schema: each field names a type; worlds own the columns. */
+export type Component = Record<string, unknown>;
+
+/** Optional starting values for a component's declared fields. */
+export type ComponentValues<T> = {
+    [K in keyof T as T[K] extends FieldType ? K : never]?: T[K] extends FieldType
+        ? T[K]["lanes"] extends 1
+            ? number
+            : T[K]["lanes"] extends 2
+              ? readonly [number, number]
+              : T[K] extends { readonly components: 3 }
+                ? readonly [number, number, number] | readonly [number, number, number, number]
+                : readonly [number, number, number, number]
+        : never;
+};
+
+/** Every declared field's value, as `World.get` returns it; vectors are arrays of their authored length. */
+export type ComponentRecord<T> = {
+    [K in keyof T as T[K] extends FieldType ? K : never]-?: T[K] extends FieldType
+        ? T[K]["lanes"] extends 1
+            ? number
+            : T[K]["lanes"] extends 2
+              ? [number, number]
+              : T[K] extends { readonly components: 3 }
+                ? [number, number, number]
+                : [number, number, number, number]
+        : never;
+};
+
+/** @internal Freeze a component's shared declarations, never its world's storage. */
+export function freezeComponent(component: Component): void {
+    for (const value of Object.values(component)) {
+        if (isType(value)) Object.freeze(value);
+    }
+    Object.freeze(component);
+}
+
+/** @internal Recognize a bare CPU storage type, not a world-bound field handle. */
+export function isType(value: unknown): value is FieldType {
+    if (!value || typeof value !== "object") return false;
+    const type = value as FieldType;
+    return (
+        typeof type.ctor === "function" &&
+        typeof type.ctor.BYTES_PER_ELEMENT === "number" &&
+        (type.lanes === 1 || type.lanes === 2 || type.lanes === 4) &&
+        typeof type.name === "string"
+    );
+}
+
+/** typed-array element backing for component columns. */
+export type TypedArray =
+    | Float32Array
+    | Float64Array
+    | Int32Array
+    | Uint32Array
+    | Uint16Array
+    | Uint8Array;
+
+/**
+ * Shared CPU storage metadata; descriptors carry no entity state.
+ */
+export interface FieldType<TArray extends TypedArray = TypedArray> {
+    /** typed-array constructor used to back CPU storage */
+    readonly ctor: {
+        readonly BYTES_PER_ELEMENT: number;
+        new (length: number): TArray;
+    };
+    /** scalar = 1, vec2 = 2, vec4 = 4. stride into the backing array per eid */
+    readonly lanes: 1 | 2 | 4;
+    /** Values an entity authors when fewer than `lanes`: 3 for {@link vec3}. Layout ignores it. */
+    readonly components?: 3;
+    /** Debug label; it selects no behavior. */
+    readonly name: string;
+    /** JS number → array-slot value. omit for identity-mapped types */
+    readonly encode?: (v: number) => number;
+    /** array-slot value → JS number. omit for identity-mapped types */
+    readonly decode?: (raw: number) => number;
+}
+
+/** 32-bit IEEE float. */
+export const f32: FieldType<Float32Array> & { readonly lanes: 1 } = {
+    ctor: Float32Array,
+    lanes: 1,
+    name: "f32",
+};
+
+/** 32-bit signed integer. */
+export const i32: FieldType<Int32Array> & { readonly lanes: 1 } = {
+    ctor: Int32Array,
+    lanes: 1,
+    name: "i32",
+};
+
+/** 32-bit unsigned integer. */
+export const u32: FieldType<Uint32Array> & { readonly lanes: 1 } = {
+    ctor: Uint32Array,
+    lanes: 1,
+    name: "u32",
+};
+
+/**
+ * CPU-only entity reference column. Setters and component starting values take live
+ * eids; getters resolve them to eids, or 0 after destruction or reuse. Raw columns
+ * and bulk writes hold EntityRef numbers, not eids. References survive frames and
+ * storage growth, belong to one World and run, and cannot be saved; 0 means missing.
+ * Generations wrap after 2^21 reuses of one eid, with a once-per-World warning.
+ */
+export const entity: FieldType<Float64Array> & { readonly lanes: 1 } = {
+    ctor: Float64Array,
+    lanes: 1,
+    name: "entity",
+};
+
+/** @internal compare storage and conversion semantics, never a FieldType's debug label. */
+export function sameTypeLayout(a: FieldType, b: FieldType): boolean {
+    if (
+        a.ctor !== b.ctor ||
+        a.ctor.BYTES_PER_ELEMENT !== b.ctor.BYTES_PER_ELEMENT ||
+        a.lanes !== b.lanes ||
+        a.encode !== b.encode ||
+        a.decode !== b.decode
+    ) {
+        return false;
+    }
+    return a !== entity && b !== entity ? true : a === b;
+}
+
+/**
+ * 8-bit unsigned CPU column. WGSL has no u8 storage type; a GPU record uses u32.
+ */
+export const u8: FieldType<Uint8Array> & { readonly lanes: 1 } = {
+    ctor: Uint8Array,
+    lanes: 1,
+    name: "u8",
+};
+
+/**
+ * 16-bit unsigned CPU column. WGSL has no u16 storage type; a GPU record uses u32.
+ */
+export const u16: FieldType<Uint16Array> & { readonly lanes: 1 } = {
+    ctor: Uint16Array,
+    lanes: 1,
+    name: "u16",
+};
+
+// Shared codec scratch avoids per-call allocation.
+const F16_BUF = new ArrayBuffer(4);
+const F16_F32 = new Float32Array(F16_BUF);
+const F16_U32 = new Uint32Array(F16_BUF);
+
+function f16encode(x: number): number {
+    F16_F32[0] = x;
+    const bits = F16_U32[0];
+    const sign = (bits >>> 16) & 0x8000;
+    const exp = ((bits >>> 23) & 0xff) - 127 + 15;
+    const mantissa = bits & 0x7fffff;
+    if (exp <= 0) {
+        if (exp < -10) return sign;
+        const m = (mantissa | 0x800000) >>> (1 - exp);
+        return sign | (m >>> 13);
+    }
+    if (exp >= 31) {
+        // A finite f32 overflowing f16 range saturates to signed infinity;
+        // only a genuine NaN/Infinity input carries its payload through.
+        if (!Number.isFinite(x)) return sign | 0x7c00 | (mantissa ? 1 : 0);
+        return sign | 0x7c00;
+    }
+    return sign | (exp << 10) | (mantissa >>> 13);
+}
+
+function f16decode(bits: number): number {
+    const sign = bits & 0x8000;
+    const exp = (bits >>> 10) & 0x1f;
+    const mantissa = bits & 0x3ff;
+    if (exp === 0) {
+        if (mantissa === 0) return sign ? -0 : 0;
+        return (sign ? -1 : 1) * mantissa * 2 ** -24;
+    }
+    if (exp === 31) return mantissa ? Number.NaN : sign ? -Infinity : Infinity;
+    return (sign ? -1 : 1) * (1 + mantissa / 1024) * 2 ** (exp - 15);
+}
+
+/**
+ * 16-bit IEEE float, stored as `Uint16Array` bit patterns; reads and writes
+ * convert through the half-float codec. A GPU table refuses to bind it, as it
+ * refuses every encoded field.
+ */
+export const f16: FieldType<Uint16Array> & { readonly lanes: 1 } = {
+    ctor: Uint16Array,
+    lanes: 1,
+    name: "f16",
+    encode: f16encode,
+    decode: f16decode,
+};
+
+/** two f32 lanes. */
+export const vec2: FieldType<Float32Array> & { readonly lanes: 2 } = {
+    ctor: Float32Array,
+    lanes: 2,
+    name: "vec2",
+};
+
+/**
+ * three f32 values in four lanes, as WGSL `vec3<f32>` in a storage array: a 16-byte stride, so its
+ * storage, snapshots and GPU binding match {@link vec4}. Author `[x, y, z]`; the fourth lane is 0
+ * unless written as `[x, y, z, w]` or through `.w`.
+ */
+export const vec3: FieldType<Float32Array> & { readonly lanes: 4; readonly components: 3 } = {
+    ctor: Float32Array,
+    lanes: 4,
+    components: 3,
+    name: "vec3",
+};
+
+/**
+ * four f32 lanes whose fourth carries meaning: a quaternion, a color with alpha, or xyz paired
+ * with a scalar such as a radius. Use {@link vec3} for xyz data.
+ */
+export const vec4: FieldType<Float32Array> & { readonly lanes: 4 } = {
+    ctor: Float32Array,
+    lanes: 4,
+    name: "vec4",
+};
+
+/**
+ * World-owned scalar accessors remain valid across storage growth; raw column arrays do not.
+ * Values read through accessors or raw columns are guaranteed only while the entity holds the
+ * component; neither access path checks membership.
+ * Setters, bulk writes and `world.add` defaults publish frame-scoped change marks.
+ * GPU consumers declare record tables separately.
+ */
+export interface ScalarField {
+    /** Copy encoded typed rows in eid order; source must match this lane's element type. */
+    writeEncoded(eids: Uint32Array, source: TypedArray): void;
+    set(eid: number, value: number): void;
+    get(eid: number): number;
+    readonly type: FieldType;
+    /** world-owned CPU column, including each vector lane in field order */
+    readonly column: TypedArray;
+    /** Publish this eid after a raw column write. Resolve column again after growth. */
+    markChanged(eid: number): void;
+}
+
+/**
+ * World-owned two-lane accessors. Lane writes mark the whole entity slot changed.
+ * Values read through accessors or raw columns are guaranteed only while the entity holds the
+ * component; neither access path checks membership.
+ * `read` copies into the caller's output without allocation.
+ */
+export interface Vector2Field {
+    /** Copy encoded two-lane typed rows in eid order and mark each entity changed. */
+    writeEncoded(eids: Uint32Array, source: TypedArray): void;
+    set(eid: number, x: number, y: number): void;
+    read(eid: number, out: Float32Array): Float32Array;
+    readonly x: ScalarField;
+    readonly y: ScalarField;
+    readonly type: FieldType;
+    readonly column: TypedArray;
+    /** Publish this eid after a raw column write. Resolve column again after growth. */
+    markChanged(eid: number): void;
+}
+
+/**
+ * per-entity storage of a {@link vec3} field: {@link Vector4Field} whose `set` takes x, y and z,
+ * writing the fourth lane 0 unless `w` is given.
+ */
+export interface Vector3Field extends Omit<Vector4Field, "set"> {
+    set(eid: number, x: number, y: number, z: number, w?: number): void;
+}
+
+/** World-owned four-lane accessors. Lane writes mark the whole entity slot changed.
+ * Values read through accessors or raw columns are guaranteed only while the entity holds the
+ * component; neither access path checks membership.
+ * `read` copies into the caller's output without allocation. */
+export interface Vector4Field {
+    /** Copy encoded four-lane typed rows in eid order and mark each entity changed. */
+    writeEncoded(eids: Uint32Array, source: TypedArray): void;
+    set(eid: number, x: number, y: number, z: number, w: number): void;
+    read(eid: number, out: Float32Array): Float32Array;
+    readonly x: ScalarField;
+    readonly y: ScalarField;
+    readonly z: ScalarField;
+    readonly w: ScalarField;
+    readonly type: FieldType;
+    readonly column: TypedArray;
+    /** Publish this eid after a raw column write. Resolve column again after growth. */
+    markChanged(eid: number): void;
+}
+
+/**
+ * Lane count of a bare storage descriptor or structurally recognized field handle; 0 otherwise.
+ * A vector's scalar lane handle reports 1, not its parent's `type.lanes`.
+ */
+export function lanes(value: unknown): 0 | 1 | 2 | 4 {
+    if (isType(value)) return value.lanes;
+    if (!value || typeof value !== "object") return 0;
+    const v = value as Record<string, unknown>;
+    if (typeof v.set !== "function") return 0;
+    // Classify by an actual lane handle, not just a property name.
+    if (v.z != null && v.w != null) return 4;
+    if (v.x != null && v.y != null) return 2;
+    if (typeof v.get === "function") return 1;
+    return 0;
+}
+
+/**
+ * A component's declared bare storage types paired with their names, in declaration order.
+ * This enumerates metadata for schema comparison, not a world's field handles.
+ * Keys with no CPU storage type are skipped; resolve entity data with `world.storage(component)`.
+ */
+export function fields(component: Component): { name: string; field: FieldType }[] {
+    const out: { name: string; field: FieldType }[] = [];
+    for (const name of Object.keys(component)) {
+        const field = component[name];
+        if (isType(field)) out.push({ name, field });
+    }
+    return out;
+}
+
+/** @internal compare component storage shape independently of its field declaration order. */
+export function sameComponentSchema(a: Component, b: Component): boolean {
+    const af = fields(a).sort((left, right) => left.name.localeCompare(right.name));
+    const bf = fields(b).sort((left, right) => left.name.localeCompare(right.name));
+    if (af.length !== bf.length) return false;
+    for (let i = 0; i < af.length; i++) {
+        const left = af[i];
+        const right = bf[i];
+        if (left.name !== right.name || !sameTypeLayout(left.field, right.field)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+interface Declaration<C extends Component = Component> {
+    key: string;
+    component: C;
+    requires?: Component[];
+    presentation?: boolean;
+    defaults?: (world: World) => ComponentValues<C>;
+}
+
+const declarations = new WeakMap<Component, Declaration>();
+
+/**
+ * Declare an exact stable key with the defaults and companions a world applies on
+ * insertion once it registers the record, as listing it in a plugin's `components`
+ * does; `world.add` of an unlisted record writes neither. Returns the field record
+ * unchanged; metadata stays off its fields. Reloaded records with the same key
+ * share identity. One record cannot declare different keys.
+ */
+export function component<
+    C extends Component,
+    const V extends ComponentValues<C> = ComponentValues<C>,
+>(
+    key: string,
+    fields: C,
+    options?: {
+        /** Default scalar values or complete vector lanes, evaluated for each world that registers this record. */
+        defaults?: (world: World) => V & Record<Exclude<keyof V, keyof C>, never>;
+        /** Added when missing on insertion in a world that registers this record; removal leaves companions in place. */
+        requires?: Component[];
+        /** Exclude membership and fields from recovery. Neither values nor membership may be
+         * read by fixed systems or affect simulation. Restore keeps them current only on live
+         * identities that survive it; destroyed or recreated entities have none. Reused eids do
+         * not inherit membership. New insertion still applies defaults. Entity references remain
+         * current, are not remapped, and must be resolved against restored identities; their targets
+         * need not survive restore. A world with allocated storage refuses a declaration under the
+         * same key that changes this policy. */
+        presentation?: boolean;
+    },
+): C {
+    const previous = declarations.get(fields);
+    if (previous && previous.key !== key) {
+        throw new Error(`component "${previous.key}" cannot also declare "${key}"`);
+    }
+    intern(fields, key);
+    declarations.set(fields, { key, component: fields, ...options });
+    return fields;
+}
+
+/** @internal Refuse undeclared plugin records before composition or reload. */
+export function declaration(fields: Component, plugin: string): Declaration {
+    const entry = declarations.get(fields);
+    if (!entry) {
+        throw new Error(
+            `plugin "${plugin}" contains an undeclared component with fields [${Object.keys(fields).join(", ")}]`,
+        );
+    }
+    return entry;
+}
+
+/** @internal Whether this record declares state outside simulation recovery. */
+export function isPresentation(component: Component): boolean {
+    return declarations.get(component)?.presentation === true;
+}
+
+// Process-global identity survives world disposal and fresh records on module reload.
+// Weak keys keep identity off frozen schemas and do not retain unloaded records.
+const _idByComponent = new WeakMap<object, number>();
+const _idByName = new Map<string, number>();
+let _nextId = 0;
+
+/**
+ * the component's stable numeric id, the key for membership and query
+ * structures. Auto-mints an anonymous id for an unregistered component;
+ * {@link component} binds it by key at declaration so a reloaded handle (a fresh
+ * object) resolves to the same id.
+ */
+export function idOf(component: object): number {
+    const id = _idByComponent.get(component);
+    if (id !== undefined) return id;
+    const next = _nextId++;
+    _idByComponent.set(component, next);
+    return next;
+}
+
+/**
+ * Bind a record to the name's stable id, adopting its anonymous id when the name is new.
+ * Fresh records under the same name resolve to that id.
+ */
+export function intern(component: object, name: string): number {
+    let id = _idByName.get(name);
+    if (id === undefined) {
+        id = _idByComponent.get(component) ?? _nextId++;
+        _idByName.set(name, id);
+    }
+    _idByComponent.set(component, id);
+    return id;
+}
+
+const BITS_PER_GEN = 31;
+
+/** per-entity component membership, packed as bitsets across generations of 31-bit masks */
+export class Components {
+    private _nextBit = 0;
+    private _gen = 0;
+    // Stable ids let reloaded component records retain their membership bits.
+    private _meta: ({ gen: number; bit: number } | undefined)[] = [];
+    private _masks: number[][] = [[]];
+    // component id by generation and bit index, the inverse of _meta
+    private _owners: number[][] = [[]];
+    private _presentation: number[] = [];
+
+    /** @internal Capture membership without taking ownership of component assignments. */
+    snapshot() {
+        return {
+            masks: this._masks.map((m, gen) => m.map((mask) => mask & ~this._presentation[gen])),
+        };
+    }
+
+    private readonly _restored?: () => void;
+    private readonly _membership?: (id: number, eid: number, present: boolean) => void;
+    private readonly _queryChanged?: (id: number, eid: number) => void;
+    private readonly _survives: (eid: number) => boolean;
+
+    constructor(
+        restored?: () => void,
+        membership?: (id: number, eid: number, present: boolean) => void,
+        queryChanged?: (id: number, eid: number) => void,
+        survives: (eid: number) => boolean = () => false,
+    ) {
+        this._restored = restored;
+        this._membership = membership;
+        this._queryChanged = queryChanged;
+        this._survives = survives;
+    }
+
+    /** @internal Restore membership, updating queries before observers and tables. Every change
+     * is visited before the first error a visit threw propagates. */
+    restore(state: ReturnType<Components["snapshot"]>): void {
+        const before = this._masks;
+        this._masks = before.map((old, gen) => {
+            const next = state.masks[gen]?.slice() ?? [];
+            const presentation = this._presentation[gen] ?? 0;
+            for (let eid = 0; eid < old.length; eid++)
+                if (old[eid] & presentation && this._survives(eid))
+                    next[eid] = (next[eid] ?? 0) | (old[eid] & presentation);
+            return next;
+        });
+        if (this._queryChanged) this.reconcile(before, this._queryChanged);
+        this._restored?.();
+        if (this._membership) this.reconcile(before, this._membership);
+    }
+
+    private reconcile(
+        before: number[][],
+        visit: (id: number, eid: number, present: boolean) => void,
+    ): void {
+        let failure: { error: unknown } | undefined;
+        for (let gen = 0; gen < this._masks.length; gen++) {
+            const owners = this._owners[gen];
+            const old = before[gen];
+            const next = this._masks[gen];
+            for (let eid = 0; eid < Math.max(old.length, next.length); eid++) {
+                const current = next[eid] ?? 0;
+                let changed = (old[eid] ?? 0) ^ current;
+                while (changed) {
+                    const bit = changed & -changed;
+                    try {
+                        visit(owners[31 - Math.clz32(bit)], eid, (current & bit) !== 0);
+                    } catch (error) {
+                        failure ??= { error };
+                    }
+                    changed ^= bit;
+                }
+            }
+        }
+        if (failure) throw failure.error;
+    }
+
+    has(eid: Entity, component: any): boolean {
+        const m = this._meta[idOf(component)];
+        if (!m) return false;
+        return ((this._masks[m.gen][eid] ?? 0) & m.bit) !== 0;
+    }
+
+    add(eid: Entity, component: any): boolean {
+        const m = this.ensure(component);
+        const prev = this._masks[m.gen][eid] ?? 0;
+        if (prev & m.bit) return false;
+        this._masks[m.gen][eid] = prev | m.bit;
+        return true;
+    }
+
+    remove(eid: Entity, component: any): boolean {
+        const m = this._meta[idOf(component)];
+        if (!m) return false;
+        const prev = this._masks[m.gen][eid] ?? 0;
+        if (!(prev & m.bit)) return false;
+        this._masks[m.gen][eid] = prev & ~m.bit;
+        return true;
+    }
+
+    clear(eid: Entity): void {
+        for (let g = 0; g <= this._gen; g++) this._masks[g][eid] = 0;
+    }
+
+    /** @internal Write the ids of the components `eid` holds into `out`; returns their count. */
+    held(eid: Entity, out: number[]): number {
+        let count = 0;
+        for (let g = 0; g <= this._gen; g++) {
+            let mask = this._masks[g][eid] ?? 0;
+            const owners = this._owners[g];
+            while (mask) {
+                const bit = mask & -mask;
+                out[count++] = owners[31 - Math.clz32(bit)];
+                mask ^= bit;
+            }
+        }
+        return count;
+    }
+
+    private ensure(component: any) {
+        const id = idOf(component);
+        const existing = this._meta[id];
+        if (existing) return existing;
+        if (this._nextBit >= BITS_PER_GEN) {
+            this._gen++;
+            this._nextBit = 0;
+            this._masks.push([]);
+            this._owners.push([]);
+        }
+        this._owners[this._gen][this._nextBit] = id;
+        const m = { gen: this._gen, bit: 1 << this._nextBit++ };
+        this._meta[id] = m;
+        if (isPresentation(component))
+            this._presentation[m.gen] = (this._presentation[m.gen] ?? 0) | m.bit;
+        return m;
+    }
+}

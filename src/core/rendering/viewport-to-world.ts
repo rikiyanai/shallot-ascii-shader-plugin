@@ -1,0 +1,113 @@
+import { type Ray, Viewports, type World } from "../../engine";
+import { GlobalTransform } from "../transform";
+import { Camera, CameraMode, computeViewFromWorld } from "./camera";
+import { type CameraRect, cameraRect } from "./camera-viewport";
+import { composeRenderGlobalTransform } from "./global-transform";
+import { cameraView } from "./view";
+
+const _size = { x: 0, y: 0, width: 0, height: 0 };
+const _viewFromWorld = new Float32Array(16);
+const _worldFromView = new Float32Array(16);
+
+// The camera's clamped rectangle in target-coordinate pixels. Null without a non-empty target.
+function targetRect(world: World, camera: number): CameraRect | null {
+    const view = cameraView(world, camera);
+    if (!view) return null;
+    if (view.texture) {
+        _size.width = view.texture.width;
+        _size.height = view.texture.height;
+    } else {
+        const viewport = world.resource(Viewports).get(view.viewportIndex);
+        if (!viewport) return null;
+        _size.width = viewport.cssWidth;
+        _size.height = viewport.cssHeight;
+    }
+    cameraRect(world, camera, _size.width, _size.height, _size);
+    return _size.width > 0 && _size.height > 0 ? _size : null;
+}
+
+/** A world ray from fixed-tick camera placement through a pixel relative to the camera target's
+ * top-left: CSS pixels of its bound canvas, or pixels of its attached texture. The direction is
+ * normalized in world space; the origin lies on the view-space near plane (`z = -near`),
+ * transformed by the camera's full placement, including scale. Uses the clamped CameraViewport aspect
+ * when present, otherwise the target aspect, not a Resolution override. Returns null without camera placement or a non-empty target. Pointer hover and
+ * crosshair coordinates belong to the caller. */
+export function viewportToWorld(world: World, camera: number, x: number, y: number): Ray | null {
+    if (camera < 0 || !world.has(camera, Camera) || !world.has(camera, GlobalTransform))
+        return null;
+    const viewport = targetRect(world, camera);
+    if (!viewport) return null;
+    const width = viewport.width;
+    const height = viewport.height;
+    const ndcX = ((x - viewport.x) / width) * 2 - 1;
+    const ndcY = 1 - ((y - viewport.y) / height) * 2;
+    const aspect = width / height;
+    const params = world.storage(Camera);
+    const near = params.near.get(camera);
+    const orthographic = params.mode.get(camera) === CameraMode.Orthographic;
+    const extent = orthographic
+        ? params.size.get(camera)
+        : Math.tan((params.fov.get(camera) * DEG2RAD) / 2) * near;
+    const vx = ndcX * aspect * extent;
+    const vy = ndcY * extent;
+    const m = composeRenderGlobalTransform(world, camera, _worldFromView);
+    const dx = orthographic ? -m[8]! : m[0]! * vx + m[4]! * vy - m[8]! * near;
+    const dy = orthographic ? -m[9]! : m[1]! * vx + m[5]! * vy - m[9]! * near;
+    const dz = orthographic ? -m[10]! : m[2]! * vx + m[6]! * vy - m[10]! * near;
+    const len = Math.hypot(dx, dy, dz) || 1;
+    return {
+        origin: [
+            m[0]! * vx + m[4]! * vy - m[8]! * near + m[12]!,
+            m[1]! * vx + m[5]! * vy - m[9]! * near + m[13]!,
+            m[2]! * vx + m[6]! * vy - m[10]! * near + m[14]!,
+        ],
+        dir: [dx / len, dy / len, dz / len],
+    };
+}
+
+/** The pixel at which a world point appears, relative to the camera target's top-left, in the
+ * coordinates {@link viewportToWorld} takes: CSS pixels of a bound canvas, or pixels of an attached
+ * texture. Projects through the renderer's view of fixed-tick camera placement, scale included,
+ * with the clamped CameraViewport aspect when present, otherwise the target aspect, not a Resolution
+ * override. Returns null without camera placement or a non-empty target, and for a point the camera does not draw by view depth: nearer than `near`, or,
+ * orthographic, beyond `far`. A point outside the frame but in that depth range returns pixels
+ * outside the target. */
+export function worldToViewport(
+    world: World,
+    camera: number,
+    point: readonly [number, number, number],
+): [number, number] | null {
+    if (camera < 0 || !world.has(camera, Camera) || !world.has(camera, GlobalTransform))
+        return null;
+    const viewport = targetRect(world, camera);
+    if (!viewport) return null;
+    const params = world.storage(Camera);
+    // The renderer's own view-from-world, so a scaled camera projects and depth-tests as drawn.
+    computeViewFromWorld(world, camera, _viewFromWorld);
+    const m = _viewFromWorld;
+    const [x, y, z] = point;
+    const vx = m[0]! * x + m[4]! * y + m[8]! * z + m[12]!;
+    const vy = m[1]! * x + m[5]! * y + m[9]! * z + m[13]!;
+    const vz = m[2]! * x + m[6]! * y + m[10]! * z + m[14]!;
+    const depth = -vz;
+    if (!(depth >= params.near.get(camera))) return null;
+    const aspect = viewport.width / viewport.height;
+    let ndcX: number;
+    let ndcY: number;
+    if (params.mode.get(camera) === CameraMode.Orthographic) {
+        if (depth > params.far.get(camera)) return null;
+        const size = params.size.get(camera);
+        ndcX = vx / (size * aspect);
+        ndcY = vy / size;
+    } else {
+        const t = Math.tan((params.fov.get(camera) * DEG2RAD) / 2);
+        ndcX = vx / (depth * t * aspect);
+        ndcY = vy / (depth * t);
+    }
+    return [
+        viewport.x + ((ndcX + 1) / 2) * viewport.width,
+        viewport.y + ((1 - ndcY) / 2) * viewport.height,
+    ];
+}
+
+const DEG2RAD = Math.PI / 180;

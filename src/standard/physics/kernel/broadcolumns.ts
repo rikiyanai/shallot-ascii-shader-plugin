@@ -1,0 +1,140 @@
+import type { World } from "../../../engine";
+// crates/physics/src/broad.rs owns the resident broad phase. Reserves can move its columns;
+// refresh tree views after grow-capable calls, not per iteration.
+
+import type { WorldState } from "../world/world";
+import { kernel } from "./kernel";
+import type { DynamicTree } from "./treecolumns";
+import { KernelViews } from "./views";
+
+/** Slots in broad.rs's derived inspection record, not a second simulation tree. */
+const TREE_STRIDE = 12;
+/** Three derived tree images and the pair-membership table. */
+const N_BROAD = 4;
+
+const EMPTY_F = new Float32Array(0);
+const EMPTY_I = new Int32Array(0);
+const EMPTY_U = new Uint32Array(0);
+
+/**
+ * The resident broad-phase region's TS-side view manager. One per world. Holds references to the three
+ * dynamic trees and World so a refresh can rebind their column views.
+ */
+export class BroadStore extends KernelViews {
+    readonly worldId: number;
+    constructor(ecsState: World | undefined, worldId: number) {
+        super(ecsState);
+        this.worldId = worldId;
+        this.guardViews();
+    }
+
+    /** The three dynamic trees (static / kinematic / dynamic), set at broad-phase creation. */
+    trees: DynamicTree[] = [];
+    /** The owning world, set once the world is fully constructed (sibling-store refresh on a grow). */
+    world: WorldState | null = null;
+    initialization = { claimed: false };
+    #layout = EMPTY_U;
+
+    override captureCheckpoint() {
+        return { ...this.initialization };
+    }
+    override restoreCheckpoint(state: unknown): void {
+        Object.assign(this.initialization, state);
+    }
+
+    initialize(): void {
+        const world = this.world;
+        if (this.initialization.claimed || world === null) return;
+        this.initialization.claimed = true;
+        this.invalidateViews();
+    }
+
+    /** Select this World for native operations; rebind views only when the shared key changed. */
+    override refreshIfStale(): void {
+        const k = kernel(this.ecsState);
+        k.bodySetActiveWorld(this.worldId);
+        this.ensureViews();
+    }
+
+    /** Rebinds tree views without copying column contents. */
+    protected deriveViews(): void {
+        const k = kernel(this.ecsState);
+        k.bodySetActiveWorld(this.worldId);
+        const ptr = k.broadLayoutPtr() >>> 0;
+        const buf = k.memory.buffer;
+        if (this.#layout.buffer !== buf || this.#layout.byteOffset !== ptr)
+            this.#layout = new Uint32Array(buf, ptr, N_BROAD);
+        const layout = this.#layout;
+
+        for (let i = 0; i < 3; ++i) {
+            const t = this.trees[i];
+            if (t === undefined) continue;
+            const cap = k.broadTreeCap(i) >>> 0;
+            if (cap === 0) {
+                t.nf = EMPTY_F;
+                t.ni = EMPTY_I;
+                continue;
+            }
+            if (this.initialization.claimed) {
+                if (t.state.buffer !== buf || t.state.byteOffset !== layout[i])
+                    t.state = new Int32Array(buf, layout[i], 6);
+                t.residentState = true;
+            }
+            t.nodeCapacity = this.initialization.claimed ? cap : 0;
+            if (
+                t.nf.buffer !== buf ||
+                t.nf.byteOffset !== layout[i] + 24 ||
+                t.nf.length !== cap * TREE_STRIDE
+            ) {
+                t.nf = new Float32Array(buf, layout[i] + 24, cap * TREE_STRIDE);
+                t.ni = new Int32Array(buf, layout[i] + 24, cap * TREE_STRIDE);
+            }
+        }
+    }
+
+    reserveTreeWork(depth: number, words: number): number {
+        const k = kernel(this.ecsState);
+        const before = k.memory.buffer.byteLength;
+        const ptr = k.reserveTreeWork(depth, words) >>> 0;
+        this.refreshIfStale();
+        if (before !== k.memory.buffer.byteLength && this.world) {
+            this.world.manifoldStore.refreshViews();
+            this.world.bodyStore.refreshViews();
+            this.world.shapeStore.refreshViews();
+        }
+        return ptr;
+    }
+
+    /** Grow tree pool `i` to `nodeCapacity` nodes (grow-only), refreshing all views afterward. */
+    growTree(i: number, nodeCapacity: number): void {
+        this.reserve(
+            i === 0 ? nodeCapacity : 0,
+            i === 1 ? nodeCapacity : 0,
+            i === 2 ? nodeCapacity : 0,
+            0,
+        );
+    }
+
+    // Reallocation can move columns without growing memory; derive views after every reserve.
+    private reserve(capS: number, capK: number, capD: number, setCap: number): void {
+        if (this.world !== null) this.initialize();
+        else this.initialization.claimed = true;
+        const k = kernel(this.ecsState);
+        k.bodySetActiveWorld(this.worldId);
+        const grew = k.reserveBroad(capS, capK, capD, setCap) !== 0;
+        this.refreshViews();
+        if (grew) {
+            const w = this.world;
+            if (w !== null) {
+                w.manifoldStore.refreshViews();
+                w.bodyStore.refreshViews();
+                w.shapeStore.refreshViews();
+            }
+        }
+    }
+}
+
+/** Create an empty broad store for a new world. Its trees are registered by `createBroadPhase`. */
+export function createBroadStore(world: World | undefined, worldId: number): BroadStore {
+    return new BroadStore(world, worldId);
+}

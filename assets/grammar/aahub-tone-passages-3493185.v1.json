@@ -1,0 +1,336 @@
+{
+ "schema": "main-tone-passages.v1",
+ "font_sha256": "592bf6be803ed76311841b95a10b20db3df0ec693a15f858757d47420b9b3a28",
+ "source": "aahub-role-lookup-3493185.v1.json retained tone_core/tone_mid/tone_fringe/cast_shadow_edge/periodic_band entries; hand-authored-targets-20261029 fog 000 and tonemapping frame-000",
+ "preferred": {
+  "wall": {
+   "fringe": 30,
+   "mid": 32,
+   "core": 24,
+   "deep": 25,
+   "contact": 0
+  },
+  "round": {
+   "fringe": 14,
+   "mid": 19,
+   "core": 10,
+   "deep": 12,
+   "contact": 0
+  },
+  "ground": {
+   "fringe": 1,
+   "mid": 4,
+   "core": 0,
+   "deep": 0,
+   "contact": 0
+  }
+ },
+ "ladder": {
+  "wall": [
+   24,
+   32,
+   25,
+   30,
+   28
+  ]
+ },
+ "passages": [
+  {
+   "id": "ground/tone_fringe/:::",
+   "role": "tone_fringe",
+   "context": "ground",
+   "text": ":::",
+   "source": "sa-church126-wedge-thinning-tails",
+   "status": "skill-cited aa[126] tone-thinning comparison; lighting reading is the skill's analogy, not an operator region label",
+   "paper": "a diagonal paper stripe ~60-90 px wide stepping right ~15 px per row between the left rubble tails and the right masonry; no mark inside it"
+  },
+  {
+   "id": "ground/tone_fringe/: : :",
+   "role": "tone_fringe",
+   "context": "ground",
+   "text": ": : :",
+   "source": "an-r41-protected-negative-shape",
+   "status": "operator-labelled protected negative shape",
+   "paper": "a dome of blank paper carved out of the : : sky field by stepping each row's dots back, continued as a blank channel through the ＿ ＝ 三 water lines below"
+  },
+  {
+   "id": "ground/tone_fringe/:.:.:.",
+   "role": "tone_fringe",
+   "context": "ground",
+   "text": ":.:.:.",
+   "source": "sa-church126-wedge-thinning-tails",
+   "status": "skill-cited aa[126] tone-thinning comparison; lighting reading is the skill's analogy, not an operator region label",
+   "paper": "a diagonal paper stripe ~60-90 px wide stepping right ~15 px per row between the left rubble tails and the right masonry; no mark inside it"
+  },
+  {
+   "id": "ground/tone_mid/:::",
+   "role": "tone_mid",
+   "context": "ground",
+   "text": ":::",
+   "source": "an-r41-protected-negative-shape",
+   "status": "operator-labelled protected negative shape",
+   "paper": "a dome of blank paper carved out of the : : sky field by stepping each row's dots back, continued as a blank channel through the ＿ ＝ 三 water lines below"
+  },
+  {
+   "id": "ground/tone_mid/.:.:.:",
+   "role": "tone_mid",
+   "context": "ground",
+   "text": ".:.:.:",
+   "source": "sa-church126-rubble-tone-mid",
+   "status": "skill-cited aa[126] tone-thinning comparison; no operator region label",
+   "paper": "a ~14 px gap between the rubble field and the column `|:::|` on every row"
+  },
+  {
+   "id": "round/tone_core/:::",
+   "role": "tone_core",
+   "context": "round",
+   "text": ":::",
+   "source": "fc-eye-large-pair-5r",
+   "status": "catalog entry; not operator-approved (component-library membership only, no operator note recorded)",
+   "paper": "between the outer almond (`／`/`《`/`ヾ`/`^ー──‐`) and the iris `{:::i:::::i:::}`"
+  },
+  {
+   "id": "round/tone_core/...",
+   "role": "tone_core",
+   "context": "round",
+   "text": "...",
+   "source": "sa-cup176-plate-right-turn",
+   "status": "operator example drawing (operator_reference_sources.v1.json aramaki-cup-plate-surface-following-tone, whole-drawing note quoted); no written region label for this region; TXT verified identical to archive e8e2f681 aa[176]",
+   "paper": "the narrow gap between the plate-top dots and the cast-shadow dots is the plate edge; it stays empty except `` ` ``, `!`, `,: '`"
+  },
+  {
+   "id": "round/tone_core/;;;",
+   "role": "tone_core",
+   "context": "round",
+   "text": ";;;",
+   "source": "an-t188-good-rim-edge",
+   "status": "bare operator label 'good'; per the skill's #188 reading it approves an edge passage that itself includes some tone",
+   "paper": "the ground left and below the rim (rows 24-27 left of ／ / ﾉ) stays open with only a few . \" ticks"
+  },
+  {
+   "id": "round/tone_core/.:.:.:",
+   "role": "tone_core",
+   "context": "round",
+   "text": ".:.:.:",
+   "source": "sr-p37-vase-rim-lobes",
+   "status": "operator circle My MLT member, cited by the skill's rounded-constructions table; no operator region label",
+   "paper": "the vase's body between ｉ´ and ｀ｉ; dots .:.:.: only in the mouth"
+  },
+  {
+   "id": "round/tone_core/:;:;:;",
+   "role": "tone_core",
+   "context": "round",
+   "text": ":;:;:;",
+   "source": "target:tonemapping/000",
+   "status": "hand-authored target",
+   "paper": "authored passage"
+  },
+  {
+   "id": "round/tone_core/.:;:;:;",
+   "role": "tone_core",
+   "context": "round",
+   "text": ".:;:;:;",
+   "source": "target:tonemapping/000",
+   "status": "hand-authored target",
+   "paper": "authored sphere passage"
+  },
+  {
+   "id": "round/tone_core/.:;:;:;:;",
+   "role": "tone_core",
+   "context": "round",
+   "text": ".:;:;:;:;",
+   "source": "target:tonemapping/000",
+   "status": "hand-authored target",
+   "paper": "authored sphere passage"
+  },
+  {
+   "id": "round/tone_fringe/:::",
+   "role": "tone_fringe",
+   "context": "round",
+   "text": ":::",
+   "source": "an-t126-deliberate-rim-dots",
+   "status": "operator-labelled deliberate dot placement",
+   "paper": "everything right of the 3-5 dot run inside each lobe stays empty; dots never cross into the next lobe"
+  },
+  {
+   "id": "round/tone_fringe/. :",
+   "role": "tone_fringe",
+   "context": "round",
+   "text": ". :",
+   "source": "target:tonemapping/000",
+   "status": "hand-authored target",
+   "paper": "authored sphere passage"
+  },
+  {
+   "id": "round/tone_fringe/: : :",
+   "role": "tone_fringe",
+   "context": "round",
+   "text": ": : :",
+   "source": "fc-eye-large-iris-dotted-3r",
+   "status": "catalog entry; not operator-approved (component-library membership only, no operator note recorded)",
+   "paper": "paper ring inside `（ ）` around the filled `●`, and between the `: :` dots"
+  },
+  {
+   "id": "round/tone_fringe/.:.:.:",
+   "role": "tone_fringe",
+   "context": "round",
+   "text": ".:.:.:",
+   "source": "an-t126-deliberate-rim-dots",
+   "status": "operator-labelled deliberate dot placement",
+   "paper": "everything right of the 3-5 dot run inside each lobe stays empty; dots never cross into the next lobe"
+  },
+  {
+   "id": "round/tone_mid/:::",
+   "role": "tone_mid",
+   "context": "round",
+   "text": ":::",
+   "source": "fc-eye-large-iris-dotted-3r",
+   "status": "catalog entry; not operator-approved (component-library membership only, no operator note recorded)",
+   "paper": "paper ring inside `（ ）` around the filled `●`, and between the `: :` dots"
+  },
+  {
+   "id": "round/tone_mid/...",
+   "role": "tone_mid",
+   "context": "round",
+   "text": "...",
+   "source": "an-t73-sunset-sky-gradient",
+   "status": "operator note approves the downward-thinning sky dots (the cloud dots in the same piece are rejected and are outside this window)",
+   "paper": "gaps widen row by row toward the bottom; the cloud interior at the right edge (rows 5-6 `(`, `(⌒`) gets no sky dots"
+  },
+  {
+   "id": "round/tone_mid/:.:;:",
+   "role": "tone_mid",
+   "context": "round",
+   "text": ":.:;:",
+   "source": "target:tonemapping/000",
+   "status": "hand-authored target",
+   "paper": "authored sphere passage"
+  },
+  {
+   "id": "round/tone_mid/.:.:.:",
+   "role": "tone_mid",
+   "context": "round",
+   "text": ".:.:.:",
+   "source": "an-r24-cloud-volume-dots",
+   "status": "operator-labelled deliberate dots communicating volume",
+   "paper": "the upper part of every cloud lobe under its ⌒ cap is blank; dots gather only in the lower/shadow part and between lobes"
+  },
+  {
+   "id": "round/tone_mid/:.:.:.",
+   "role": "tone_mid",
+   "context": "round",
+   "text": ":.:.:.",
+   "source": "an-r24-cloud-volume-dots",
+   "status": "operator-labelled deliberate dots communicating volume",
+   "paper": "the upper part of every cloud lobe under its ⌒ cap is blank; dots gather only in the lower/shadow part and between lobes"
+  },
+  {
+   "id": "round/tone_mid/:.::.:",
+   "role": "tone_mid",
+   "context": "round",
+   "text": ":.::.:",
+   "source": "sh-lib23-rim-dot-band",
+   "status": "catalog entry; not operator-approved",
+   "paper": "the centre (rows 3-8) is open paper"
+  },
+  {
+   "id": "wall/tone_core/:::",
+   "role": "tone_core",
+   "context": "wall",
+   "text": ":::",
+   "source": "sk-smoke9-twin-dome-y",
+   "status": "same cited piece (res9); this construction is not the cited lit-wall feature; no operator note. Smoke contour-first recipe (SKILL 15.7) is specific to outline-dominant smoke/lobe designs; still reference, no lifecycle/animation evidence.",
+   "paper": "none inside the lobes (filled `::::`); only between `≧====´` and `｀====≦` under the bridge"
+  },
+  {
+   "id": "wall/tone_core/:;:;:",
+   "role": "tone_core",
+   "context": "wall",
+   "text": ":;:;:",
+   "source": "target:fog/000",
+   "status": "hand-authored target",
+   "paper": "authored wall/box passage"
+  },
+  {
+   "id": "wall/tone_core/.:.:.:",
+   "role": "tone_core",
+   "context": "wall",
+   "text": ".:.:.:",
+   "source": "an-r37-lobe-wisp-junction",
+   "status": "operator-labelled junction compatibility",
+   "paper": "no gap between ) and ～: the lobe end and the wisp share one joint; paper under the ⌒ cap"
+  },
+  {
+   "id": "wall/tone_core/:.:.:.",
+   "role": "tone_core",
+   "context": "wall",
+   "text": ":.:.:.",
+   "source": "an-t94-lobe-junction-dots",
+   "status": "operator keeps the junction; the .:.: dots in the same rows are labelled bad and are not part of the transfer",
+   "paper": "right of the lobes (rows 6-8) is empty paper; the .:.: field fills the left side (rejected)"
+  },
+  {
+   "id": "wall/tone_core/:;:;:;",
+   "role": "tone_core",
+   "context": "wall",
+   "text": ":;:;:;",
+   "source": "target:fog/000",
+   "status": "hand-authored target",
+   "paper": "authored passage"
+  },
+  {
+   "id": "wall/tone_fringe/. .",
+   "role": "tone_fringe",
+   "context": "wall",
+   "text": ". .",
+   "source": "target:fog/000",
+   "status": "hand-authored target",
+   "paper": "authored wall/box passage"
+  },
+  {
+   "id": "wall/tone_fringe/: : :",
+   "role": "tone_fringe",
+   "context": "wall",
+   "text": ": : :",
+   "source": "sa-basement073-pillar-flank-paper",
+   "status": "operator-supplied crop source; no written region label",
+   "paper": "two open regions: left between the thick band (`,ｲﾆア゜`→`/ﾆ'′`) and the thin inner rib (`'゜`, `,､-:`, `｣`); right between the pillar marks (`/`, `∨/`, `V/`, `|`) and the band (`寸ム`, `寸ﾊ`, `Ⅵｉ`)"
+  },
+  {
+   "id": "wall/tone_fringe/. : .",
+   "role": "tone_fringe",
+   "context": "wall",
+   "text": ". : .",
+   "source": "target:fog/000",
+   "status": "hand-authored target",
+   "paper": "authored wall/box passage"
+  },
+  {
+   "id": "wall/tone_mid/:::",
+   "role": "tone_mid",
+   "context": "wall",
+   "text": ":::",
+   "source": "sk-madonna-kawa-veil-edge",
+   "status": "skill-cited glyphs `川` and `!ﾘ` (Madonna rows 9–24); interpretation of the lines is an agent reading; no operator rejection recorded",
+   "paper": "narrow gaps (≈6-9px) between the diverging stroke lines below `川`; left of the colon-pair column"
+  },
+  {
+   "id": "wall/tone_mid/:;:",
+   "role": "tone_mid",
+   "context": "wall",
+   "text": ":;:",
+   "source": "target:fog/000",
+   "status": "hand-authored target",
+   "paper": "authored wall/box passage"
+  },
+  {
+   "id": "wall/tone_mid/:::.:::.",
+   "role": "tone_mid",
+   "context": "wall",
+   "text": ":::.:::.",
+   "source": "sk-madonna-right-shoulder-paper",
+   "status": "skill-cited open paper beside bounded strips (rows 9–24); no operator rejection recorded",
+   "paper": "a wedge between the contour and the dot columns, widening to ~60px at rows 17–18; no dot touches the contour"
+  }
+ ]
+}

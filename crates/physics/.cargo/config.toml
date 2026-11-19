@@ -1,0 +1,6 @@
+# Leave target selection to the build script so bare cargo test runs on the host
+# and exercises the scalar FloatW fallback.
+[target.wasm32-unknown-unknown]
+# Strip the workspace-member prefix so embedded panic paths read src/x.rs.
+# crates/physics/scripts/build-kernel.ts supplies RUSTFLAGS; keep its flags aligned.
+rustflags = ["-C", "target-feature=+simd128", "--remap-path-prefix=crates/physics/="]

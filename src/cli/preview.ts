@@ -1,0 +1,116 @@
+import { execSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { constants } from "node:os";
+import { basename, posix, relative, resolve } from "node:path";
+import { nativeOutDir } from "../native";
+import { normalizePath } from "../project";
+
+export type PreviewTarget =
+    | { kind: "mac" }
+    | { kind: "linux" }
+    | { kind: "windows" }
+    | { kind: "unknown"; target: string };
+
+export function resolvePreviewTarget(target: string): PreviewTarget {
+    if (target === "mac") return { kind: "mac" };
+    if (target === "linux") return { kind: "linux" };
+    if (target === "windows") return { kind: "windows" };
+    return { kind: "unknown", target };
+}
+
+/** the linux launch env: portable builds resolve `libcef.so` from their bundled `cef/` dir. */
+export function linuxPreviewEnv(
+    outputDir: string,
+    portable: boolean,
+    baseEnv: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+    const env = { ...baseEnv };
+    if (portable) {
+        // LD_LIBRARY_PATH is Linux syntax whatever host computes it.
+        const cefLibDir = posix.join(outputDir, "cef");
+        env.LD_LIBRARY_PATH = `${cefLibDir}:${env.LD_LIBRARY_PATH || ""}`;
+    }
+    return env;
+}
+
+/** the powershell.exe command line that launches a windows build from WSL, given its host path. */
+export function windowsPreviewCommand(winPath: string, projectName: string): string {
+    return `cd '${winPath}'; .\\${projectName}.exe`;
+}
+
+function requireBuild(projectDir: string, target: string, artifact: string): void {
+    if (existsSync(artifact)) return;
+    throw new Error(
+        `no ${target} build found at ${normalizePath(relative(projectDir, artifact))}; run \`shallot build --target ${target}\` first.`,
+    );
+}
+
+export async function previewProject(
+    projectDir: string,
+    opts: { target: string; release?: boolean; portable?: boolean; devUrl?: string },
+): Promise<number> {
+    const target = resolvePreviewTarget(opts.target);
+    const release = opts.release ?? false;
+    const portable = opts.portable ?? false;
+
+    if (target.kind === "unknown") {
+        console.error(`unknown target: ${target.target}`);
+        console.error("See `shallot preview --help` for available targets and options.");
+        return 1;
+    }
+
+    const name = basename(projectDir);
+    const outputDir = nativeOutDir(
+        projectDir,
+        target.kind,
+        release,
+        portable,
+        Boolean(opts.devUrl),
+    );
+    const artifact =
+        target.kind === "mac"
+            ? resolve(outputDir, `${name}.app`)
+            : resolve(outputDir, `${name}${target.kind === "windows" ? ".exe" : ""}`);
+    requireBuild(projectDir, target.kind, artifact);
+    const env = {
+        ...process.env,
+        ...(opts.devUrl ? { SHALLOT_DEV_URL: opts.devUrl } : {}),
+    };
+
+    if (target.kind === "mac") {
+        console.log(`\n  running ${name}...\n`);
+        const command = opts.devUrl
+            ? [resolve(artifact, "Contents", "MacOS", name)]
+            : ["open", "-W", artifact];
+        return run(command, { env });
+    }
+
+    if (target.kind === "linux") {
+        console.log(`\n  running ${name}...\n`);
+        const launchEnv = linuxPreviewEnv(outputDir, portable, env);
+        return run([artifact], { env: launchEnv });
+    }
+
+    console.log(`\n  running ${name}...\n`);
+    if (process.platform === "win32") {
+        return run([artifact], { cwd: outputDir, env });
+    }
+    // From WSL, Windows builds launch through the host's PowerShell.
+    const winPath = execSync(`wslpath -w "${outputDir}"`, { encoding: "utf-8" }).trim();
+    const cmd = windowsPreviewCommand(winPath, name);
+    return run(["powershell.exe", "-Command", cmd], { env });
+}
+
+/** Run the shell with the CLI's own stdio, so its output reaches the caller while it runs, not after it exits. */
+async function run(
+    command: string[],
+    options: { cwd?: string; env: Record<string, string | undefined> },
+): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const child = spawn(command[0]!, command.slice(1), { ...options, stdio: "inherit" });
+        child.once("error", reject);
+        child.once("exit", (code, signal) =>
+            resolve(code ?? (signal ? 128 + constants.signals[signal] : 1)),
+        );
+    });
+}

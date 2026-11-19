@@ -1,0 +1,252 @@
+import type { World } from "../../../engine";
+import type { AABB } from "../common/records";
+import type { ShapeDef, ShapeType, SurfaceMaterial } from "../common/types";
+import type { Shape } from "../shapes/shape";
+import type { WorldState } from "../world/world";
+import { kernel } from "./kernel";
+// crates/physics/src/shapes.rs owns World-local shape records; a slot is fixed for its life.
+// Lifecycle writes must reach the resident record immediately: finalize reads it without a marshal.
+// Reserves can reallocate columns or grow memory; callers refresh views afterward.
+
+import { KernelViews } from "./views";
+
+/** Word stride of one kernel shape record, mirroring `shapes.rs`. */
+export const SHAPE_STRIDE = 50;
+const FAT_STRIDE = 6;
+/** b3Shape union: inline sphere or capsule, data reference plus mesh scale, or data reference. Its
+ * first word is the retained hull pointer or non-convex pool word offset. */
+export const S_GEO_REFERENCE = 42;
+
+/** Surface material: friction, restitution, rolling, tangent xyz, u64 user id and color. */
+export const MATERIAL_STRIDE = 10;
+
+/** Allocate a world-local shape slot in the kernel pool. The shape record itself is authored below,
+ * but index reuse, generation and validity are never decided by TypeScript. */
+export function createShapeSlot(
+    world: WorldState,
+    body: number,
+    type: ShapeType,
+    def: ShapeDef,
+): number {
+    const flags =
+        Number(def.enableSensorEvents) |
+        (Number(def.enableContactEvents) << 1) |
+        (Number(def.enableCustomFiltering) << 2) |
+        (Number(def.enableHitEvents) << 3) |
+        (Number(def.enablePreSolveEvents) << 4) |
+        (Number(def.enableSpeculativeContact) << 6);
+    const id = kernel(world.ecsState).shapeCreate(
+        world.worldId,
+        body,
+        type,
+        def.density,
+        def.explosionScale,
+        flags,
+    );
+    return id;
+}
+
+/**
+ * World-owned shape views. Re-derives views when the shared kernel key changes.
+ */
+export class ShapeStore extends KernelViews {
+    private readonly _worldId: number;
+
+    constructor(ecsState: World | undefined, worldId: number) {
+        super(ecsState);
+        this._worldId = worldId;
+        this.guardViews();
+    }
+
+    /** Resident shape column as u32 (type + nextShapeId). Re-derived after every grow. */
+    shapeU = new Uint32Array(0);
+    /** The same bytes as f32 — the geometry payload's natural type. */
+    shapeF = new Float32Array(0);
+    /** Broad-phase bounds live in their own packed column, indexed by shape id. */
+    fatF = new Float32Array(0);
+    /** Borrowed synchronous geometry result; copied before another kernel call. */
+    geometryOutput = new Float32Array(0);
+    /** Addressable memory for inline materials and owned contiguous material arrays. */
+    materialU = new Uint32Array(0);
+    materialF = new Float32Array(0);
+    private _materialData = new DataView(new ArrayBuffer(0));
+    // BigInts are reused while a material address holds the same user-id words.
+    private readonly _ids = new Map<number, { low: number; high: number; value: bigint }>();
+    private _layout = new Uint32Array(0);
+
+    // Shape/material lifecycle metadata and contents are entirely native region data.
+    captureCheckpoint(): null {
+        return null;
+    }
+    restoreCheckpoint(_state: unknown): void {}
+
+    /** Re-derive the column views over the current region. No-op before the kernel first reserves
+     * shapes, and when the buffer, offset and capacity are those the views were derived at. */
+    protected deriveViews(): void {
+        const k = kernel(this.ecsState);
+        k.shapeSetActiveWorld(this._worldId);
+        const cap = k.shapeCap() >>> 0;
+        if (cap === 0) return;
+        const buf = k.memory.buffer;
+        const ptr = k.shapeLayoutPtr() >>> 0;
+        if (this._layout.buffer !== buf || this._layout.byteOffset !== ptr)
+            this._layout = new Uint32Array(buf, ptr, 3);
+        const layout = this._layout;
+        if (
+            this.shapeU.buffer !== buf ||
+            this.shapeU.byteOffset !== layout[0] ||
+            this.shapeU.length !== cap * SHAPE_STRIDE
+        ) {
+            this.shapeU = new Uint32Array(buf, layout[0], cap * SHAPE_STRIDE);
+            this.shapeF = new Float32Array(buf, layout[0], cap * SHAPE_STRIDE);
+        }
+        if (
+            this.fatF.buffer !== buf ||
+            this.fatF.byteOffset !== layout[2] ||
+            this.fatF.length !== cap * FAT_STRIDE
+        )
+            this.fatF = new Float32Array(buf, layout[2], cap * FAT_STRIDE);
+        if (this.geometryOutput.buffer !== buf)
+            this.geometryOutput = new Float32Array(buf, k.shapeGeometryOutputPtr() >>> 0, 13);
+        if (this.materialU.buffer !== buf || this.materialU.byteLength !== buf.byteLength) {
+            this.materialU = new Uint32Array(buf);
+            this.materialF = new Float32Array(buf);
+            this._materialData = new DataView(buf);
+        }
+    }
+
+    /** Copy authored materials into the shape's inline material or owned contiguous array. */
+    writeMaterials(
+        world: WorldState,
+        shape: Shape,
+        materials: SurfaceMaterial[] | SurfaceMaterial,
+    ): void {
+        const count = Array.isArray(materials) ? materials.length : 1;
+        const ptr =
+            kernel(world.ecsState).shapeAllocateMaterials(world.worldId, shape, count) >>> 0;
+        for (let i = 0; i < count; ++i) {
+            const o = ptr / 4 + i * MATERIAL_STRIDE;
+            const m = Array.isArray(materials) ? materials[i] : materials;
+            this._materialData.setBigUint64((o + 6) * 4, m.userMaterialId, true);
+            kernel(world.ecsState).shapeMaterialSet(
+                world.worldId,
+                shape,
+                i,
+                m.friction,
+                m.restitution,
+                m.rollingResistance,
+                m.tangentVelocity[0],
+                m.tangentVelocity[1],
+                m.tangentVelocity[2],
+                this.materialU[o + 6],
+                this.materialU[o + 7],
+                m.customColor,
+            );
+        }
+    }
+
+    /** Material record `id`'s user material id, built once per distinct value of its id words. */
+    userMaterialId(id: number): bigint {
+        const o = id;
+        const material = this.materialU;
+        const low = material[o + 6];
+        const high = material[o + 7];
+        let cached = this._ids.get(id);
+        if (!cached || cached.low !== low || cached.high !== high) {
+            cached = { low, high, value: BigInt(low) | (BigInt(high) << 32n) };
+            this._ids.set(id, cached);
+        }
+        if (cached.value < 0n || cached.value > 0xffffffffffffffffn)
+            cached.value = this._materialData.getBigUint64((o + 6) * 4, true);
+        return cached.value;
+    }
+
+    /** Copy one live inline or owned material into caller-owned scratch. */
+    readMaterialAt(shape: Shape, index: number, out: SurfaceMaterial): SurfaceMaterial {
+        this.ensureViews();
+        const k = kernel(this.ecsState);
+        const count = k.shapeMaterialCount(this._worldId, shape) >>> 0;
+        if (count === 0) throw new Error(`physics: no material on shape ${shape}`);
+        if (index < 0 || index >= count)
+            throw new Error(`physics: no material ${index} on shape ${shape}`);
+        const o = (k.shapeMaterialPtr(this._worldId, shape) >>> 0) / 4 + index * MATERIAL_STRIDE;
+        const f = this.materialF;
+        out.friction = f[o];
+        out.restitution = f[o + 1];
+        out.rollingResistance = f[o + 2];
+        out.tangentVelocity[0] = f[o + 3];
+        out.tangentVelocity[1] = f[o + 4];
+        out.tangentVelocity[2] = f[o + 5];
+        out.userMaterialId = this.userMaterialId(o);
+        out.customColor = this.materialU[o + 8];
+        return out;
+    }
+
+    /** Read a material's user id without constructing a TypeScript material copy. */
+    userMaterialIdAt(shape: Shape, index: number): bigint {
+        const k = kernel(this.ecsState);
+        if (k.shapeMaterialCount(this._worldId, shape) >>> 0 === 0) return 0n;
+        const o = (k.shapeMaterialPtr(this._worldId, shape) >>> 0) / 4 + index * MATERIAL_STRIDE;
+        return this.userMaterialId(o);
+    }
+}
+
+/** Create an empty shape store for a new world. Its views are derived on the first write. */
+export function createShapeStore(world: World | undefined, worldId: number): ShapeStore {
+    return new ShapeStore(world, worldId);
+}
+
+/** Read live materials from the kernel. The returned objects are bridge values;
+ * simulation decisions always re-read this column rather than a Shape.materials authoring array. */
+export function readShapeMaterials(world: WorldState, shape: Shape): SurfaceMaterial[] {
+    const k = kernel(world.ecsState);
+    k.shapeSetActiveWorld(world.worldId);
+    const count = k.shapeMaterialCount(world.worldId, shape) >>> 0;
+    if (count === 0) return [];
+    const ptr = k.shapeMaterialPtr(world.worldId, shape) >>> 0;
+    const buf = k.memory.buffer;
+    const u = new Uint32Array(buf, ptr, count * MATERIAL_STRIDE);
+    const f = new Float32Array(buf, ptr, count * MATERIAL_STRIDE);
+    const out: SurfaceMaterial[] = [];
+    for (let i = 0; i < count; ++i) {
+        const o = i * MATERIAL_STRIDE;
+        const bits = BigInt(u[o + 6]) | (BigInt(u[o + 7]) << 32n);
+        out.push({
+            friction: f[o],
+            restitution: f[o + 1],
+            rollingResistance: f[o + 2],
+            tangentVelocity: [f[o + 3], f[o + 4], f[o + 5]],
+            userMaterialId: BigInt.asUintN(64, bits),
+            customColor: u[o + 8],
+        });
+    }
+    return out;
+}
+
+/** The authoritative live material count for a shape. */
+export function shapeMaterialCount(world: WorldState, shape: Shape): number {
+    const k = kernel(world.ecsState);
+    return k.shapeMaterialCount(world.worldId, shape) >>> 0;
+}
+
+/** Copy the kernel-owned tight bounds into caller-owned scratch. */
+export function readShapeAabb(world: WorldState, shapeId: number, out: AABB): AABB {
+    world.shapeStore.ensureViews();
+    return readBounds(world.shapeStore.shapeF, shapeId * SHAPE_STRIDE + 10, out);
+}
+
+/** Copy the kernel-owned fat bounds into caller-owned scratch. */
+export function readFatAabb(world: WorldState, shapeId: number, out: AABB): AABB {
+    world.shapeStore.ensureViews();
+    return readBounds(world.shapeStore.fatF, shapeId * FAT_STRIDE, out);
+}
+
+function readBounds(f: Float32Array, o: number, out: AABB): AABB {
+    out.lowerBound.x = f[o];
+    out.lowerBound.y = f[o + 1];
+    out.lowerBound.z = f[o + 2];
+    out.upperBound.x = f[o + 3];
+    out.upperBound.y = f[o + 4];
+    out.upperBound.z = f[o + 5];
+    return out;
+}

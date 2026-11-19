@@ -1,0 +1,97 @@
+import type { EntityRef, Resource, World } from "../../engine";
+import { CONTACT_RECYCLE_DISTANCE } from "./common/constants";
+import { defaultWorldDef, type WorldDef } from "./common/types";
+
+export type WorldCustomFilterCallback = (
+    world: World,
+    shapeA: EntityRef,
+    shapeB: EntityRef,
+) => boolean;
+export type WorldPreSolveCallback = (
+    world: World,
+    shapeA: EntityRef,
+    shapeB: EntityRef,
+    point: { x: number; y: number; z: number },
+    normal: { x: number; y: number; z: number },
+) => boolean;
+export type WorldMixCallback = (
+    world: World,
+    valueA: number,
+    materialIdA: bigint,
+    valueB: number,
+    materialIdB: bigint,
+) => number;
+
+/** The replaceable simulation's Box3D world settings and the stepped world policy. */
+export type PhysicsWorldDefinitionConfig = Omit<
+    WorldDef,
+    "userData" | "frictionCallback" | "restitutionCallback"
+> & {
+    /** Solver threads including the calling thread; absent selects the host default. Read at build only. */
+    workerCount?: number;
+    /**
+     * Shared kernel's maximum linear memory in bytes, a multiple of 64 KiB, from the module's initial
+     * memory through 4 GiB. Defaults to 1 GiB; read at build only. Does not affect the unshared kernel.
+     * Hosts that reserve the maximum up front pay for a larger value even before memory grows
+     * (https://bugs.webkit.org/show_bug.cgi?id=255103).
+     */
+    maximumMemory?: number;
+    /** Solver substeps per automatic step. Box3D's recommended default is four. */
+    subStepCount: number;
+    /** Whether contact and joint impulses are warm-started. */
+    enableWarmStarting: boolean;
+    /** Whether mesh contacts may use speculative points. */
+    enableSpeculative: boolean;
+    /**
+     * Automatically solve once per fixed tick; defaults true. Disable to step only through `stepPhysics`.
+     * Disabling does not transfer the ordering of SyncPhysicsWorldDefinitionSystem, SyncSystem,
+     * SyncPhysicsConstraintsSystem or CharacterPlugin's MoveCharactersSystem before StepPhysicsSystem.
+     * Call `stepPhysics` in a fixed system with `after: [StepPhysicsSystem]` to follow those producers.
+     */
+    enableAutomaticStep: boolean;
+    /** Contact separation at which a contact is recycled. */
+    contactRecycleDistance: number;
+    /** Optional collision-pair filter, called at the solver's serial callback point. */
+    customFilterCallback: WorldCustomFilterCallback | null;
+    /** Optional contact inspection, called at the solver's serial callback point. */
+    preSolveCallback: WorldPreSolveCallback | null;
+    /** Optional friction mixing rule; omitted means Box3D's geometric-mean default. */
+    frictionCallback: WorldMixCallback | null;
+    /** Optional restitution mixing rule; omitted means Box3D's maximum-value default. */
+    restitutionCallback: WorldMixCallback | null;
+};
+
+/**
+ * World-owned authoring resource for the complete standard-physics simulation definition.
+ * Mutate it directly; standard physics compares it with its live solver settings before each
+ * fixed step, so writes survive frames that contain no fixed tick. Host-owned data and task-system
+ * callbacks are omitted; capacity only affects the world's initial reservation.
+ */
+export const PhysicsWorldDefinition: Resource<PhysicsWorldDefinitionConfig> = {
+    create: () => {
+        const definition = defaultWorldDef();
+        return {
+            ...definition,
+            gravity: { ...definition.gravity },
+            subStepCount: 4,
+            enableWarmStarting: true,
+            enableSpeculative: true,
+            enableAutomaticStep: true,
+            contactRecycleDistance: CONTACT_RECYCLE_DISTANCE,
+            customFilterCallback: null,
+            preSolveCallback: null,
+            frictionCallback: null,
+            restitutionCallback: null,
+        };
+    },
+};
+
+export function copyPhysicsWorldDefinition(
+    definition: PhysicsWorldDefinitionConfig,
+): PhysicsWorldDefinitionConfig {
+    return {
+        ...definition,
+        gravity: { ...definition.gravity },
+        capacity: definition.capacity ? { ...definition.capacity } : undefined,
+    };
+}

@@ -1,0 +1,395 @@
+import tgpu from "typegpu";
+import * as d from "typegpu/data";
+import * as std from "typegpu/std";
+import {
+    CULL_FRUSTUM,
+    CULL_VOLUME_FLOATS,
+    CullVolumes,
+    Xform,
+    xformPoint,
+} from "../../core/rendering";
+import { HANDLE_INDEX_MASK } from "../../engine/utils";
+import { batchResolver } from "./material-batch";
+import { EntityMeshInstanceInput } from "./material-data";
+import { ALPHA_PIPELINE_KEY_COUNT, AlphaModeCode, AlphaPipelineKey } from "./material-type";
+import { DrawIndexedIndirect } from "./registry";
+
+// Raw compute passes bind by index, so layouts pin their group indices rather than relying on resolve order.
+
+/** dense MeshInstance row counts and view/pair dimensions, written once per changed frame @internal */
+export const CullParams = d.struct({
+    viewCount: d.u32,
+    pairCount: d.u32,
+    meshCount: d.u32,
+    instanceCount: d.u32,
+    instanceCapacity: d.u32,
+    /** keys per material batch in pair indices: six alpha pipeline keys per cull mode held */
+    keyCount: d.u32,
+});
+
+/** Generation and bounds share one binding, indexed by the dense handle index. @internal */
+export const MeshBounds = d.struct({ sphere: d.vec4f, handle: d.u32 });
+
+/** shared dense inputs for count + scatter, plus mesh bounds and per-view cull volumes @internal */
+export const cullLayout = tgpu
+    .bindGroupLayout({
+        instanceRows: { storage: d.arrayOf(d.vec2u), access: "readonly" },
+        instances: { storage: d.arrayOf(EntityMeshInstanceInput), access: "readonly" },
+        globalTransforms: { storage: d.arrayOf(Xform), access: "readonly" },
+        globalTransformRows: { storage: d.arrayOf(d.u32), access: "readonly" },
+        meshBounds: { storage: d.arrayOf(MeshBounds), access: "readonly" },
+        materialBatches: { storage: d.arrayOf(d.u32), access: "readonly" },
+        cullVolumes: { uniform: CullVolumes },
+        params: { uniform: CullParams },
+    })
+    .$idx(0);
+
+/** the count pass's own output: one atomic tally per (view slot, pair) @internal */
+export const countLayout = tgpu
+    .bindGroupLayout({
+        counts: { storage: d.arrayOf(d.atomic(d.u32)), access: "mutable" },
+    })
+    .$idx(1);
+
+/** the scan pass's I/O — no cull inputs, so it references neither shared layout @internal */
+export const scanLayout = tgpu
+    .bindGroupLayout({
+        counts: { storage: d.arrayOf(d.atomic(d.u32)), access: "mutable" },
+        drawArgs: { storage: d.arrayOf(DrawIndexedIndirect), access: "mutable" },
+        params: { uniform: CullParams },
+    })
+    .$idx(0);
+
+/** Scatter reuses the indirect instance count as its cursor, restoring the draw record before rendering.
+ * The atomic view has the canonical indirect record's byte layout. @internal */
+const ScatterArgs = d.struct({
+    ...DrawIndexedIndirect.propTypes,
+    instanceCount: d.atomic(d.u32),
+});
+export const scatterLayout = tgpu
+    .bindGroupLayout({
+        drawArgs: { storage: d.arrayOf(ScatterArgs), access: "mutable" },
+        packedEids: { storage: d.arrayOf(d.vec4u), access: "mutable" },
+    })
+    .$idx(1);
+
+export const CULL_STRIDE = CULL_VOLUME_FLOATS / 4;
+
+/**
+ * test the instance's world bounding sphere against this slot's frustum cull volume, dispatched on the
+ * leading tag word. `CULL_FRUSTUM` = a 6-plane AND (every camera, the sun, and each point/spot shadow
+ * combo's depth view). An unknown tag (an unwritten slot) keeps the instance, and so does a slot past the
+ * active view count (headless, or the fallback slot 0 when no camera exists) — the pack then degrades to
+ * plain compaction. The radius scales by the largest |scale| axis, conservative for non-uniform scale.
+ * @internal
+ */
+export function visibility(
+    layout: typeof cullLayout | typeof import("./producer-table").producerCullLayout,
+) {
+    return tgpu.fn(
+        [d.u32, d.u32, d.u32, d.u32, d.u32],
+        d.bool,
+    )((mid, instanceRow, globalTransformRow, slot, layers) => {
+        "use gpu";
+        if (slot >= layout.$.params.viewCount) return true;
+        const xf = layout.$.globalTransforms[globalTransformRow];
+        let b = d.vec4f(layout.$.meshBounds[mid].sphere);
+        const override = layout.$.instances[instanceRow].cullBounds;
+        if (override.w >= 0) b = d.vec4f(override);
+        const center = xformPoint(xf, d.vec3f(b.x, b.y, b.z));
+        const radius =
+            b.w * std.max(std.abs(xf.scale.x), std.max(std.abs(xf.scale.y), std.abs(xf.scale.z)));
+        const base = slot * CULL_STRIDE;
+        const header = layout.$.cullVolumes[base];
+        if ((std.bitcastF32toU32(header.z) & layers) === 0) return false;
+        if (d.u32(header.x) !== CULL_FRUSTUM) return true;
+        let i = d.u32(0);
+        while (i < 6) {
+            const pl = layout.$.cullVolumes[base + 1 + i];
+            if (std.dot(d.vec3f(pl.x, pl.y, pl.z), center) + pl.w < -radius) return false;
+            i = i + 1;
+        }
+        return true;
+    });
+}
+
+export const visible = visibility(cullLayout);
+
+// Resolve one active table row to its pair, identity and GlobalTransform row. A miss is out of range.
+const Pair = d.struct({
+    pair: d.u32,
+    mid: d.u32,
+    eid: d.u32,
+    row: d.u32,
+    globalTransformRow: d.u32,
+});
+
+const instanceBatch = batchResolver(cullLayout);
+
+function pairFactory() {
+    return tgpu
+        .fn(
+            [d.u32],
+            Pair,
+        )((index) => {
+            "use gpu";
+            const entry = cullLayout.$.instanceRows[index];
+            const eid = entry.x;
+            const row = entry.y;
+            const instance = cullLayout.$.instances[row];
+            const encodedGlobalTransform = cullLayout.$.globalTransformRows[eid];
+            const invalidPair = cullLayout.$.params.pairCount;
+            const mid = instance.mesh & HANDLE_INDEX_MASK;
+            const batch = instanceBatch(instance.materialType, instance.material);
+            const alphaMode = instance.alphaMode;
+            const cullMode = instance.cullMode;
+            if (
+                batch === 0xffffffff ||
+                alphaMode > AlphaModeCode.AlphaToCoverage ||
+                cullMode >= d.u32(cullLayout.$.params.keyCount / ALPHA_PIPELINE_KEY_COUNT) ||
+                mid >= cullLayout.$.params.meshCount ||
+                cullLayout.$.meshBounds[mid].handle !== instance.mesh ||
+                encodedGlobalTransform === 0
+            ) {
+                return Pair({
+                    pair: invalidPair,
+                    mid,
+                    eid,
+                    row,
+                    globalTransformRow: 0,
+                });
+            }
+            let alphaKey = alphaMode;
+            if (alphaMode === AlphaModeCode.Premultiplied || alphaMode === AlphaModeCode.Add)
+                alphaKey = AlphaPipelineKey.Premultiplied;
+            else if (alphaMode === AlphaModeCode.Multiply) alphaKey = AlphaPipelineKey.Multiply;
+            else if (alphaMode === AlphaModeCode.AlphaToCoverage)
+                alphaKey = AlphaPipelineKey.AlphaToCoverage;
+            return Pair({
+                pair:
+                    (batch * cullLayout.$.params.keyCount +
+                        alphaKey +
+                        cullMode * ALPHA_PIPELINE_KEY_COUNT) *
+                        cullLayout.$.params.meshCount +
+                    mid,
+                mid,
+                eid,
+                row,
+                globalTransformRow: encodedGlobalTransform - 1,
+            });
+        })
+        .$name("instancePair");
+}
+
+/** Tally frustum-visible active MeshInstance rows per (view slot, pair); no entity-capacity scan. @internal */
+export function countKernel() {
+    const pair = pairFactory();
+    return tgpu
+        .computeFn({
+            workgroupSize: [64],
+            in: { gid: d.builtin.globalInvocationId },
+        })((input) => {
+            "use gpu";
+            const index = input.gid.x;
+            const slot = input.gid.y;
+            if (index >= cullLayout.$.params.instanceCount) return;
+            const g = pair(index);
+            if (g.pair >= cullLayout.$.params.pairCount) return;
+            if (
+                (cullLayout.$.instances[g.row].flags & 1) !== 0 &&
+                cullLayout.$.cullVolumes[slot * CULL_STRIDE].y !== 0
+            )
+                return;
+            if (
+                !visible(
+                    g.mid,
+                    g.row,
+                    g.globalTransformRow,
+                    slot,
+                    std.select(
+                        1,
+                        cullLayout.$.instances[g.row].layers,
+                        (cullLayout.$.instances[g.row].flags & 2) !== 0,
+                    ),
+                )
+            )
+                return;
+            std.atomicAdd(countLayout.$.counts[slot * cullLayout.$.params.pairCount + g.pair], 1);
+        })
+        .$name("meshPreprocessCount");
+}
+
+const SCAN_WG = 256;
+
+const temp = tgpu.workgroupVar(d.arrayOf(d.u32, SCAN_WG));
+const carry = tgpu.workgroupVar(d.u32);
+
+// Tile sums live past the live slots' tallies: views * pairCount + slot * tiles + tile.
+const tileBase = tgpu.fn(
+    [d.u32],
+    d.u32,
+)((slot) => {
+    "use gpu";
+    const pairCount = scanLayout.$.params.pairCount;
+    const tiles = (pairCount + 255) >>> 8;
+    return std.max(scanLayout.$.params.viewCount, 1) * pairCount + slot * tiles;
+});
+
+/** One workgroup per (tile, view slot): the tile's tally sum. @internal */
+export function tileSumKernel() {
+    return tgpu.computeFn({
+        workgroupSize: [SCAN_WG],
+        in: { wid: d.builtin.workgroupId, lid: d.builtin.localInvocationId },
+    })((input) => {
+        "use gpu";
+        const slot = input.wid.y;
+        const pairCount = scanLayout.$.params.pairCount;
+        const local = input.lid.x;
+        const p = input.wid.x * SCAN_WG + local;
+        let c = d.u32(0);
+        if (p < pairCount) c = std.atomicLoad(scanLayout.$.counts[slot * pairCount + p]);
+        temp.$[local] = c;
+        std.workgroupBarrier();
+        let half = d.u32(128);
+        while (half > 0) {
+            if (local < half) temp.$[local] = temp.$[local] + temp.$[local + half];
+            std.workgroupBarrier();
+            half = half >>> 1;
+        }
+        if (local === 0)
+            std.atomicStore(scanLayout.$.counts[tileBase(slot) + input.wid.x], temp.$[0]);
+    });
+}
+
+/** One workgroup per view slot: exclusive prefix over its tile sums, in place. @internal */
+export function tileScanKernel() {
+    return tgpu.computeFn({
+        workgroupSize: [SCAN_WG],
+        in: { wid: d.builtin.workgroupId, lid: d.builtin.localInvocationId },
+    })((input) => {
+        "use gpu";
+        const slot = input.wid.x;
+        const pairCount = scanLayout.$.params.pairCount;
+        const tiles = (pairCount + 255) >>> 8;
+        const local = input.lid.x;
+        const base = tileBase(slot);
+        if (local === 0) carry.$ = 0;
+        std.workgroupBarrier();
+        let tile = d.u32(0);
+        while (tile < tiles) {
+            const t = tile + local;
+            const inRange = t < tiles;
+            let c = d.u32(0);
+            if (inRange) c = std.atomicLoad(scanLayout.$.counts[base + t]);
+            temp.$[local] = c;
+            std.workgroupBarrier();
+            let offset = d.u32(1);
+            while (offset < SCAN_WG) {
+                let add = d.u32(0);
+                if (local >= offset) add = temp.$[local - offset];
+                std.workgroupBarrier();
+                temp.$[local] = temp.$[local] + add;
+                std.workgroupBarrier();
+                offset = offset * 2;
+            }
+            const excl = temp.$[local] - c;
+            const total = temp.$[SCAN_WG - 1];
+            if (inRange) std.atomicStore(scanLayout.$.counts[base + t], carry.$ + excl);
+            std.workgroupBarrier();
+            if (local === 0) carry.$ = carry.$ + total;
+            std.workgroupBarrier();
+            tile = tile + SCAN_WG;
+        }
+    });
+}
+
+/**
+ * Exclusive prefix sum in pair order, one workgroup per (tile, view slot), offset by the tile's
+ * scanned sum. Writes instanceCount and firstInstance;
+ * firstInstance addresses that slot's instance-capacity-sized region in packedEids.
+ * Leaves indexCount and firstIndex unchanged and clears count tallies for the next count pass.
+ * baseVertex temporarily holds the tally while scatter uses instanceCount as a cursor;
+ * scatter restores both before drawing. Workgroup-local scanning needs no subgroups. @internal
+ */
+export function scanKernel() {
+    return tgpu.computeFn({
+        workgroupSize: [SCAN_WG],
+        in: { wid: d.builtin.workgroupId, lid: d.builtin.localInvocationId },
+    })((input) => {
+        "use gpu";
+        const slot = input.wid.y;
+        const pairCount = scanLayout.$.params.pairCount;
+        const local = input.lid.x;
+        const p = input.wid.x * SCAN_WG + local;
+        const inRange = p < pairCount;
+        const idx = slot * pairCount + p;
+        let c = d.u32(0);
+        if (inRange) c = std.atomicLoad(scanLayout.$.counts[idx]);
+        temp.$[local] = c;
+        std.workgroupBarrier();
+        let offset = d.u32(1);
+        while (offset < SCAN_WG) {
+            let add = d.u32(0);
+            if (local >= offset) add = temp.$[local - offset];
+            std.workgroupBarrier();
+            temp.$[local] = temp.$[local] + add;
+            std.workgroupBarrier();
+            offset = offset * 2;
+        }
+        if (!inRange) return;
+        const prefix = std.atomicLoad(scanLayout.$.counts[tileBase(slot) + input.wid.x]);
+        scanLayout.$.drawArgs[idx].instanceCount = c;
+        scanLayout.$.drawArgs[idx].firstInstance =
+            slot * scanLayout.$.params.instanceCapacity + prefix + temp.$[local] - c;
+        scanLayout.$.drawArgs[idx].baseVertex = d.i32(c);
+        std.atomicStore(scanLayout.$.counts[idx], 0);
+    });
+}
+
+/** Scatter visible identities and MeshInstance rows into matching dense per-view draw lists. @internal */
+export function scatterKernel() {
+    const pair = pairFactory();
+    return tgpu
+        .computeFn({
+            workgroupSize: [64],
+            in: { gid: d.builtin.globalInvocationId },
+        })((input) => {
+            "use gpu";
+            const index = input.gid.x;
+            const slot = input.gid.y;
+            if (index >= cullLayout.$.params.instanceCount) return;
+            const g = pair(index);
+            if (g.pair >= cullLayout.$.params.pairCount) return;
+            if (
+                (cullLayout.$.instances[g.row].flags & 1) !== 0 &&
+                cullLayout.$.cullVolumes[slot * CULL_STRIDE].y !== 0
+            )
+                return;
+            if (
+                !visible(
+                    g.mid,
+                    g.row,
+                    g.globalTransformRow,
+                    slot,
+                    std.select(
+                        1,
+                        cullLayout.$.instances[g.row].layers,
+                        (cullLayout.$.instances[g.row].flags & 2) !== 0,
+                    ),
+                )
+            )
+                return;
+            const idx = slot * cullLayout.$.params.pairCount + g.pair;
+            const remaining = std.atomicSub(scatterLayout.$.drawArgs[idx].instanceCount, 1);
+            const target = scatterLayout.$.drawArgs[idx].firstInstance + remaining - 1;
+            scatterLayout.$.packedEids[target] = d.vec4u(g.eid, g.globalTransformRow, g.row + 1, 0);
+            if (remaining === 1) {
+                // Every survivor has already decremented the cursor. Only this invocation reads
+                // the saved tally, restoring both indirect words before any render pass consumes them.
+                const count = d.u32(scatterLayout.$.drawArgs[idx].baseVertex);
+                scatterLayout.$.drawArgs[idx].baseVertex = 0;
+                std.atomicStore(scatterLayout.$.drawArgs[idx].instanceCount, count);
+            }
+        })
+        .$name("meshPreprocessScatter");
+}

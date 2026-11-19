@@ -1,0 +1,36 @@
+[package]
+name = "shallot-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "wasm-simd128 contact-solve + integration kernel for upstream"
+
+[features]
+count-allocations = []
+box3d-oracle = []
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# C-reference parity tests intentionally preserve upstream index loops, exact constants, and
+# phase signatures; these lint exceptions keep clippy from requiring bit-affecting rewrites.
+[lints.clippy]
+approx_constant = "allow"
+doc_lazy_continuation = "allow"
+excessive_precision = "allow"
+manual_is_multiple_of = "allow"
+manual_memcpy = "allow"
+needless_borrow = "allow"
+needless_range_loop = "allow"
+should_implement_trait = "allow"
+too_many_arguments = "allow"
+# `&*(&raw mut STATIC)` is how a `static mut` is borrowed without rustc's `static_mut_refs`; clippy's
+# suggested `&mut STATIC` is that lint's error.
+deref_addrof = "allow"
+
+# Test-only: parse the committed C-reference gold vectors (src/math.gold.json) in the native
+# `cargo test` build. Never compiled into the shipping wasm (release profile pulls no dev-deps).
+[dev-dependencies]
+serde_json = "1"
+
