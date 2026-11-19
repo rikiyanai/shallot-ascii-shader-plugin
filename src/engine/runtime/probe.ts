@@ -246,10 +246,10 @@ export async function probeBuffer(
     });
 }
 
-/**
- * capture one single-sample, uncompressed color or copyable depth/stencil texture region after an
- * optional encoded trigger. WebGPU row padding is stripped from the owned result.
- */
+
+
+
+
 export async function probeTexture(
     owner: World,
     source: GPUTexture,

@@ -1,7 +1,7 @@
 import type { TypedArray } from "./component";
 import type { WorldField } from "./storage";
 
-/** @internal Field storage owns its capture boundary and never shrinks live columns. */
+
 export class FieldColumns {
     highWater = 0;
     readonly #fields: WorldField[] = [];

@@ -30,12 +30,12 @@ import { WebSocketConnection } from "./websocket";
 /** A live server-side connection entity. Its transport and histories live outside ECS storage. */
 export const ClientOf = component("ClientOf", {});
 
-/** Shared protocol and game policy. Connection arguments are server eids, not client-supplied IDs.
- * Hooks borrow runtime handles; explicit disconnect calls onLeave before despawning.
- * Direct ECS removal may already have removed the entity's other components.
- * onClient installs game-specific prediction or routing at the client's first stepped preFixed
- * boundary, after app warm-up, where prediction may capture its initial World snapshot.
- * Replay composes only the game's plugins and onClient, not the tab's controls or presentation. */
+
+
+
+
+
+
 export interface Game {
     plugins: readonly Plugin[];
     schema: ReplicationSchema;
@@ -275,12 +275,12 @@ export function client(
     };
 }
 
-/** Same-process shortcut over seeded links, not socket or process-isolation evidence.
- * Prepares child apps before returning a plugin for the caller's client app: app builds serialize,
- * so child apps cannot be built inside a plugin initializer. Dispose the session if the client
- * app cannot be built; a built client World also owns disposal. Delay values are milliseconds.
- * The caller pumps frame deltas in seconds; the server catches up at most four fixed ticks.
- * Thin clients receive and acknowledge state without ticking, predicting or rendering it. */
+
+
+
+
+
+
 export async function local(
     game: Game,
     options: {

@@ -201,7 +201,7 @@ export function mountTouchButton(
         try {
             button.setPointerCapture(event.pointerId);
         } catch {
-            // An inactive pointer can refuse capture; its press still belongs to this frame.
+
         }
     });
     const release = () => releaseKey(world, key);

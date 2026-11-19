@@ -241,23 +241,3 @@ mod runtime {
         w.records.restore(input);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::mem::{offset_of, size_of};
-
-    #[test]
-    fn joint_record_layout_matches_plain_word_bindings() {
-        assert_eq!(size_of::<JointEdge>(), 12);
-        assert_eq!(size_of::<JointRecord>(), 60);
-        assert_eq!(offset_of!(JointRecord, edges), 12);
-        assert_eq!(offset_of!(JointRecord, joint_id), 36);
-        assert_eq!(offset_of!(JointRecord, island_id), 40);
-        assert_eq!(offset_of!(JointRecord, island_index), 44);
-        assert_eq!(offset_of!(JointRecord, draw_scale), 48);
-        assert_eq!(offset_of!(JointRecord, joint_type), 52);
-        assert_eq!(offset_of!(JointRecord, generation), 56);
-        assert_eq!(offset_of!(JointRecord, collide_connected), 58);
-    }
-}

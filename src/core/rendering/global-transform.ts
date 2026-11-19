@@ -328,12 +328,12 @@ export function globalTransformTable(world: World): GpuTable<typeof Xform> {
     }
     return runtime.render!;
 }
-/** The CPU source of rendered entity placement: a caller-owned 12-float Xform record
- * (position at 0, xyzw quaternion at 4, scale at 8), including VisualCorrection.
- * RenderTransformHistory or retainRenderTransformHistory enrolls fixed samples ahead
- * of the first read; the history plugin
- * works without a GPU. Without enrollment, before capture, or after a frame-authored
- * write, reads use current placement. No GPU readback is performed. */
+
+
+
+
+
+
 export function readRenderGlobalTransform(world: World, eid: number, out: Float32Array): void {
     const runtime = world.resource(GlobalTransformHistory);
     const { translation, rotation, scale } = world.storage(GlobalTransform);

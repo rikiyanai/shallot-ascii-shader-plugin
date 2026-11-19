@@ -4,23 +4,23 @@ import type {SourceSmallParentEnd,SourceSmallParentKind} from './source-small-pa
 import type {NativeGlyph} from './native-page.ts';
 import {PARENT_MAX_COLUMNS} from './source-lod.ts';
 
-/** COMPILED SMALLEST-TIER PARENT CONSTRUCTIONS (perf-impl-156; D9, petit AA 07).
- *
- * A far parent held at 1-5 page rows plays one genuine connected construction
- * at ITS OWN size: no 9-row shoulder or 10-row flank squeezed into five rows,
- * no per-edge wireframe, no tone, gaps or dots. Every record is built only
- * from retained whole units:
- *  - round: the retained compact whole circles / domes, byte-identical to the
- *    bank rows (their own size; width variants are the different entries);
- *  - limb: one role per row: the compact circle's cap units (γ, ⌒ repeated as
- *    whole units, ヽ), straight side rows | ... | (a straight source side keeps
- *    an upright, D5), then its return units (ゝ, _ repeated, ノ) or, on a
- *    support contact, the dome's flat-base units ({, ＿ repeated, });
- *  - box: one row is 口 / ロ / ﾛ by width; more rows are the classic connected
- *    box: lid run ＿, sides |, base |＿＿| (D9: horizontals and verticals).
- * Text is authoritative: atoms are the native layout of the text rows (each
- * glyph's own advance), so exported text equals the placed construction.
- * Compiled once; the far consumer selects (kind, ends, rows, width) per pose. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export interface SmallConstructionGlyph {readonly text:string;readonly advance:number}
 export interface SmallConstructionRecord {
  readonly kind:SourceSmallParentKind;
@@ -91,7 +91,7 @@ function layout(text:readonly string[],font:ReadonlyMap<string,SmallConstruction
  * silently closed; see below). Formerly: Ends 'open' were closed as a free
  * return/cap: a small outline is closed (D9). Returns indices into records. */
 export function smallConstructionsFor(parent:{readonly kind:SourceSmallParentKind;readonly positiveEnd:SourceSmallParentEnd;readonly negativeEnd:SourceSmallParentEnd},records:readonly SmallConstructionRecord[]):readonly number[]{
- // perf-impl-158: an OPEN end (a cut tube, an unclosed source end) has no
+
  // small vocabulary yet. It is never silently closed as a cap: the family is
  // empty, the incumbent keeps the form, and the gap stays an explicit
  // unfinished representation obligation.
@@ -130,7 +130,7 @@ export function compileSmallConstructions(glyphs:readonly NativeGlyph[]):readonl
   push('round',ends[0],ends[1],0,[id],value.native.rows.map(nativeRoleText));
  }
  // LIMB and BOX: one role per row from named whole units.
- // WIDTH GROWTH (perf-impl-158): one whole ⌒ / ＿ unit is 16 px = one far
+
  // page column (gpu-source-far-forms.ts floors page x / 16), and a parent
  // spans at most PARENT_MAX_COLUMNS columns. Units therefore run until the
  // record would exceed SMALL_CONSTRUCTION_MAX_PX, never a fixed 1..4 table:
@@ -168,7 +168,7 @@ export function compileSmallConstructions(glyphs:readonly NativeGlyph[]):readonl
  }
  // BOX one row: the one-glyph boxes by width (the compiled hard-word set).
  for(const [units,glyph]of [[1,'ﾛ'],[2,'ロ'],[3,'口']] as const)if(font.has(glyph))push('box','cap','contact',units,[`one-glyph box ${glyph}`],[glyph]);
- // 3/4-ROW ROUND FAMILIES (perf-impl-160; README "Codex continuation,
+
  // 2026-11-19"). Appended AFTER every earlier record, so existing record
  // indices and order are unchanged.
  //  - WIDER: the retained 3-row brace circle and 4-row circle grow only through
@@ -220,7 +220,7 @@ export function compileSmallConstructions(glyphs:readonly NativeGlyph[]):readonl
    if(ground&&fits(ground.text))push('round','cap','contact',k,[`${family.id} ${k>1?`widened by own repeat units (${family.unit}, k=${k}) `:''}grounded by sh-mlt03-compact-circle ground units ＿x${ground.units}`],ground.text);
   }
  }
- // FREE BOX (perf-impl-162 companion): cap/cap records from the SAME retained
+
  // closed box units as above (lid ＿, sides |, base |＿...|, one-glyph boxes),
  // appended after every existing record. A free box's base is the box's own
  // closed bottom edge, never an outside ground run. Same units range and

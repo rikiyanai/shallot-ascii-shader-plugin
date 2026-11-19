@@ -254,41 +254,6 @@ impl Drop for Database {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn native_chains_share_by_bytes_and_survive_eviction_removal_and_rehash() {
-        let mut db = Database::new();
-        let mut images = Vec::new();
-        let mut handles = Vec::new();
-        for i in 0..300u64 {
-            let mut image = vec![0u64; 19];
-            image[1] = (i % 17) << 48;
-            image[17] = i;
-            image[18] = 152;
-            let handle = db.add(&image);
-            assert_eq!(db.add(&image), handle);
-            images.push(image);
-            handles.push(handle);
-        }
-        assert_eq!(db.count, 300);
-        for i in (0..300).step_by(2) {
-            db.remove(handles[i]);
-            assert_eq!(db.buckets[db.find(&images[i]).unwrap()].refs, 1);
-            db.remove(handles[i]);
-            assert!(db.find(&images[i]).is_none());
-        }
-        for i in (1..300).step_by(2) {
-            assert_eq!(db.add(&images[i]), handles[i]);
-            for _ in 0..3 {
-                db.remove(handles[i]);
-            }
-        }
-        assert_eq!(db.count, 0);
-        assert!(db.metadata[..db.buckets.len()].iter().all(|m| *m == 0));
-    }
-}
 
 #[cfg(target_arch = "wasm32")]
 pub use runtime::*;

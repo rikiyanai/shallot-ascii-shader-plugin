@@ -367,7 +367,7 @@ class DiagnosticsRecorder {
 
     // Request prior-frame query timestamps at frame begin, before resetting query indices. Queue
     // order puts the resolve and copy after every prior submission and before the next frame's writes.
-    // Capture pass names with the request so later frames cannot relabel an arriving result. The world
+
     // pool owns staging; READ_RING bounds only the profiling metadata in flight.
     resolve(world: World): void {
         const querySet = this._querySet;

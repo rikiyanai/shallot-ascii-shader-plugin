@@ -42,12 +42,12 @@ export const TERRAIN_STEP_SLOPE=.2125,TERRAIN_SLANT_SLOPE=17/24;
 export const TERRAIN_STEP_PHASES=[5,11] as const;
 /** Paired flank lean bounds, signed page px of horizontal travel per row going
  * down the page: ／ | / | upright | \\ | ＼. The same word spells both sides. */
-/** A hard edge within this lean of vertical (|cos| of its page direction;
- * .26 is 15 degrees, the two direction bins either side of upright) is a run
- * of uprights whose pen follows the edge, one shift every few rows. A post or
- * a door jamb leans a few degrees in perspective; spelled with the 45 degree
- * slash on every row at nearly one pen it read as hatching (loop 351 view 02,
- * operator call-out). The bound is this rule's own choice. */
+
+
+
+
+
+
 export const HARD_UPRIGHT_LEAN=.26;
 /** A hard edge sloping between TERRAIN_STEP_SLOPE (about 12 degrees) and 45
  * degrees is the gentle-slope run of the fog target (frame 000: the floor
@@ -57,15 +57,15 @@ export const HARD_UPRIGHT_LEAN=.26;
  * cell-edge lines. Phase bounds (path height in the 17 px row, 0 = top) are
  * each unit's ink height in the native font. Level edges keep ＿ ￣. */
 export const HARD_SLOPE_RISING=['￣','´','‐',',','_'] as const,HARD_SLOPE_FALLING=['￣','｀','‐','､','_'] as const;
-/** Whole shallow-row passages, ordered by the unsigned 64-direction bin.
- * These are the graded-line construction, not five independent phase picks.
- * The fog target supplies _,.-‐´ / ｀ヽ､､.; the railway reference review
- * (ascii-art-archive 644a6de09, tetsudou-haikei/resK-137, lower track rows)
- * shows the same connected grade extended with whole horizontal members.
- * Related widths add/remove intervening whole units, never scale the font.
- * The reference is a construction witness, not an operator approval or a
- * runtime image. Bins 3..7 are the existing hard table's graded interval.
- */
+
+
+
+
+
+
+
+
+
 export const HARD_SLOPE_PASSAGES={
  rising:['_,,.-‐´￣','_,.-‐‐´','_,.-‐´','_,.-´','_,‐´'],
  falling:['￣｀‐‐､__','￣｀‐､_','｀ヽ､､.','｀‐､_','｀ヽ_'],
@@ -96,27 +96,27 @@ export function hardSlopePassage(font:readonly NativeGlyph[],dir:number):{
  * ﾉリ (14), 彡ノ (15); falling side iヽ (10), ﾙﾊ (11), ゞ､ (12), ルヘ (16). */
 export const FOLIAGE_EDGE_UNITS=['/ﾘ','ノ彡','ﾉリ','彡ノ','iヽ','ﾙﾊ','ゞ､','ルヘ'] as const;
 /** The terrain instruction table's size (roles x sizes x directions x phases x record words). */
-/** SLOPE UNITS: every AAHub editor palette part (ascii-art-archive c35ec01d6,
- * collections/aahub-editor-parts/parts.json, categories 斜線 点・チョン ノ・フ
- * 彡・イ へ・ハ リ・レ 組合せ１-３ 基本 く・Ｘ 十・Ｔ・ト 横線) that the native
- * font holds as 1-3 scalars without spaces, box-drawing glyphs excluded (the
- * palette report lists them as a contour conflict). A line row takes the unit
- * whose ink lies closest along that row's slope (fitSlopeUnit), measured once
- * here on the native font; the frame reads the result by address. Standalone
- * digits and Latin letters (1 7 y Z k T A X x Y and full-width forms) are not
- * candidates: a stack of them reads as text (council codex-20261111-cliff-crown:
- * "kl reads as letters"); l ｌ are strokes and stay. */
+
+
+
+
+
+
+
+
+
+
 export const SLOPE_UNITS=["＼","丶","ヽ","ヾ","ゝ","ゞ","´","¨","｀","ﾞ","ﾟ","彡","∠","⌒","乂","亅","亠","从","仆","儿","兀","冂","冖","冫","几","凵","勹","匕","匚","匸","卅","卞","厂","叮","叭","叨","夂","宀","幵","广","廾","弋","_","￣","-","‐","ｰ","￤","|","∥","〕","［","］","「","」","=","＝","二","≡","三","ｌ","∈","∋","⊆","⊇","⊂","⊃","∪","∩","／","/","〆","⊿","％","‰","♂","≠","〃","∧","∨","キ","ｷ","ﾔ","∀","〈","〉","゛","'","′","〟","〝","、","､","（","(","巛","<","＜","《","へ","ヘ","ﾍ","ミ","ﾐ","丿","ノ","ﾉ","ソ","ｿ","）",")",">","＞","》","∟","く","戈","弌","弍","弐","式","戔","戉","戊","戍","戌","成","戒","廴","辷","込","×","※","米","＊","*","メ","ﾒ","ツ","ﾂ","ン","ﾝ","フ","ﾌ","ス","ｽ","ヌ","ﾇ","又","叉","双","ヲ","ｦ","ラ","ﾗ","ワ","ﾜ","ヮ","仄","√","尸","尺","戸","丘","反","氏","民","十","＋","+","卉","孑","±","丁","汀","行","庁","六","亢","山","屮","丱","艸","出","卜","ト","ﾄ","モ","ﾓ","下","寸","忖","可","斗","才","癶","ハ","ﾊ","八","公","兮","只","穴","价","ネ","ﾈ","之","乏","疋","片","爿","淵","乙","人","入","父","艾","爻","个","仝","今","夲","天","大","太","犬","夫","夭","夾","來","丈","史","介","リ","ﾘ","ル","ﾙ","レ","ﾚ","㍉","尢","尤","无","旡","牙","矛","朮","ホ","ﾎ","凡","丹","舟","咒","冗","瓜","爪","斤","斥","九","丸","彳","イ","ィ","ｨ","ｲ","〒","テ","ﾃ","チ","ﾁ","形","杉","尨","豸","豕","亥","毛","毟","气","￣｀","丶､","｀ヽ","｀丶","ヽ､","｀､","',","´￣",",.'",",'","しへ","しﾍ","ﾚへ","ﾚﾍ","レへ","レﾍ","ﾚ'7","ノ7","lﾝ","iﾉ","ﾚ'","レ'","メ、","へ、","_,ノ",",ノ",",ィ",",ｨ",",ｲ",",ﾉ","ト､","ﾄ､","｀Y´","ｔ'","f´￣","⌒て","i'´","`￣’","┬く","r―","rく","rｹ","--イ","l!","i!","|!","l|","ll","i}","{!","{i","||","|l","|i","!i","!l","!|","!}","|,リ","l,ﾘ","l,!","ｌル'","ｌﾙ'","k.l","ヽ!","ﾄ､!","|八|","|儿!","ｌハﾉ","!ﾊﾉ","ハ川","ﾞl刈"] as const;
-/** HOOD EDGE COMBINATIONS (operator 2026-11-12: "IF DONE CORRECTLY, IT SHOULD
- * BE A COMBINATION, SEE THE 'HOODED FIGURE' AAHUB REFERENCE LIST"). AAHub
- * 人間・モブ11（フード） (ascii-art-archive collections/aahub/ningen-mobu-11,
- * 373 pieces): the first and last ink token of every row is where the hood or
- * robe outline crosses it; every 2-3 scalar token seen there 6 times or more,
- * without interior tone (: ;), box drawing or letters. A slope is spelled by
- * a stroke with its dot or comma (./ .／ ,／ /, .ﾊ .∨ ﾍ', 〃', ｀ヽ ヽ､ ヽ.)
- * or a doubled stroke (／／ ＼＼), not one bare glyph; the fit chooses among
- * these and SLOPE_UNITS together. Extraction:
- * scratchpad hood_edges.py 6 | hood_units.py, 2026-11-12. */
+
+
+
+
+
+
+
+
+
+
 export const HOOD_EDGE_UNITS=["./","|l",".|",".ﾊ",".／","／／","＼＼",".∨","｀ヽ","＞､","ﾞ|","卜、_","',!","ゝ{","／＿","ヽ、",".′","_|／","∨.","〃',","/,",",′",",／","/|","ﾍ',","∨/","ヽ､","_..","/／","/!",".＼","ヽ.","／￣","'，",".!","|/","/ヽ","／|","／/","ﾞ,","l|","ﾘﾊj","_,.",",.ｨ","＼/","｝＼","'´","｀、","∨/∧","/l","＿／","'､",",!"] as const;
 /** PRACTITIONER SLOPE RECIPES (skill references/aa-shokunin-tutorials.md,
  * posts 01 and 05): between the clean-line angles a slope is a thin glyph
@@ -125,12 +125,12 @@ export const HOOD_EDGE_UNITS=["./","|l",".|",".ﾊ",".／","／／","＼＼",".�
 export const PRACTITIONER_SLOPE_UNITS=["ｷ",",〈","〉,",".､≪","≫､.","､＜","＞､","厶","ｲ","丿","人","八","〉､","丶"] as const;
 /** Upright pairs: a slanted line never takes them on any form (D5). */
 export const UPRIGHT_STACKS=new Set(['∥','||','ll','|l','l|','!|','|!','!l','l!','|i','!i','i!']);
-/** Lone strokes a natural form (terrain, rock, cliff) never takes alone
- * (operator 2026-11-10 ledger), plus the upright pairs. */
+
+
 export const NATURAL_LONE_STROKES=new Set(['|','/','_','＿','／','＼','￣','-','‐','ｰ','￤',...UPRIGHT_STACKS]);
-/** A unit holding a Latin letter other than the narrow strokes l i j ｌ ｉ reads
- * as text (skill 4.3, 15.6; council codex-20261111-cliff-crown "kl reads as
- * letters"): never a line, slope or junction unit. */
+
+
+
 export function readsAsLetter(text:string):boolean{
  return [...text].some(ch=>/[A-Za-zＡ-Ｚａ-ｚ0-9０-９]/.test(ch)&&!'lijｌｉ'.includes(ch));
 }
@@ -184,23 +184,23 @@ export function fitSlopeUnit(font:readonly NativeGlyph[],address:(text:string)=>
  const stray=off.filter(d=>d>2).length/off.length;
  return {score:rms+.25*gaps+4*stray,centre};
 }
-/** JUNCTION UNITS (operator 2026-11-12: "IT SHOULD BE AUTOMATICALLY CHOOSING
- * JUNCTION GLYPHS AND PATTERNS THAT BEST FIT VIA COMPILED TABLE LOOKUP"). The
- * candidates for the ONE glyph where two or three runs meet: every AAHub
- * editor palette part (ascii-art-archive c35ec01d6,
- * collections/aahub-editor-parts/parts.json, categories 十・Ｔ・ト juu, く・Ｘ
- * ku-x, 点・チョン ten, 横線・冖 yokosen, ノ・フ・厂 no-fu, リ・レ・ホ ri-re,
- * へ・ハ・人 he-ha, 彡・イ mi-i, 組合せ１-３ kumiawase1-3) of 1-3 scalars, and
- * each scalar of a longer part (the 組合せ２ glyph lists 厂「｢丁…), that the
- * native font holds with ink, without spaces; box drawing (─ ┬ ┼ …, a contour
- * conflict in the palette report) and standalone Latin letters and digits
- * (T L Y k X ７ 1 …: a stack of them reads as text, council
- * codex-20261111-cliff-crown) are not candidates; l and ｌ are strokes and
- * stay. Extraction: scratchpad junction/candidates.ts, 2026-11-12. The
- * former hand lists (HARD_JUNCTIONS ∧ ヘ V < > ＜ ＞ 〈 〉 「 L 」 ７ ∠ ﾚ レ ﾉ
- * ノ, NATURAL_JUNCTIONS 廴 ﾉ ノ ｒ ヽ ﾍ ∧ ∨) are replaced by the measurement
- * below over these units plus HOOD_EDGE_UNITS and PRACTITIONER_SLOPE_UNITS
- * (the skill's joins ﾉ ｲ 厶 丿 人 八 〉､, aa-shokunin-tutorials post 05). */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const JUNCTION_UNITS=["_","￣","-","‐","ｰ","冖","￤","亅","|","∥","〕","［","］","「","」","=","＝","二","≡","三","∈","∋","⊆","⊇","⊂","⊃","∪","∩","＼","｀","´","゛","ﾞ","'","′","〟","〝","¨","、","､","丶","ヽ","ヾ","ゝ","ゞ","（","(","⌒","巛","<","〈","＜","《","へ","ヘ","ﾍ","ミ","ﾐ","／","/","〃","丿","ノ","ﾉ","ソ","ｿ","）",")",">","〉","＞","》","〆","⊿","彡","∠","∧","∨","从","∟","く","弋","戈","弌","弍","弐","式","戔","戉","戊","戍","戌","成","戒","廴","辷","込","冫","×","※","米","＊","*","メ","ﾒ","ツ","ﾂ","ン","ﾝ","フ","ﾌ","ス","ｽ","ヌ","ﾇ","又","叉","双","ヲ","ｦ","ラ","ﾗ","ワ","ﾜ","ヮ","厂","仄","√","广","尸","尺","戸","丘","反","氏","民","十","＋","+","卉","卞","孑","匕","±","丁","汀","行","庁","亠","六","亢","山","屮","丱","艸","出","卜","ト","ﾄ","モ","ﾓ","下","寸","忖","可","斗","才","癶","ハ","ﾊ","八","公","兮","只","穴","价","ネ","ﾈ","之","乏","疋","片","爿","淵","乙","人","入","乂","父","艾","爻","个","仝","今","夲","天","大","太","犬","夫","夭","夾","來","丈","史","介","リ","ﾘ","ル","ﾙ","レ","ﾚ","㍉","儿","兀","尢","尤","无","旡","牙","矛","朮","ホ","ﾎ","几","凡","丹","舟","咒","冗","瓜","爪","斤","斥","九","丸","彳","イ","ィ","ｨ","ｲ","〒","テ","ﾃ","チ","ﾁ","形","杉","尨","豸","豕","亥","毛","毟","气","￣｀","丶､","｀ヽ","｀丶","ヽ､","｀､","',","´￣",",.'",",'","しへ","しﾍ","ﾚへ","ﾚﾍ","レへ","レﾍ","ﾚ'7","ノ7","lﾝ","iﾉ","ﾚ'","レ'","メ、","へ、","_,ノ",",ノ",",ィ",",ｨ",",ｲ",",ﾉ","ト､","ﾄ､","｀Y´","ｔ'","f´￣","⌒て","i'´","`￣’","r―","rく","rｹ","--イ","＿",",",".","l!","i!","|!","l|","ll","i}","{!","{i","||","|l","|i","!i","!l","!|","!}","l","ｌ","｣","!","ﾆ","ニ","｢","土","士","|,リ","l,ﾘ","l,!","ｌル'","ｌﾙ'","k.l","ヽ!","ﾄ､!","|八|","|儿!","ｌハﾉ","!ﾊﾉ","仆","ハ川","ﾞl刈"] as const;
 /** Acceptance of a measured junction: every leg carried over at least this
  * share of its length out to the unit's edge, at most this share of the
@@ -305,7 +305,7 @@ export function junctionLegSets():{two:number[][];three:number[][]}{
  for(let a=0;a<16;a++)for(let b=a+1;b<16;b++){if(apart(a,b)>=2&&apart(a,b)<=6)two.push([a,b]);for(let c=b+1;c<16;c++)if(apart(a,b)>=2&&apart(b,c)>=2&&apart(a,c)>=2)three.push([a,b,c]);}
  return {two,three};
 }
-/** The compiled junction table and its readable record (evidence table). */
+
 export interface CompiledJunction {readonly legs:readonly number[];readonly natural:boolean;
  /** The accepted unit, '' when the runs simply meet; best is the best-measured unit either way. */
  readonly text:string;readonly best:string;readonly fit:JunctionFit|undefined}
@@ -313,9 +313,9 @@ export function compileJunctions(font:readonly NativeGlyph[],address:(text:strin
  const units=[...new Set<string>([...JUNCTION_UNITS,...HOOD_EDGE_UNITS,...PRACTITIONER_SLOPE_UNITS])].filter(text=>!readsAsLetter(text));
  const gauges=units.map(text=>junctionGauge(font,address,text));
  const {two,three}=junctionLegSets(),out:CompiledJunction[]=[];
- // Built forms (box, wall, post) never take doubled uprights (the operator's
+
  // || call-out); natural forms (terrain, rock, cliff) no lone | / _ ＿ ／ and no
- // doubled uprights (operator 2026-11-10 ledger). A slanted leg is carried
+
  // only by ink along it, so an upright cannot take one (D5).
  // One measurement per unit and leg set serves both vocabularies; the first
  // unit in candidate order wins a tie.
@@ -365,7 +365,7 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  });
  // Expanded role composition: retain aa[99]'s cap, shoulder, single centre
  // and return parts, but do not repeat its asymmetric / versus ‘， row down
- // an arbitrarily tall sphere. The operator-specified paired native curves
+
  // belong to the WHOLE height program, not independent tangent selections.
  // aa[99]'s sparse ticks intentionally lose its shoulders. The connected
  // expanded construction instead joins the retained flat caps to its native
@@ -405,7 +405,7 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  // They are contiguous so a passage index addresses its word by offset.
  const toneWords=recipes.length+1;
  for(const passage of TONE_PASSAGES.slice(1))recipes.push(passage.text);
- // 遠景 far strip vocabulary (operator PDF "EXAMPLE SUPER FAR LOD"): the peak
+
  // and upright-mark words of the one-row skyline. Appended after every pinned
  // and tone word, so no earlier word index moves. The native font has no ↑.
  const farWords=new Map<string,number>();
@@ -461,7 +461,7 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  // non-upright unit carries (best score above SHIFT_RUN_SCORE) is a ずらし
  // run of the upright stroke, shifted with the line each row (AAしょくにん
  // 01: | one dot a row); D5 keeps uprights off curved and round sides, which
- // never read this table's steep rows. Operator 2026-11-12: "combine Best fit
+
  // as measured and Shifted upright run ... with implied continuation".
  const SHIFT_RUN_SCORE=2,SHIFT_RUN_GAP=3;
  const slopeFit=(exclude:ReadonlySet<string>,stroke:string,size:number)=>Array.from({length:64},(_,dir)=>{
@@ -484,7 +484,7 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  // row read as separated dashes down every steep cliff fold (view 06). AAしょく
  // にん 01 (skill aa-shokunin-tutorials.md 45-47): "Vertical bar: 1 dot per
  // row (thin l softens the steps but weakens the join)"; AAHub 地形（海・砂浜
- // ・島） 3c33aa91 aa[31] rows 2-5 (operator-kept label, swipe audit
+
  // verdicts.jsonl:1267): a leaning rock side is | shifted per row. The run is
  // still one unit plus the line's own shift (never a lone |).
  const naturalSlope=[0,1,2].map(size=>slopeFit(NATURAL_LONE_STROKES,'|',size)),builtSlope=[0,1,2].map(size=>slopeFit(UPRIGHT_STACKS,'|',size));
@@ -644,7 +644,7 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  for(let role=0;role<4;role++)for(let size=0;size<3;size++)for(let dir=0;dir<64;dir++)for(let phase=0;phase<17;phase++){
   const at=(((role*3+size)*64+dir)*17+phase)*12,angle=dir*Math.PI/32,dx=Math.cos(angle),dy=Math.sin(angle);
   const slope=Math.abs(dy)/Math.max(Math.abs(dx),1e-9),rising=dx*dy<0;
-  // NO LONE | / _ ＿ ／ ON TERRAIN (operator order 2026-11-10, GOAL-EXECUTOR
+
   // ledger). A slope up to TERRAIN_SLANT_SLOPE is a RUN UNIT spelled glyph by
   // glyph along the row at the line's own height in it, so a rising line
   // reads _ , ‐ ´ ￣ and a falling one ￣ ｀ ‐ ､ _ (AAHub _,.-‐''´ and
@@ -771,7 +771,7 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
   const ports=(entry as typeof entry&{ports?:Readonly<Record<string,string|null>>}).ports;
   return !!ports&&Object.values(ports).every(port=>port!==null&&pathPorts.has(port));
  };
- // SOURCE-PART SOFT PROGRAMS (perf-impl-111/112). The source graph owns the
+
  // feature, role and context token. This residency table resolves one exact
  // retained entry for role, requested size, both source tangent ports and the
  // source context class. The table is indexed before playback; no glyph or
@@ -785,7 +785,7 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  const contextInside=(role:number,contextClass:number)=>{
   if(role===0&&contextClass===1)return 'below';
   if(role===1&&contextClass===2)return 'below';
-  // perf-impl-154: a side turn is a genuine shoulder (retained
+
   // sk-church101-rib-shoulder-flank: shoulder, convex, inside right, NE->S,
   // path ports). Same class rule as compiled-construction-topology.ts.
   if(role===1&&contextClass===6)return 'left';
@@ -842,7 +842,7 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  //  [67,99) upright mark: per quarter-row height of the form, the mark word
  //          and the x of its foot: 、 under a quarter row, y to three
  //          quarters, 人 to a row, 个 above (the single marks standing on the
- //          base line of the operator's "EXAMPLE SUPER FAR LOD":
+
  //          apps/stroke-matcher/references/review-untitled-24.png); from a
  //          row and a half up, 个 over a | stem, one stem unit per row the
  //          form stands up to the far band's three rows (farSkyline; a trunk
@@ -1000,11 +1000,11 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  //          edge, so every unit of one level shares one row and a mark stands
  //          on the line from the row above. Terrain: ￣ ／ ＼ ヘ over | (D9:
  //          the smallest tier simplifies steep diagonals to verticals; the
- //          operator's super-far strip is one base line with ヘ ∧ peaks).
+
  //          Mass: a straight-shouldered arch (the skill's 15.5 complete arch
- //          ／￣＼; the operator markup's far rocks, hills and houses are flat
+
  //          caps on slanted shoulders with ∧ peaks). The puff lobe ⌒ヽ is the
- //          smoke idiom and scalloped every far rock (capture self-7 view 06).
+
  //          Caps ￣ on the run, ／ where it rises, ＼ where it falls, ∧ on a
  //          one-column top; flank words ／ ＼ on ONE row under the cap, only
  //          where that side falls three rows or more (farSkyline).
@@ -1044,7 +1044,7 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  //          between the leans of the glyphs' own ink. A slanted side never
  //          takes an upright and a straight side keeps it (D5).
  const sideLean=(text:string)=>farTip(text,false)-farTip(text,true);
- // No lone | / ／ on far forms (operator order 2026-11-10): l upright, ﾉ steep
+
  // rise, ノ rise, ヽ fall; thresholds from the same glyphs' own leans.
  for(const [k,text]of ['l','ﾉ','ノ','ヽ'].entries())farStrip.set([farUnit(text),Math.round((farTip(text,true)+farTip(text,false))/2)>>>0],168+k*2);
  farStrip.set([Math.round((Math.abs(sideLean('l'))+Math.abs(sideLean('ﾉ')))/2),Math.round((Math.abs(sideLean('ﾉ'))+Math.abs(sideLean('ノ')))/2)],176);

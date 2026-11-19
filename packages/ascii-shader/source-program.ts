@@ -34,10 +34,10 @@ interface SourceProgramData {
  readonly wholeConstruction?:SourceWholeConstructionTemplate;
  /** Original source vertex ids, compiled once; never visibility fragments. */
  readonly partAnchorVertices?:Uint32Array;
- /** Smallest-tier parent class (perf-impl-156): which genuine small connected
-  * construction this source owns at 1-5 page rows (round / limb / box, end
-  * constructions), from the same part graph. Present whenever the source has a
-  * closed section, with or without a four-role whole template. */
+
+
+
+
  readonly smallParent?:SourceSmallParent;
 }
 export type SourceComplexRetention='full'|'summary';
@@ -87,13 +87,13 @@ function sourcePartRecords(table:Uint32Array|undefined):readonly SourcePartProgr
  return records;
 }
 
-/** perf-impl-152: the source vertex a section sample stands for. A sample is
- * a point on source edge (a,b); its port is the nearer original endpoint. The
- * former `partPorts` published a whole section's first/last sample endpoints
- * whatever contour anchor/passage was admitted, and a band's `lower[0]`/
- * `upper[0]` SECTION ids as vertex ports. Ports now come only from the ends of
- * the geometry actually admitted and emitted. */
-// perf-impl-154: the port is the sample edge's endpoint on the LOWER side of
+
+
+
+
+
+
+
 // the section level along the graph axis (ties: `a`). "Nearer endpoint" put
 // every sample of a cap section next to a fan apex on the apex (T13: section
 // 6, 32 candidates, 0 distinct ports). The lower endpoint is the same side
@@ -102,8 +102,8 @@ const sampleVertex=(sample:PartSample,axis:readonly number[],positions:ArrayLike
  const along=(v:number)=>positions[v*3]!*axis[0]!+positions[v*3+1]!*axis[1]!+positions[v*3+2]!*axis[2]!;
  return (along(sample.b)<along(sample.a)?sample.b:sample.a)>>>0;
 };
-/** The band-incidence owner (lane T12, `source-band-incidence.ts`): band-face
- * representatives labelled with the incident section they continue. */
+
+
 const sourceBandIncidenceOwner:SourceBandIncidence=sourceBandIncidence;
 
 function openingTemplate(feature:number,ports:readonly number[],sourceContributors:readonly number[]):SourceWholeOpeningTemplate|undefined{
@@ -137,7 +137,7 @@ const cross3=(a:readonly number[],b:readonly number[])=>[a[1]!*b[2]!-a[2]!*b[1]!
 function bandSourceBoundary(record:SourcePartProgramRecord,graph:MeshPartGraph,complex:MeshSourceComplex,positions:Float32Array,incident?:ReadonlyMap<number,number>):{readonly points:readonly (readonly [number,number,number])[];readonly vertices:readonly number[]}|undefined{
  const band=graph.bands.find(value=>value.id===record.sourceId);if(!band)return;
  const representatives=new Set<number>();
- // perf-impl-154: with an incidence table, the junction envelope is the hull
+
  // of the INCIDENT SECTIONS' band-side vertices, as this producer declares it.
  // Hulling every band face vertex kept only interior band vertices on a real
  // closed Y (hull 20, labelled 0), so no passage could join two branches.
@@ -151,7 +151,7 @@ function bandSourceBoundary(record:SourcePartProgramRecord,graph:MeshPartGraph,c
  const axis=graph.axis,seed=Math.abs(axis[0]!)<.8?[1,0,0]:[0,0,1],basis=cross3(axis,seed),basisLength=Math.hypot(...basis);if(!(basisLength>0))return;
  const u=basis.map(value=>value/basisLength),v=cross3(axis,u);
  // The source vertex id rides with its hull point: a band passage's ports are
- // these actual band face vertices (perf-impl-152), never section ordinals.
+
  const projected=raw.map(item=>({...item,x:dot3(item.point,u),y:dot3(item.point,v)})).sort((a,b)=>a.x-b.x||a.y-b.y||a.vertex-b.vertex);
  const turn=(a:typeof projected[number],b:typeof projected[number],c:typeof projected[number])=>(b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
  const lower:typeof projected=[];for(const point of projected){while(lower.length>=2&&turn(lower[lower.length-2]!,lower.at(-1)!,point)<=0)lower.pop();lower.push(point);}
@@ -169,25 +169,25 @@ export interface SourcePartAdmission extends SourcePartContextGeometry {
  /** 'contour' = the whole closed source loop; 'passage' = an anchor-bounded arc. */
  readonly span:'contour'|'passage';
 }
-/** Band incidence: representative band-face vertex -> incident section id
- * (perf-impl-152 / lane T12). Absent means band passages are not admitted. */
+
+
 export type SourceBandIncidence=(graph:MeshPartGraph,band:MeshPartGraph['bands'][number],indices:ArrayLike<number>,positions:ArrayLike<number>)=>ReadonlyMap<number,number>;
-/** Context admission is deterministic source work (perf-impl-152).
- *
- * Order: (1) the whole closed source contour at each cyclic anchor/winding
- * (the incumbent rule); (2) anchor-bounded source-contiguous passages of the
- * same contour (`sourcePartPassageCandidates`). The first candidate whose
- * context resolves a resident native entry under the RUNTIME admission rule
- * (role, path ports, convex, inside, both tangents, paper) AND whose two end
- * ports are distinct source vertices is admitted. No candidate, no entry or
- * collapsed ports = not admitted: the part keeps its incumbent producer.
- *
- * A fork band is the one declared band producer (role `turn`): its geometry
- * is the band's source junction envelope (convex hull of its face vertices),
- * and its passages are bounded by BAND INCIDENCE anchors, i.e. hull vertices
- * labelled with the incident section they belong to; a passage must join two
- * different incident sections. Without an incidence table, or for any other
- * open band, nothing is admitted (correspondence-only, incumbent kept). */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 function sourcePartContextFor(record:SourcePartProgramRecord,graph:MeshPartGraph,complex:MeshSourceComplex,source:Pick<SourceProgramInput,'positions'|'indices'>,incidence?:SourceBandIncidence):SourcePartAdmission|undefined{
  const positions=source.positions,rep=(vertex:number)=>(graph.vertexRepresentatives[vertex]??vertex)>>>0;
  const admit=(candidate:SourcePartContextGeometry,ports:readonly [number,number]|undefined,closed:boolean,span:SourcePartAdmission['span']):SourcePartAdmission|undefined=>{
@@ -204,7 +204,7 @@ function sourcePartContextFor(record:SourcePartProgramRecord,graph:MeshPartGraph
    const a=base.indexOf(points[0] as typeof base[number]),b=base.indexOf(points[points.length-1] as typeof base[number]);
    return a<0||b<0?undefined:[sampleVertex(section.samples[a]!,graph.axis,positions),sampleVertex(section.samples[b]!,graph.axis,positions)];
   };
-  // Parent admission measures the PAGE side (perf-impl-155); the live packet
+
   // classification (`sectionContext`) keeps the incumbent rule.
   for(const candidate of sourcePartContextCandidates(graph.axis,record.role,true,{points:base,center},'page')){
    const admitted=admit(candidate,portsOf(candidate.points),true,'contour');if(admitted)return admitted;
@@ -278,21 +278,21 @@ export function compileSourcePartPassages(source:Pick<SourceProgramInput,'positi
  * of the four connected passages, valid context, or stable source ports stays
  * unknown and therefore retains the incumbent path; no fake role or box is
  * emitted. */
-/** The whole template's contact list (perf-impl-161): only REQUIRED contacts.
- * A proven ordinary seam of one closed welded shell (separately indexed
- * faces, d607bdf515) is the whole construction itself, not a depicted
- * contact, so it is not serialized. The runtime guard
- * (`sourceWholeConstructionRenderable` rejects any contact) is unchanged and
- * still refuses every cross-component, open, nonmanifold or defective one.
- * The raw candidate index stays the contact's feature identity. One source-
- * revision classification (`sourceContactRequirements`) decides it. */
+
+
+
+
+
+
+
+
 export function compileWholeTemplateContacts(complex:MeshSourceComplex):SourceWholeOpeningTemplate[]{
  const contacts:SourceWholeOpeningTemplate[]=[];
  const requiredContacts=sourceContactRequirements(complex);
  for(const [contactIndex,contact]of complex.contacts.entries()){
   if(!requiredContacts[contactIndex])continue;
   const first=contact.members[0],last=contact.members[contact.members.length-1];
-  // perf-impl-163: a contact member's `edge` is a HALFEDGE id (the original
+
   // index address `SourceEdge.id`), not an index into the compact `edges`
   // array. Resolve halfedge -> edge index first; indexing `edges` directly
   // dropped every required contact whose halfedge id exceeded the edge count
@@ -320,7 +320,7 @@ export function compileWholeConstructionTemplate(source:SourceProgramInput,analy
  // far consumer (gpu-source-far-forms.ts) copies `context` into the played
  // run, so it is the ADMITTED candidate's token. The packet's record token is
  // its FIRST legal closed candidate, which for a flank may be the other side
- // (class 3 vs 4) than the admitted anchor: perf-impl-152 no longer copies it.
+
  const parts:SourceWholePartTemplate[]=report.parts.map(part=>({feature:part.record.feature,entryRef:part.entryRef,
   context:part.context.token,role:WHOLE_ROLE[part.record.role]!,
   ports:part.ports,sourceContributors:[part.record.sourceId],geometry:part.points,closed:part.closed}));
@@ -365,17 +365,17 @@ export function* sourceProgramWork(source:SourceProgramInput):Generator<void,Com
  const partPacket=sourcePartProgramPacket(runProgram.topology);
  const partAnchorVertices=partPacket?sourcePartAnchorVertices(partPacket,source.indices):undefined;
  const wholeConstruction=compileWholeConstructionTemplate(source,analysis,complex);yield;
- // perf-impl-156: the smallest-tier class from the same immutable part graph.
+
  // Its relationship counts come from this same compilation: plane-region
  // openings and source contacts, so eligibility can refuse a generic outline.
- // perf-impl-159: contacts are REQUIRED contacts only; proven closed-shell
+
  // seams of separately indexed faces are not depicted contacts.
  const smallParent=analysis.type==='terrain'?undefined:compileSourceSmallParent(analysis.structure,source.positions,{
   openings:(analysis.planeRegions??[]).reduce((sum,region)=>sum+(region.openings?.length??0),0),...compileSourceRelationships(complex)});
- // COMPILED CONSTRUCTION LEVELS (perf-impl-93): compiled with this revision
+
  // from its own edge classes, carried in the source packet the relation
  // stage already binds. A terrain source and the legacy packet keep all.
- // perf-impl-106: the table also carries the compiled L2 outline hull.
+
  const edgeLevels=compileConstructionLevels(runProgram.topology,complex,source.positions,analysis.type);
  const packet:CompiledSourceProgram['packet']=source.incidence==='gpu-csr'?{kind:'gpu-csr-v1',plan:compileSourceIncidencePlan(source,complex,{materialClasses,edgeLevels})}:{kind:'legacy-v2',words:packMeshSource(source,complex,{materialClasses})};yield;
  const geometry=physical?.geometry??{owner:source.id,revision:source.revision,positions:source.positions,indices:source.indices,contactKeys:source.contactKeys,...source.definition};

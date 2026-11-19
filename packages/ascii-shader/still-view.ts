@@ -123,13 +123,13 @@ export class AppearanceHash {
  }
  /** The job started on `frame`: still needs that frame's hash. */
  watch(frame:number):void{this.watched={frame};this.waitFrom=undefined;this.blipFrom=undefined;this.streak=0;}
- /** Still when a hash newer than the job's frame equals the job frame's hash.
-  * Not yet read back: wait (no job) for up to WAIT_FRAMES host frames, then
-  * start a job as before, so a lost readback never holds a view. A difference
-  * counts once three consecutive resolved hashes differ (the appearance is
-  * hashed every other frame: frames N, N+2, N+4): the engine image has
-  * one-frame blips (a texel flips and reverts, perf-impl-43) that never reach
-  * the text; continuous change (motion) differs on every frame. */
+
+
+
+
+
+
+
  state(frame:number):''|'appearance-wait'|'appearance-blip'|'appearance-pending'|'appearance'{
   const watched=this.watched,latest=this.latest;
   if(!watched)return 'appearance-pending';

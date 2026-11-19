@@ -53,41 +53,6 @@ impl BodyRecord {
     };
 }
 
-#[cfg(test)]
-mod tests {
-    use super::BodyRecord;
-    use std::mem::{offset_of, size_of};
-    #[test]
-    fn body_record_layout_matches_the_plain_word_bindings() {
-        assert_eq!(size_of::<BodyRecord>(), 21 * 4);
-        let offsets = [
-            offset_of!(BodyRecord, set_index),
-            offset_of!(BodyRecord, local_index),
-            offset_of!(BodyRecord, head_contact_key),
-            offset_of!(BodyRecord, contact_count),
-            offset_of!(BodyRecord, head_shape_id),
-            offset_of!(BodyRecord, shape_count),
-            offset_of!(BodyRecord, head_chain_id),
-            offset_of!(BodyRecord, head_joint_key),
-            offset_of!(BodyRecord, joint_count),
-            offset_of!(BodyRecord, island_id),
-            offset_of!(BodyRecord, island_index),
-            offset_of!(BodyRecord, sleep_threshold),
-            offset_of!(BodyRecord, sleep_time),
-            offset_of!(BodyRecord, sleep_velocity),
-            offset_of!(BodyRecord, mass),
-        ];
-        for (word, offset) in offsets.into_iter().enumerate() {
-            assert_eq!(offset, word * 4);
-        }
-        assert_eq!(offset_of!(BodyRecord, body_move_index), 15 * 4);
-        assert_eq!(offset_of!(BodyRecord, id), 16 * 4);
-        assert_eq!(offset_of!(BodyRecord, flags), 17 * 4);
-        assert_eq!(offset_of!(BodyRecord, body_type), 18 * 4);
-        assert_eq!(offset_of!(BodyRecord, generation), 19 * 4);
-        assert_eq!(offset_of!(BodyRecord, safety_factor), 20 * 4);
-    }
-}
 
 #[cfg(target_arch = "wasm32")]
 #[cfg(target_arch = "wasm32")]

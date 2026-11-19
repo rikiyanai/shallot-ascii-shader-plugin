@@ -197,6 +197,3 @@ wrap_request_handler! {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

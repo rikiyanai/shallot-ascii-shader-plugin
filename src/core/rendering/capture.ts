@@ -9,7 +9,7 @@ interface CaptureIdentity {
     encoding: "rgba8-tight";
 }
 
-/** The viewport size and device scale used by capture fixtures. */
+
 export const CAPTURE_CONTRACT: {
     width: number;
     height: number;
@@ -83,7 +83,7 @@ export async function captureTexture(world: World, eid: number): Promise<Capture
     };
 }
 
-/** one capture: tightly packed RGBA at the declared identity. */
+
 export interface Capture {
     rgba: Uint8ClampedArray;
     width: number;
@@ -143,13 +143,13 @@ export function encodeFrameCapture(world: World, view: View): void {
     }
 }
 
-/**
- * Read a running canvas's rendered target at its own backing size as tightly packed RGBA, not the
- * composited page or physical display. A bound WebGPU canvas captures the next presenting frame and
- * refuses capture if that frame reuses a texture an earlier frame drew to; await world.frameFence
- * (or yield a task) before the capture frame. An unbound canvas uses its bitmap. A held app presents
- * no next frame; capture its page with a Playwright page screenshot instead.
- */
+
+
+
+
+
+
+
 export async function captureFrame(canvas: HTMLCanvasElement): Promise<Capture> {
     const binding = canvasFrameBinding(canvas);
     if (binding) {

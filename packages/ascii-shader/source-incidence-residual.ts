@@ -121,7 +121,7 @@ fn sourceEdgeLevel(h:u32)->u32{
  var at=0u;if($source[0u]==0x4d41494eu){if($source[1u]==${COMPACT_RELATION_SOURCE_VERSION}u){at=$source[8u];}else if($source[1u]==${GPU_NUMERIC_RELATION_SOURCE_VERSION}u){at=$source[20u];}}
  if(at==0u){return 0u;}return ($source[at+(h>>1u)]>>((h&1u)*16u))&0xffffu;
 }
-// THE COMPILED L2 OUTLINE HULL (compileOutlineHull, perf-impl-106): the
+
 // section after the ceil(H/2) code words of the same table, H = faces x 3.
 // 0 = this source has no outline construction (and is never drawn at L2).
 fn sourceHullAt()->u32{

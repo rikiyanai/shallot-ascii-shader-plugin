@@ -51,7 +51,7 @@ struct Status {count:atomic<u32>,overflow:atomic<u32>,nonmanifold:atomic<u32>,tr
 @group(0) @binding(10) var formDepths:texture_2d<u32>;
 @group(0) @binding(11) var<uniform> formWorldFromClip:mat4x4f;
 ${FORM_DEPTH_WGSL}
-// CONTACT SELECTION BEFORE CONTACTS (perf-impl-95). p.form: x bit 0 the frame's
+
 // form table is bound, bit 1 this source draws the field; y one text row in
 // field pixels (f32 bits); z, w the field extent. An owner with no texel of
 // the field is unseen; an owner whose compact form is 遠景 (rows under
@@ -65,7 +65,7 @@ fn contactSkipped(owner:vec2u)->bool{
  let m=formWorldFromClip;let extent=vec2f(f32(p.form.z),f32(p.form.w));
  if(!(abs(m[0][3])+abs(m[1][3])+abs(m[2][3])>1e-6*abs(m[3][3])&&formOpen())){return false;}
  if(formCut(form.box,extent)||formSpansDepth(form.near,form.far,extent,m)){return false;}
- // perf-impl-107: the one held form level when the writer published it
+
  // (header texel w), so a form's contacts follow its relation level exactly.
  if(textureLoad(formDepths,vec2i(0,${FORM_DEPTH_HEADER_ROW}),0).w!=0u){return formHeldLod(owner,true)==2u;}
  return (form.bottom-form.top)/bitcast<f32>(p.form.y)<${FAR_STRIP_BELOW_ROWS*LOD_TIER_HOLD};
@@ -253,7 +253,7 @@ export class SurfaceIntersections {
   const raster=device.createShaderModule({code:RASTER});
   this.raster=(['back','none','front'] as const).map(cullMode=>device.createRenderPipeline({layout:'auto',vertex:{module:raster,entryPoint:'vertex'},fragment:{module:raster,entryPoint:'fragment',targets:[{format:'r32uint'}]},primitive:{cullMode},depthStencil:{format:'depth32float',depthWriteEnabled:true,depthCompare:'greater-equal'}}));
  }
- /** perf-impl-95: set by SurfaceRelations before appendAll. */
+
  fieldDomains?:ReadonlySet<number>;page?:readonly number[];private emptyForm?:GPUTexture;
  ensureCapacity(count:number):void{
   if(!Number.isSafeInteger(count)||count<0)throw Error('Invalid contact triangle count');

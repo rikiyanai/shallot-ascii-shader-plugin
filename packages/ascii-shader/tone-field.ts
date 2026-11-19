@@ -66,7 +66,7 @@ const wallWord=(text:string):number=>{const index=TONE_PASSAGES.findIndex(passag
 const DENSE_A=wallWord(':;:;:'),DENSE_B=wallWord(':;:;:;'),FRINGE=wallWord('. : .'),TAIL=wallWord('. .');
 // The ground's retained words (hand-target ground passages): the even field
 // member `:`, a slope's dense stacked band `:::` and its staggered thinning
-// `.:.:.:` (operator markup review-untitled-24: the lower-right and
+
 // medium-far colon grid; the blue side-plane band), the sea's dash member.
 const groundWord=(text:string):number=>{const index=TONE_PASSAGES.findIndex(passage=>passage.context==='ground'&&passage.text===text);if(index<0)throw Error(`Missing ground tone passage ${text}`);return index;};
 const GROUND_FIELD=groundWord(':'),SLOPE_DENSE=groundWord(':::'),SLOPE_SPACED=groundWord('.:.:.:'),WATER_FIELD=groundWord('-');
@@ -145,16 +145,16 @@ function regionKey(domain:number,bx:number,by:number,offset:number):number{
  h=(h^(h>>>15))>>>0;h=Math.imul(h,0x2c1b3c6d)>>>0;h=(h^(h>>>12))>>>0;
  return (h|1)>>>0;
 }
-/** CANONICAL MEMBER ORDER (2026-11-12). Members are appended by atomics in
- * whatever order the GPU ran the emitting threads, and the seed that turns
- * them into row words keeps the first of competing members: the kept word
- * followed thread timing (perf-impl-3-tone: a per-node list instead of a
- * per-pixel dispatch respelt .:.:.: as ::: on five rows). These passes
- * rewrite the list into rows in order, each row's members ordered by their
- * surface key (lattice node or plane offset, cells, packed band/passage/
- * ordinal/axis/exponents, source, owner; then passage, centre X, depth): the
- * same surface point keeps the same priority wherever the camera is and
- * however the emitting dispatches were shaped. Rows: counts, starts, fill. */
+
+
+
+
+
+
+
+
+
+
 export const TONE_ORDER_SHADER=/* wgsl */`
 struct Q {rows:u32,capacity:u32,pad0:u32,pad1:u32}
 @group(0) @binding(0) var<uniform> q:Q;
@@ -356,7 +356,7 @@ fn toField(page:vec2f)->vec2f{return (page-p.rect.xy)*p.field.xy/p.rect.zw;}
 ${MATERIAL_INK_WGSL}
 fn materialForeground(page:vec2f,owner:vec2u)->u32{
  // A form with a chromatic material keeps its material hue (examples-89,
- // operator note 5: tonemapping draws coloured glyphs). Any other form keeps
+
  // the incumbent transport unchanged.
  let ink=materialInk(owner);if(ink!=0u){return ink;}
  let dimensions=vec2i(textureDimensions(radiance));
@@ -425,7 +425,7 @@ fn facetSeam(mark:vec4f)->bool{
 // asks about, so every cell of one form holds that form's one tier.
 //
 // TONE BY TIER. Distance does not stop tone: past the red line of the
-// operator's markup (apps/stroke-matcher/references/review-untitled-24.png,
+
 // "EXAMPLE OF MEDIUM FAR LOD" and "EXAMPLE SUPER FAR LOD") the dot content
 // carries most of the drawing and the lines thin instead. The word table is
 // the same at every tier (passages, wordOf); the tier, the form's own size on
@@ -476,7 +476,7 @@ fn openGround(q:vec2f,d:f32,o:vec2u,style:u32)->bool{
 // covers at the point. On level ground that is the point's distance below its
 // horizon on the page, so the field is densest under the horizon and thins to
 // paper toward the viewer (skill section 8 rule 2: lighten by erasing members;
-// operator far/mid examples 2026-11-10: sparse marks below the base line;
+
 // hand-authored tonemapping target: a floor seen from close is paper). No
 // scene length is voted or guessed: the camera and the surface give it.
 fn groundRows(q:vec2f,d:f32)->f32{
@@ -881,7 +881,7 @@ fn cellStep(P:vec3f,n:vec3f,y:f32,L:Lattice)->f32{
 }
 // THE REGION FIELD (tone lane 2026-11-12/13; replaces the turn band that
 // kept only one to three cells along the dark edge and left the rest of a
-// shaded face paper: operator "NO SPARSE TONE"). A shaded plane carries its
+
 // field over its whole region. Its n·L in the fixed bands gives the band's
 // level: n·L .15 to .45 level 1 (spaced ". : ."), -.1 to .15 level 2
 // (".:.:.:"), under -.1 level 3 (":;:;:;"); a face inside a cast shadow counts
@@ -1614,7 +1614,7 @@ fn continuesSpan(c:u32)->bool{return (atomicLoad(&walkContinues[c/32u])&(1u<<(c%
 // lattice rows: ずらし, read from the surface, never from the page row) and
 // writes the unit. Neighbouring threads never wait on each other and no span
 // is walked.
-// THE 10-12 SEA (sea-100 rebase of numabe-90 arm B; operator 2026-11-17: the
+
 // sea looks and behaves like the frozen 10-12 Y8 runtime's water,
 // runtimes/y8-20261012 packages/trueff/render/ff/terrain.ts FL-4918 attempts
 // 217-329, spelled as its layout.ts:1081-1089 spells WATER from
@@ -2496,7 +2496,7 @@ export class ToneField {
    // first's writes.
    const tables=this.rowTables(rows);
    // Two passes (labelled apart for the frame profile): the serial row walk
-   // costs ~97% of the tone time on Y8 (perf-impl-3-tone), the units ~3%.
+
    const prelude=encoder.beginComputePass({label:'MAIN tone row texture edges'});prelude.setBindGroup(0,group);prelude.setBindGroup(1,tables.group);
    // One workgroup per row (WGSL rowWalk).
    prelude.setPipeline(this.rowPrelude);prelude.dispatchWorkgroups(rows);prelude.end();

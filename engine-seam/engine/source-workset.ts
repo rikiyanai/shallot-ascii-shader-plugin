@@ -43,7 +43,7 @@ function posedBox(box:SpatialBounds,p:Float32Array):SpatialBounds|undefined{
 type Member={eid:number;mesh:number;meshRow:number;poseRow:number;pose:Float32Array;worldFromSource?:Float32Array;seeded:boolean;settleTick:number;initialBoundsFrame:number;bounds?:SpatialBounds;formBounds?:SpatialBounds};
 type Slot={version:number;volume:Float32Array;meshes:Map<number,number>;members:Member[]};
 export interface SourceViewInstance {readonly eid:number;readonly mesh:number;readonly bounds?:SpatialBounds;readonly settling:boolean;readonly boundsPending:boolean;readonly worldFromSource?:Readonly<Float32Array>}
-/** perf-impl-95: an octree node the caller found adequate, as ONE representation. */
+
 export interface SourceViewParent {readonly bounds:SpatialBounds;readonly instances:readonly SourceViewInstance[];readonly key:number}
 export interface SourceViewWorkset {readonly instances:readonly SourceViewInstance[];readonly parents?:readonly SourceViewParent[];readonly exterior:boolean}
 class SourceWorkset{
@@ -178,7 +178,7 @@ class SourceWorkset{
   if(!this.visible(slot))return;
   const held=this.slots.get(slot)!;
   if(adequate){
-   // OCTREE REPRESENTATION (perf-impl-95): an adequate node is one parent;
+
    // a node with a settling member is never one (its members stay single).
    const data=this.world.resource(RenderContext).cullVolumeStaging!,base=slot*CULL_VOLUME_FLOATS;
    const instances:SourceViewInstance[]=[],parents:SourceViewParent[]=[];

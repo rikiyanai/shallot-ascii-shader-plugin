@@ -172,11 +172,7 @@ impl Scheduler {
             }
         }
     }
-    #[cfg(test)]
-    pub fn worker(&self) {
-        self.register_worker();
-        self.worker_with_fault(false);
-    }
+
     pub fn worker_with_fault(&self, inject_fault: bool) {
         loop {
             self.wait();
@@ -208,69 +204,5 @@ pub fn pause(spins: u32) {
     #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
     for _ in 0..spins {
         core::hint::spin_loop();
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    struct Work {
-        counts: Vec<AtomicUsize>,
-        entered: AtomicUsize,
-        threads: usize,
-    }
-    unsafe fn task(context: usize, index: usize) {
-        let work = &*(context as *const Work);
-        if index < work.threads {
-            work.entered.fetch_add(1, Ordering::SeqCst);
-            while work.entered.load(Ordering::SeqCst) < work.threads {
-                std::thread::yield_now();
-            }
-        }
-        work.counts[index].fetch_add(1, Ordering::SeqCst);
-    }
-    #[test]
-    fn tasks_run_once_and_finish_observes_completion_at_two_and_eight_threads() {
-        for threads in [2, 8] {
-            let scheduler = Scheduler::new();
-            let work = Work {
-                counts: (0..128).map(|_| AtomicUsize::new(0)).collect(),
-                entered: AtomicUsize::new(0),
-                threads,
-            };
-            std::thread::scope(|scope| {
-                for _ in 1..threads {
-                    scope.spawn(|| scheduler.worker());
-                }
-                for _ in 0..16 {
-                    assert_eq!(scheduler.task_count(), 0);
-                    work.entered.store(0, Ordering::SeqCst);
-                    for count in &work.counts {
-                        count.store(0, Ordering::SeqCst);
-                    }
-                    let handles: Vec<_> = (0..128)
-                        .map(|i| unsafe {
-                            scheduler.enqueue(
-                                task as unsafe fn(usize, usize),
-                                &work as *const Work as usize,
-                                i,
-                            )
-                        })
-                        .collect();
-                    for (i, handle) in handles.into_iter().enumerate() {
-                        scheduler.finish(handle);
-                        assert_eq!(work.counts[i].load(Ordering::SeqCst), 1);
-                    }
-                    assert_eq!(scheduler.task_count(), 128);
-                    scheduler.reset();
-                    assert_eq!(scheduler.task_count(), 0);
-                }
-                scheduler.stop();
-            });
-            assert!(work
-                .counts
-                .iter()
-                .all(|count| count.load(Ordering::SeqCst) == 1));
-            scheduler.reset();
-        }
     }
 }

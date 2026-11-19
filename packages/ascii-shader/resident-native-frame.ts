@@ -6,8 +6,8 @@ import type {ArticulationResult} from './gpu-articulation.ts';
 import type {ConstructionMetrics} from './native-construction.ts';
 import type {PresentationMode} from './text/text-frame.ts';
 
-/** Immutable display snapshot. Reading it is an operator export operation;
- * normal drawing uses results[].resident.tape and never calls this module. */
+
+
 export interface ResidentNativeSnapshot {
  readonly results:readonly ArticulationResult[];
  readonly width:number;readonly height:number;readonly serial:number;

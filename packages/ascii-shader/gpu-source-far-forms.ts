@@ -7,29 +7,29 @@ import {inverseMatrix} from './composition.ts';
 import type {SourceSmallParent} from './source-small-parent.ts';
 import {packSmallConstructionKindAndEnds} from './role-grammar-format.ts';
 
-/** THE FAR AGGREGATE (perf-impl-96, the parent construction of the structural
- * LOD). ONE compiled representation stands for a whole group of forms that are
- * too small to be drawn singly; its members' fine relations are never produced.
- * Two member kinds share this one emitter and the one consumer (articulation's
- * farKind -> farSkyline, the merged far skyline):
- *  - an ENTITY aggregate: a whole form smaller than one native cell (one
- *    member), or an adequate octree node of entity instances (spatial-index
- *    `select` -> engine workset `parents` -> source-lod `parents`): one record
- *    with the node's members as a sorted (domain, eid) list. A node record is
- *    source-owned programs (cap/turn/flank/return) project their own immutable
- *    samples with the retained instance pose. Each run carries exact native
- *    context, source ports and field-domain contributor identity. Older
- *    residents without usable geometry/pose retain ONE incumbent profile;
- *    they are not complete whole constructions and are not marked accepted.
- *  - a PRODUCER aggregate: the far producer rows (one draw, many owners: voxel
- *    detail props, batched static rows) whose own visible form is smaller than
- *    one native cell (farAggregateMember, the SAME test the relation stage uses
- *    to skip their relations). They are merged into the outline of what they
- *    stand on: per page column, they add a unit to the merged skyline only where
- *    a member pixel is that column's topmost ink (terrain-class far line, the
- *    horizon table); under another form's outline they add no mark.
- * Bounds select work; geometry owns the part extent and the same-pose native
- * owner/depth field clips native words. No glyph is chosen here. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export interface SourceFarAggregate {readonly key:number;readonly box:readonly [number,number,number,number];readonly members:readonly (readonly [number,number])[];readonly construction?:SourceWholeConstruction}
 export interface SourceFarProducers {readonly domains:readonly number[];readonly perspective:boolean}
 export interface SourceFarForms {readonly domain:number;readonly instances:readonly FarFormInstance[];readonly aggregates?:readonly SourceFarAggregate[];readonly producers?:SourceFarProducers}
@@ -143,7 +143,7 @@ fn sourceParts(input:Input,local:u32){
   }
  }
 }
-// THE PARENT PROFILE (perf-impl-108): an entity aggregate is a one-cell far
+
 // form or an octree node under the connected-outline tier (source-lod
 // PARENT_MAX_COLUMNS columns at most, so the box meets at most
 // PARENT_PROFILE_COLUMNS page columns). The 64 lanes split its page columns;

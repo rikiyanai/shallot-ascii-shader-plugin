@@ -24,7 +24,7 @@ import type {GpuToneMembers} from './tone-field.ts';
 import {GpuNativeSealer} from './gpu-native-seal.ts';
 import {GPU_PLANAR_FAN} from './gpu-planar-fan.ts';
 import {issueGpuNativeTapeSeal,type GpuNativeTape} from './gpu-native-tape.ts';
-import {instrumentWgsl,traceRecorderWgsl,decodeTrace,TRACE_OFF_WGSL,TRACE_HEADER,type TraceSite} from './gpu-trace.ts';
+
 
 export interface ArticulationPoint {
  readonly x:number;readonly y:number;readonly depth:number;readonly parameter:number;readonly visible:boolean;
@@ -85,9 +85,9 @@ export interface ArticulationLiteralFeed {
 const MAIN_PROBES=typeof location!=='undefined'&&new URLSearchParams(location.search).has('mainProbes');
 const ROW_CAP=2048,WORD_WORDS=32,ROW_WORDS=18,MEMO_AT=2056,MEMO_WORDS=20,MEMO_HEADER_WORDS=6;
 const MEMO_CORRESPONDENCE_AT=15;
-/** perf-impl-109 source-backed limb pair table, after the ripple grids in the
- * per-frame transient words: LIMB_SLOTS slots (unchanged capacity), each the
- * exact 4-word tuple + 4 ordered x words (perf-impl-109c). */
+
+
+
 const LIMB_SLOTS=4096,LIMB_WORDS=8;
 /** One source-program seed record per relation run. Records are established
  * before reduction, then a later ordered pass walks exact-key bucket chains.
@@ -108,17 +108,17 @@ export const RESIDENT_RUN_WORDS=CONSTRUCTION_RUN_WORDS;
 const ACTIVE_QUEUE_FAMILIES=9,ACTIVE_QUEUE_META_WORDS=ACTIVE_QUEUE_FAMILIES*2,ACTIVE_SOURCE_QUEUE_FAMILIES=7,ACTIVE_QUEUE_LABEL=7,ACTIVE_QUEUE_TONE=8,ACTIVE_ARGUMENT_WORDS=ACTIVE_QUEUE_FAMILIES*3;
 export const FAR_TEXTURE_PROBE_BOUNDS=[3,48,6,0] as const;
 export interface MainTransientLayoutInput {readonly runCount:number;readonly epochWords:number;readonly paperWords:number;readonly gridWords:number;readonly orderWords:number;readonly rowLayoutWords:number;readonly proposalCapacity:number;readonly farPlanWords:number;readonly activeQueueWords:number;readonly partAnchorWords?:number;}
-export interface MainTransientLayout {readonly transientWords:number;readonly proposalWords:number;readonly proposalBase:number;readonly proposalStatus:number;readonly farPlanBase:number;readonly activeQueueBase:number;readonly rowLayoutBase:number;readonly orderBase:number;readonly partAnchorBase:number;readonly intervals:Readonly<Record<'state'|'partAnchors'|'order'|'rows'|'proposals'|'farPlan'|'activeQueues'|'trace',readonly [number,number]>>;}
-export function mainTransientLayout(input:MainTransientLayoutInput,traceWords=0):MainTransientLayout{
+export interface MainTransientLayout {readonly transientWords:number;readonly proposalWords:number;readonly proposalBase:number;readonly proposalStatus:number;readonly farPlanBase:number;readonly activeQueueBase:number;readonly rowLayoutBase:number;readonly orderBase:number;readonly partAnchorBase:number;readonly intervals:Readonly<Record<'state'|'partAnchors'|'order'|'rows'|'proposals'|'farPlan'|'activeQueues',readonly [number,number]>>;}
+export function mainTransientLayout(input:MainTransientLayoutInput):MainTransientLayout{
  const {runCount,epochWords,paperWords,gridWords,orderWords,rowLayoutWords,proposalCapacity,farPlanWords,activeQueueWords}=input;
  const partAnchorWords=input.partAnchorWords??0;
- for(const value of [runCount,epochWords,paperWords,gridWords,orderWords,rowLayoutWords,proposalCapacity,farPlanWords,activeQueueWords,partAnchorWords,traceWords])if(!Number.isSafeInteger(value)||value<0)throw Error('Invalid MAIN transient extent');
+ for(const value of [runCount,epochWords,paperWords,gridWords,orderWords,rowLayoutWords,proposalCapacity,farPlanWords,activeQueueWords,partAnchorWords])if(!Number.isSafeInteger(value)||value<0)throw Error('Invalid MAIN transient extent');
  const stateWords=runCount+epochWords+paperWords+epochWords+runCount*3+gridWords,orderSpan=orderWords*2,proposalWords=proposalCapacity*WORD_PROPOSAL_WORDS+4;
  const transientWords=stateWords+partAnchorWords+orderSpan+rowLayoutWords+proposalWords+farPlanWords+activeQueueWords;
  const proposalBase=transientWords-proposalWords-farPlanWords-activeQueueWords;
  const rowLayoutBase=proposalBase-rowLayoutWords,orderBase=rowLayoutBase-orderSpan,farPlanBase=proposalBase+proposalWords,activeQueueBase=farPlanBase+farPlanWords;
  const partAnchorBase=stateWords;
- const intervals={state:[0,stateWords] as const,partAnchors:[partAnchorBase,partAnchorBase+partAnchorWords] as const,order:[orderBase,orderBase+orderSpan] as const,rows:[rowLayoutBase,rowLayoutBase+rowLayoutWords] as const,proposals:[proposalBase,proposalBase+proposalWords] as const,farPlan:[farPlanBase,farPlanBase+farPlanWords] as const,activeQueues:[activeQueueBase,activeQueueBase+activeQueueWords] as const,trace:[transientWords,transientWords+traceWords] as const};
+ const intervals={state:[0,stateWords] as const,partAnchors:[partAnchorBase,partAnchorBase+partAnchorWords] as const,order:[orderBase,orderBase+orderSpan] as const,rows:[rowLayoutBase,rowLayoutBase+rowLayoutWords] as const,proposals:[proposalBase,proposalBase+proposalWords] as const,farPlan:[farPlanBase,farPlanBase+farPlanWords] as const,activeQueues:[activeQueueBase,activeQueueBase+activeQueueWords] as const};
  return {transientWords,proposalWords,proposalBase,proposalStatus:proposalBase+proposalCapacity*WORD_PROPOSAL_WORDS,farPlanBase,activeQueueBase,rowLayoutBase,orderBase,partAnchorBase,intervals};
 }
 export function activeDispatchArgs(count:number,stride:number):readonly[number,number,number]{
@@ -235,8 +235,8 @@ ${ARTICULATION_PARAMETERS}
  let groups=(min(counts[p.proposals.z],p.proposals.y)+63u)/64u;
  arguments[0]=min(groups,p.proposals.w);arguments[1]=max(1u,(groups+p.proposals.w-1u)/p.proposals.w);arguments[2]=1u;
 }`;
-// The decision trace's header words: after the three far skyline tables, before the correspondence header (gpu-trace.ts).
-const TRACE_AT=2048,TRACE_LOG_WORDS=8*1024*1024;
+
+
 /** Source-owned region records join the SAME native priority/cursor pass.
  * This merely transports the tone producer's decisions, not an image fit,
  * CPU member readback, second page, or a post-publication tone overlay. */
@@ -348,89 +348,89 @@ fn hasLifetime(first:u32,count:u32,value:u32)->bool{
 `;
 
 export {NEAR_FROM_ROWS,FAR_STRIP_BELOW_ROWS};
-/** THE TIER IS THE ROWS THE DRAWING HAS (shared contract of the line producer
- * here and the tone producer, tone-field.ts toneTier). A text artist's 近景 /
- * 中景 / 遠景 is how many 17 px text rows a form is drawn in (the
- * practitioner's 7-row petit drawing; the markup's super-far marks of one to
- * three rows), never a distance in world units: world distance matters only
- * through the rows it leaves. No game unit scale enters.
- *
- * tierOfRows(rows): 0 近景 near from NEAR_FROM_ROWS rows, 2 遠景 far under
- * FAR_STRIP_BELOW_ROWS rows, 1 中景 middle between (form-depths.ts owns both
- * numbers). The rows come from ONE TABLE, ONE READ: the field's form table
- * (form-depths.ts FormDepths, one pass per field over every owner's visible
- * pixels, before every reader). Lines (distanceTier) and tone (toneTier) both
- * bind it read-only and both call distanceTierOf below, so one form cannot
- * hold two tiers. A form is one source owner (the owner field's id pair).
- *  COMPACT STANDING FORM (an owner that does not span depth): ONE tier, from
- *   the rows its visible pixels occupy on the page, top to bottom. Visible,
- *   not projected through what hides it: the tier is what the drawing has to
- *   work with, and the far mark (farForm) stands in exactly those rows. A form
- *   CUT by an edge of the page (formCut) is at least that large, so
- *   it reads the nearer of its visible rows and the rows the reference length
- *   holds at its nearest depth: the cut never makes it far.
- *  SPANNING FORM, read PER POINT: a terrain source (one height surface runs
- *   from the camera to the horizon), any owner that spans depth (its farthest
- *   visible point at least FORM_DEPTH_SPAN = NEAR_FROM_ROWS /
- *   FAR_STRIP_BELOW_ROWS times as far as its nearest: a ground plane, a floor,
- *   a long wall, where one length goes from the near band to the far band
- *   across the owner) and an owner without a table slot. Its tier at a point
- *   is the band the REFERENCE LENGTH L holds there: rows = L / the world units
- *   one row covers at that point's depth (tierRowUnits, unprojected through
- *   the frame's own matrix; lines ask at the run's nearest point, tone at the
- *   cell). This is where the red line of the operator's markup
- *   (references/review-untitled-24.png) crosses the ground: where the
- *   scene's typical standing form would itself be drawn in under three rows.
- *  L comes from the world itself, per frame, on the GPU, without search: the
- *   median world size (longest side of the visible surface's world box) of
- *   the compact forms in view that the page does not cut, each weighted by
- *   its page area (form-depths.ts vote/reference, quarter octave bins): the
- *   size of the forms the drawing is made of. With no such form in view L = 0 and
- *   every spanning form is near throughout.
- *  A PARALLEL PROJECTION is 近景 throughout (no recession: one scale).
- *  An ENCLOSED VIEW is 近景 throughout: when the field shows no open
- *   background (formOpen: no sky patch, so no horizon is in view; a crack
- *   of a pixel or two between meshes does not open it), the view is one
- *   room drawn at one scale, and a room never enters the far regime
- *   (GOAL-EXECUTOR D7) nor dots its floor as receding ground (D6).
- * No state is kept between frames, so there is no hysteresis: the same pose
- * gives the same tier. Under a one-step camera move a compact form's rows
- * change by the step's projection; it changes tier only on the step that
- * carries it across 3 or 7 rows, and once. L changes only when the median
- * vote crosses a quarter-octave bin; then every per-point row count changes
- * by that one factor (2^0.25) in that frame and the red line moves with it.
- *
- * What each tier draws (GOAL-EXECUTOR agreed design 1, D9; the operator's
- * markup references/review-untitled-24.png, "EXAMPLE OF MEDIUM FAR LOD" and
- * "EXAMPLE SUPER FAR LOD", opened at full size). LINES thin with distance;
- * TONE DOES NOT STOP: past the red line the dot content carries most of the
- * drawing (tone-field.ts "TONE BY TIER" owns the tone rows below).
- *  近景 lines: the full graph. Tone: the region tone of each class.
- *  中景 lines: outline, principal creases, joins. Tone: the far vocabulary,
- *       one constant unit per ranked region at every node of its surface
- *       lattice: level ground the spaced dots, a region ranked dense (a
- *       slope's or a form's side turned from the light) the alternating
- *       dot-colon band, a region ranked spaced the spaced dots, the faces
- *       toward the light paper.
- *  遠景 lines: a standing form is ONE mark on the base line, or a low lobe
- *       with its turn and base when it is a wide mass; the terrain silhouette
- *       is the base line (farSkyline). Tone: the same units with every other
- *       lattice node erased (skill section 8: a band is lightened by erasing
- *       members), so the far band keeps its dotted ground and shaded sides.
- * The run pass's SIZE BAND (run.range.w) sizes compiled parts only; it does
- * not select the tier. */
-/** MATERIAL INK (examples-89, operator note 5 2026-11-14: tonemapping draws
- * COLOURED glyphs carrying the scene's colour; rework after the orchestrator
- * review: a form's colour is its own MATERIAL's, not the lit colour of one of
- * its facets). The host builds one table per frame (materialInkTable): each
- * drawn entity's authored base colour, reduced to a readable ink once on the
- * CPU: hue (base colour over its largest channel), saturation (1 - smallest
- * normalized channel). A saturated material (at least CHROMA_LEAST) gets its
- * hue as ink, scaled so the ink's luminance is at most INK_LUMA (readable on
- * white paper, the same intent as semantic-text.ts nativeLabelForeground); a
- * neutral material (white boxes, grey walls) gets no entry, and the caller
- * keeps its incumbent colour (black lines, the tone's incumbent transport).
- * No glyph, pen or word is chosen by colour. The bounds are this rule's own. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const CHROMA_LEAST=.45,INK_LUMA=.35,INK_VALUE=.85;
 export function materialInk(rgb:readonly number[]):number{
  const c=[0,1,2].map(i=>Math.max(0,rgb[i]??0)),top=Math.max(...c);
@@ -462,7 +462,7 @@ export const MATERIAL_INK_WGSL=/* wgsl */`
 fn materialInkPair(i:u32)->vec2u{let w=textureDimensions(materialInks).x;return textureLoad(materialInks,vec2i(i32(i%w),i32(i/w)),0).xy;}
 fn materialInk(owner:vec2u)->u32{
  // A producer row (owner bit 31) has no entity material, nor has a far
- // aggregate or skyline column (source domain 0, perf-impl-96/97: its
+
  // owner word is an octree or column key, not an entity).
  if((owner.x&0x80000000u)!=0u||owner.x==0u){return 0u;}
  let n=materialInkPair(0u).x;var lo=0u;var hi=n;
@@ -481,9 +481,9 @@ fn tierOfRows(rows:f32)->u32{return select(select(1u,2u,rows<${FAR_STRIP_BELOW_R
 // size. row: one text row in field pixels. 0 = 近景, 1 = 中景, 2 = 遠景.
 // Parallel and enclosed views are near; a compact form reads the rows it
 // occupies on the page. No world distance, no reference length, no line
-// across the ground enters (operator order 2026-11-10: the markup's red line
+
 // was a guess).
-// perf-impl-107: the form-table writer published held levels this frame
+
 // (header texel w, form-depths.ts resolveLod).
 fn formLodActive()->bool{return textureLoad(formDepths,vec2i(0,${FORM_DEPTH_HEADER_ROW}),0).w!=0u;}
 fn distanceTierOf(owner:vec2u,terrain:bool,f:vec2f,depth:f32,extent:vec2f,row:f32,worldFromClip:mat4x4f)->u32{
@@ -493,14 +493,14 @@ fn distanceTierOf(owner:vec2u,terrain:bool,f:vec2f,depth:f32,extent:vec2f,row:f3
   let form=formExtent(owner);
   if(form.found&&!formSpansDepth(form.near,form.far,extent,m)){
    let rows=(form.bottom-form.top)/row;
-   // SCREEN-SIZE LOD (operator order 2026-11-10; the per-object screen-size
+
    // selection of game engines, the line-density control of Cole et al. 2006
    // and Markosian et al. 2000): a compact form's level is the rows it
    // occupies on the page and nothing else. No world line, no reference
    // length. Every level draws the form's OWN edges, fewer of them (the
    // selection table is the fixed priority order, and each level's lines are
    // a subset of the level above); see farKind for the one merge.
-   // perf-impl-107: the form's ONE held level when the writer published it.
+
    if(!formCut(form.box,extent)){if(formLodActive()){return formHeldLod(owner,true);}return tierOfRows(rows);}
   }
  }
@@ -545,55 +545,55 @@ export const TIER_NEVER=0xffffffff;
  * feature edge (edge class 1), never for a facet crease of a triangle soup
  * (edge class 2, gpu-construction-runs.ts hardEdge). */
 export const PRINCIPAL_CREASE_FROM_HARD_BIT=true;
-/** Selection by distance tier, [tier][column]: the least visible projected run
- * length, in 17 px text rows, for a run to be drawn. Columns 0-4 are assemble's
- * line class (run flags >>8): 0 silhouette and depth step, 1 occluding contour,
- * 2 contact, 3 facet crease, 4 suggestive contour; column 5 is a principal
- * (hard) crease. The row is the form's ONE tier (distanceTierOf: its rows).
- * What each class contributes to the read decides where it stays:
- *  silhouette, occluding contour: the form itself; every tier (D9: the
- *   smallest tier is the connected outline).
- *  principal crease (an authored feature edge: a box's lid and corner
- *   edges, a step's nosing): what makes a box read as a box and not a flat
- *   patch; every tier at any length, with or without a tone change
- *   (tierSelects). A far box's lid line is part of its connected outline (the
- *   markup's medium-far houses are tiny outlined boxes).
- *  contact: the form standing on its ground, a junction in 近景 and 中景 at
- *   any size (a 3-6 row box keeps its base on the floor); in 遠景 the ground
- *   line is the far strip's base line and the outline's own base edge, so a
- *   separate contact stroke under a far form is not drawn.
- *  facet crease: interior modelling; 近景 only across a tone change.
- *  interior curve (column 4: a suggestive contour or a principal-curvature
- *   ridge/valley, surface-relations.ts ridgeLines): chosen as a WHOLE linked
- *   curve, never a fragment (operator order 2026-11-11: interior lines are
- *   joined on the mesh before choosing among them). The run pass links them
- *   through shared edge crossings; a curve under two rows in 近景 or three in
- *   中景 is a scrap an inker does not draw, a longer one is the brim, the jaw,
- *   the arm across the chest. 遠景: the outline only. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const TIER_SELECTION:readonly (readonly number[])[]=[
  [0,0,0,0,2,0], // 近景: the full graph; a facet crease only across a tone change; interior curves of two rows or more
  [0,0,0,1,3,0], // 中景: outline, contacts, every principal crease, and a facet crease of one row or more that is a plane boundary (tierSelects: a tone-band change or a 45 degree turn)
  [0,0,TIER_NEVER,1,TIER_NEVER,0], // 遠景: the connected outline, its principal creases and a plane boundary of one row or more (second in the priority order; a two-row rock is its outline and its top edge)
 ];
-/** Selection rows of a TERRAIN source (form 3, run flag 0x10000000), same
- * columns. Column 3 is never drawn at any tier: an interior facet crease of a
- * height surface is not an outline candidate, its side planes are told apart
- * by tone. Column 5 is a principal slope turn (terrainCreaseRead): 近景 a crease
- * at least 3 rows long whose two faces turn by TERRAIN_TURN_COS or more; 中景
- * at least 4 rows long and a shelf edge (one face within TERRAIN_SHELF_TOP of
- * level, the other at least as steep as TERRAIN_SHELF_FACE); 遠景 none: the
- * silhouette alone, which the far strip spells. Columns 0 and 1 in 中景 and
- * 遠景 are OUTLINES only (tierSelects, terrainOutlineRead): a line whose far
- * side continues its near surface within one row's world span (a seam on flat
- * ground, a fold inside one slope, a picket of facet contours down a cliff
- * face) is that surface's interior and its tone carries it.
- * Column 4 is the surface's INTERIOR TURN line (relation kind 3, the magenta
- * line of the underdrawing; gpu-construction-runs.ts lineClass 4): a cliff's
- * fold drawn down its face. 近景 1 row or more, 中景 2 rows or more, never 遠景;
- * parallel turns inside one glyph width yield to one (tierSelects), so a face is
- * a few folds, not a picket. It was never drawn at any tier, and a near cliff
- * kept only tone (decision trace traced-06-a: relation 50361 joined into run
- * 3006, 18 rows, dropped at least==TIER_NEVER; operator call-out 2026-11-10). */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const TERRAIN_SELECTION:readonly (readonly number[])[]=[
  [0,0,0,TIER_NEVER,1,3], // 近景: skyline and ridge silhouettes, interior turns of 1 row or more (a fold one glyph long on the magenta line draws; line repair 2026-11-12, was 2), principal slope turns, contacts
  [0,0,0,TIER_NEVER,2,4], // 中景: ridge outlines, interior turns of 2 rows or more (was 3), shelf edges, contacts
@@ -622,7 +622,7 @@ export const STAMP_ORDINAL=0x7fe00000;
  * immutable grammar records. A run looks up its instruction ONCE; its units
  * carry the same word through the complete source parameterization. */
 const ARTICULATION_SOURCE=/* wgsl */`
-/*TRACE-HOOKS*/
+
 const WS=${WORD_STRIDE}u;
 ${ARTICULATION_PARAMETERS}
 struct Run {range:vec4u,identity:vec4u,part:vec4u,paper:vec4u,correspondence:vec4u}
@@ -894,7 +894,7 @@ fn wholeBoundaryFlags(run:Run)->u32{
  if(atomicLoad(&counts[at])==2u){atomicStore(&counts[at],4u);atomicSub(&counts[u32(p.field.z)-1u],1u);}
 }
 // featureplace reads its own row's protected paper (written only by
-// featurecurves, read-only from here on) from a workgroup copy (perf-impl-83):
+
 // paperWord tested every ink pixel of every word with a device atomic load.
 var<workgroup> localPaper:array<u32,256>;
 var<private> paperLocal:bool=false;
@@ -989,7 +989,7 @@ fn formRows(run:Run)->f32{
  // (crop-review-20261110 crops 1 F, 3 B, 5 E). Its rows are the form table's
  // visible extent. A height surface has no such size: its lines keep theirs.
  if(!terrainRun(run)){let extent=formExtent(run.identity.yz);if(extent.found){own=max(own,(extent.bottom-extent.top)/p.field.y*p.rect.w/17.0);}}
- dtraceValue(1u,u32(own*100.0));dtraceValue(2u,u32(face*100.0));
+
  return max(own,face);
 }
 // ONE TIER PER FORM, HELD (line repair step 2, 2026-11-12). A form's tier
@@ -1017,7 +1017,7 @@ fn tierHold(rows:f32,held:u32,plain:u32)->u32{
  if(held==2u&&plain==1u&&rows<${FAR_STRIP_BELOW_ROWS}.0/TIER_HOLD){return 2u;}
  return plain;
 }
-// perf-impl-107: a COMPACT form (not a measured far part, not terrain, not a
+
 // spanning, cut or unslotted owner) takes the form table's ONE held level,
 // the same level its relations, contacts and outline were produced at
 // (surface-relations formLevel). Spanning-surface lines keep the run hold.
@@ -1031,9 +1031,9 @@ fn heldTier(runID:u32,run:Run)->u32{
  let rows=formRows(run);let plain=tierOfRows(rows);var tier=plain;
  let at=tierWord(runID,run);
  let compact=compactHeldLevel(run);
- if(compact!=NONE){dtraceValue(3u,compact);return compact;}
+ if(compact!=NONE){return compact;}
  if(at!=NONE){let stored=atomicLoad(&counts[at]);if((stored&3u)!=0u&&(stored&~3u)==(run.identity.w&~3u)){tier=tierHold(rows,(stored&3u)-1u,plain);}}
- dtraceValue(3u,tier);
+
  return tier;
 }
 // featurecurves records the tier it drew with; skylineReduce, earlier in the
@@ -1043,7 +1043,7 @@ fn keepTier(runID:u32,run:Run,tier:u32){let at=tierWord(runID,run);if(at!=NONE){
 // surface is short on the page wherever the surface is folded finely, also on
 // a cliff right in front of the viewer, so its own length is not its size: a
 // near cliff's folds read as far and the far tier dropped them all (probe
-// why-1, view 06: 242 of 269 cliff-region lines far; operator call-out
+
 // 2026-11-10 "the walls of cliffs missing edges"). The surface's size at the
 // line is the page extent, up and down from the line, over which the same
 // surface stays at the line's own distance within half again (the scale at
@@ -1062,7 +1062,7 @@ fn faceRows(run:Run)->f32{
  let side=normalize(vec2f(b.y-a.y,a.x-b.x)+vec2f(1e-6,0.0));
  // The surface continues while each 4 px step stays on surface and moves less
  // than a quarter of its own distance (no depth step). Two corrections
- // (trace-rock-near, spot-frames, operator 2026-11-12 "the rock nearest to
+
  // camera" drew almost nothing: 176 of its 280 terrain lines read far with
  // face rows 0-1): a terrain line's surface is every terrain chunk, not the
  // one chunk owner its line lies on (the rock spans chunks 396/397, and the
@@ -1347,7 +1347,7 @@ fn tierSelects(run:Run,tier:u32)->bool{
    // glyph width of it (creaseRead z), so a face is a few fold strokes with
    // its tone between them and never a picket.
    // A fold whose two faces fall in different tone bands of the scene light
-   // is a line too (the cliff's shaded facets against its lit ones: operator
+
    // call-out 2026-11-10, view 06 cliff); a gentle fold inside one band is
    // carried by the face's tone.
    let band=creaseRead(run);
@@ -1396,7 +1396,7 @@ fn tierSelects(run:Run,tier:u32)->bool{
  if(terrain&&line==4u){
   let near=creaseRead(run);if(near.x>0u&&near.z==near.x){return false;}
   // No light or turn test: a gentle fold inside one tone band is a fold of
-  // the face too (traced-06-f: the left-face folds of the operator's crop 6,
+
   // runs 2895, 2563, 2896, all near, were dropped here by a "light separates
   // the faces or 45 degrees" rule that no reference supports; withdrawn).
  }
@@ -1475,7 +1475,7 @@ fn rank(run:Run,a:vec2f,b:vec2f)->u32{
 // highest-ranked line through it. A word of a lower-ranked run whose cell is
 // held by a higher-ranked PARALLEL line (two bins, 22 degrees) of the SAME
 // owner (terrain: the one height surface) is that line, one glyph width away:
-// it collapses into it before placement and is recorded (probe 34, trace tag
+
 // 55), instead of being found as a copy among the committed words
 // (terrainCopy, duplicateWord, which stay until this draws as well).
 // Fixed rule, decided once per frame from selection, no pens tried.
@@ -1566,9 +1566,9 @@ fn gridCollapsed(own:u32,x:i32,row:i32,advance:u32)->bool{
  for(var g=0u;g<2u;g++){
   let at=gridCell(g,centre,row);if(at==NONE){continue;}
   let held=atomicLoad(&counts[at]);let turn=((held&15u)+16u-(own&15u))&15u;
-  // perf-impl-108 SEAMS: the higher-ranked parallel line need not be the same
+
   // owner. Numabe draws a road, its curb and its walk as separate placements;
-  // their edges inside one glyph width were three parallel strokes (perf-106
+
   // Numabe frame), and two parallel lines closer than one glyph cannot both be
   // spelled (FACET_COLLAPSE). The owner tag still orders equal ranks.
   if((held>>12u)>(own>>12u)&&min(turn,16u-turn)<=2u){return true;}
@@ -1667,7 +1667,7 @@ fn spanPartWord(id:u32,ordinal:u32,q:vec4f,x:i32,row:i32,word:u32,count:u32,adva
 // visibility cut. Native row alignment is depiction, not a change of depth or
 // ownership. Clip hidden members of the chosen word, never the whole word by
 // one sample and never choose a replacement glyph independently.
-fn emitMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,part:u32,depth:f32,a:Point,b:Point,mapped:bool){dtraceValue(4u,word);dtraceValue(5u,u32(row));dtraceValue(6u,u32(x));dtraceValue(7u,priority);
+fn emitMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,part:u32,depth:f32,a:Point,b:Point,mapped:bool){
  if(row<0||row>=i32(rowCount())||row*17+17>i32(p.extent.y)){return;}
  // A run ends at its hard-junction glyph (hardJunction): its own units centred on that glyph are the glyph.
  for(var side=0u;side<JUNCTION_HOLDS;side++){let held=junctionHold[side];let centre=2*x+i32(advance);if(held.x<held.y&&(row==held.z||row==held.w)&&centre>=held.x&&centre<=held.y){return;}}
@@ -1686,10 +1686,10 @@ fn emitMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u
 // The incumbent whole-word visibility algorithm, unchanged. The only move
 // is its execution owner: one candidate word, not a whole source run.
 fn realizeMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,part:u32,depth:f32,a:Point,b:Point,mapped:bool,collapse:u32){
- dtraceValue(4u,word);dtraceValue(5u,u32(row));dtraceValue(6u,u32(x));dtraceValue(7u,priority);
+
  // The selection grid (gridWrite): a parallel same-owner line of higher rank
  // holds this cell. The word is that line; recorded, not placed.
- if(gridCollapsed(collapse,x,row,advance)){probeAdd(34u);dtraceValue(55u,1u);return;}
+ if(gridCollapsed(collapse,x,row,advance)){probeAdd(34u);return;}
  let context=select(0u,a.visible.z,terrainRun(runs[runID])&&a.visible.z!=NONE&&(a.visible.z&0x80000000u)!=0u);
  let sourceEdge=select(NONE,pointFeatureId(a),context!=0u||(mapped&&(wholeBoundaryFlags(runs[runID])&0x100000u)!=0u));
  let source=spanSource(runs[runID],context);
@@ -1754,9 +1754,9 @@ fn realizeMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,coun
  for(var i=0u;i<${WORD_PROPOSAL_WORDS}u;i++){data[i]=atomicLoad(&counts[at+i]);}
  let a=Point(bitcast<vec4f>(vec4u(data[16],data[17],data[18],data[19])),vec4u(0u,data[12],data[24],data[14]));
  let b=Point(bitcast<vec4f>(vec4u(data[20],data[21],data[22],data[23])),vec4u(0u,data[13],0u,0u));
- /*WORD-VISIBILITY-TRACE-BEGIN*/
+
  realizeMapped(data[0],data[1],bitcast<f32>(data[2]),bitcast<i32>(data[3]),i32(data[4]),data[5],data[6],data[7],data[8],data[9],bitcast<f32>(data[10]),a,b,data[11]!=0u,data[15]);
- /*WORD-VISIBILITY-TRACE-END*/
+
 }
 struct CircleSection {left:vec4f,right:vec4f,visible:u32}
 fn circleSection(run:Run,y:f32)->CircleSection{
@@ -1856,10 +1856,10 @@ fn circleConstruction(id:u32,run:Run,priority:u32){
  // cap/shoulder/return anchors. No glyph is stretched or chosen by a fit.
  let start=u32(max(0,-top));let end=min(height,u32(max(0,i32(rowCount())-top)));
  for(var row=start;row<end;row++){
-  // D5 / UPRIGHT_RUN=1 (perf-impl-108): the l l flank unit (row 3) never
+
   // stands on the same side in two consecutive rows. Where the contour stays
   // within the upright band for two rows or more (a large round's equator:
-  // tonemapping spheres, perf-106 frame 0, l on four rows a side) the flank
+
   // is OPEN between its entry and return turns (γ⌒ヽ / {　} / 乂__乂), never
   // a stack of uprights; a lone upright-band row keeps its l.
   if(circleRowUnit(run,row,height,low,high)==3u&&((row>0u&&circleRowUnit(run,row-1u,height,low,high)==3u)||circleRowUnit(run,row+1u,height,low,high)==3u)){continue;}
@@ -2184,7 +2184,7 @@ ${GPU_PLANAR_FAN}
 // endpoints or restart the native passage. A unit whose line has another
 // source's pixels both above and below (a wall top running across another
 // house's gable) is not placed. Off-field samples count as bordering (no
-// evidence to clip).
+
 fn faceBorders(run:Run,x:f32,y:f32)->bool{
  for(var s=0u;s<2u;s++){
   let q=vec2i(floor(fieldPoint(vec2f(x,y+select(-5.0,5.0,s==1u)))));
@@ -2209,7 +2209,7 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
  // never a lone upright), as a compact circle is one library entry. A
  // narrow box of three rows or more (a pillar, a post) is built from its
  // edges below over its own rows: one glyph never stands for a form taller
- // than the glyph (capture examples-pdf5 isometric: each pillar one 口).
+
  var low=vec2f(3.402823e38);var high=vec2f(-3.402823e38);var seen=false;
  for(var i=0u;i+1u<run.range.y;i+=2u){let a=points[run.range.x+i];if(!pointVisible(a)){continue;}let b=points[run.range.x+i+1u];
   let anchors=wholeEdgeAnchors(run,pointFeatureId(a));var wholeA=a;var wholeB=b;if(anchors.found){wholeA=anchors.a;wholeB=anchors.b;}
@@ -2376,7 +2376,7 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
    // baseline units beside the retained turn, never by flattening the edge.
    // Lowering this bound (to 21/27 px, 2026-11-11) sent the fog and
    // lit-interior ＼ chains through the row walk as ＿/￣ staircases and lost
-   // a parallel line (council codex-20261111-cliff-crown, 7 of 7 REJECTED).
+
    let travel=abs(d.x)*17.0/abs(d.y);
    if(travel>=30.0){
     shallowEdgeRow(id,ordinal|(u32(row-span.x)<<20u),a,b,wholeA,wholeB,row,priority,runSize(run));
@@ -2392,7 +2392,7 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
  }
 }
 // 遠景 MERGED FAR SKYLINE (D3 exterior far field: ONE merged skyline strip;
-// operator markup references/review-untitled-24.png, red line: super-far is
+
 // one base line with peaks and marks standing on it, medium-far keeps the
 // hills' and masses' own rows). Far forms and the far terrain silhouette
 // CONTRIBUTE to shared profiles on the page's 16 px column lattice and the
@@ -2424,7 +2424,7 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
 //  level of it (it draws nothing) and a separate lower line otherwise (it
 //  spells its own columns by the same table from its own neighbours); a mass
 //  under a higher mass draws nothing there.
-// THE FAR UNITS (operator markup review-untitled-24.png, "EXAMPLE SUPER FAR
+
 // LOD", opened at full size: one base line, single marks y 人 个 standing on
 // it, tufts and commas under it, dotted texture; no outlined cone, no stacked
 // arc rows. The dotted texture is the tone producer's, tone-field.ts):
@@ -2518,7 +2518,7 @@ fn skyRead(table:u32,c:i32)->Sky{
 // merged strip only when it stands under FAR_MERGE_BELOW page px, where it
 // cannot hold a drawing of its own; from there up a far form is spelled from
 // its own outline by its own construction, never replaced by a strip mark
-// (a two-row rock drawn as 个 and a lobe turn: loop 351 view 06, operator
+
 // call-out 2026-11-10).
 const FAR_MERGE_BELOW=25.5;
 fn farStands(run:Run)->f32{
@@ -2541,7 +2541,7 @@ fn farKind(run:Run,away:u32,span:vec4f)->u32{
  // A middle form keeps lines of its own only where it stands on the rows to
  // hold them (five): under that an open, curved or interior-lined form is the
  // same profile as a solid one (a three-row tree spelled by its own runs was
- // a stack of unrelated marks: capture trace-1 view 06).
+
  if(away==1u&&(terrainRun(run)||(run.range.z&0x100000u)!=0u||(run.range.z&0x20000u)!=0u)){return 0u;}
  // A MIDDLE FORM KEEPS ITS OWN LINES (line repair step 2; TIER_SELECTION
  // row 1: outline, occluding contours, principal creases, joins). A middle
@@ -2556,7 +2556,7 @@ fn farKind(run:Run,away:u32,span:vec4f)->u32{
  if((run.range.z&0x100000u)!=0u){return 2u;}
  // A far standing form of a unit or more is spelled from its own outline by
  // its own construction (TIER_SELECTION row 2, D9); the strip takes the
- // smaller ones (operator order 2026-11-10: a form is never replaced by a
+
  // strip mark; only forms too small to hold a drawing merge).
  if((run.range.z&0x18000000u)==0x8000000u&&run.paper.z!=0u){return select(0u,3u,farUnderGlyph(run));}
  if((run.range.z&0x20000u)!=0u){return select(0u,3u,farUnderGlyph(run));}
@@ -2568,7 +2568,7 @@ fn farKind(run:Run,away:u32,span:vec4f)->u32{
 // across its mid height, read on the owner field on a 4 px page grid six
 // lattice cells to each side of the run's own centre (three cells did not
 // reach across a far tree from a run on its edge, and that run spelled a
-// second, mass construction beside the form's mark: capture pdf-3-band-capped
+
 // view 06). foot: the run's lowest visible segment (the source span of a mark).
 fn farForm(run:Run,span:vec4f)->FarForm{
  var top=f32(run.paper.z&0xffffu)-16384.0;var base=f32(run.paper.z>>16u)-16384.0;
@@ -2716,7 +2716,7 @@ fn farMarkKey(run:Run,form:FarForm)->u32{return (u32(clamp(form.height,0.0,4095.
  // This ordered pass already precedes all construction dispatches. Prepare
  // one complete whole-part verdict here; no member yields speculatively.
  prepareWholeSourcePart(runID,run,away);
- // perf-impl-109: a near limb silhouette records its rows for its chain's pair.
+
  if(away==0u){limbWrite(run);}
  if(rippleRun(run)&&tierSelects(run,away)){rippleWrite(run);}
  if(away==0u){return;}
@@ -2751,7 +2751,7 @@ fn skyGround(c:i32,foot:i32)->i32{
 //   on the last row of a side that falls two rows or more; no other row.
 //   lower: the mass stands under a higher one in this column; its flat cap
 //   would be a second arc row under the first and is not drawn.
-// THE PROFILE OF A STANDING FORM (operator far/mid examples 2026-11-10: a
+
 // slanted rise, a cap, a slanted fall, closed on the base line). Cap: ￣ where
 // the form's top is level across the column, ／ or ＼ where the top itself
 // leans across the column toward a lower side, ∧ where the form is under one
@@ -2873,7 +2873,7 @@ fn farSkyline(id:u32,run:Run,kind:u32,span:vec4f,priority:u32)->bool{
   // A mass keeps its cap run on its TRUE top (a wide far mass, a cliff or a
   // stand, is a hill outline: the markup's medium-far hills are simple
   // outline strokes). A trial that held every lobe within three rows of its
-  // base erased the top of a far cliff (capture pdf-4-final ridge-far) and
+
   // was withdrawn.
   if(top.on&&top.flag==0u&&top.id==skyID(run)){
    level=top.level;
@@ -3091,7 +3091,7 @@ fn wholePartLayout(run:Run,record:u32)->vec4i{
  }
  return vec4i(origin,i32(floor(span.y/17.0)),spanWidth,rows);
 }
-// perf-impl-129 ONCE-PER-RUN PREPARATION (crawl brief item I). One
+
 // invocation plays back one run's rows; the whole-part layout of (run, record)
 // and its all-row preflight verdict are computed once and reused by every row
 // (the leader's row loop and the soft per-row path), instead of re-running the
@@ -3152,13 +3152,13 @@ fn wholePartRowsFit(record:u32,whole:vec4i)->bool{
  }
  wholeVerdict=1u;return true;
 }
-// Crawl brief item D, size-boundary part (lane T3): when the requested size
+
 // band does not fit the posed source span, select the DECLARED RELATED
 // VARIANT, the same role and context at the next smaller size band, down to
 // band 0. The first band whose entry fits wins, deterministically. Validity
 // rejections (no span, a degenerate entry, the origin outside the page, a bad
 // atom) return no entry without falling through. Selected once per (runID,
-// role, size), like the perf-129 layout cache; the leader path and the per-row
+
 // path select the same record for the same run.
 var<private> wholeVariantKey:vec3u=vec3u(0xffffffffu,0xffffffffu,0xffffffffu);
 var<private> wholeVariantCached:u32;
@@ -3177,7 +3177,7 @@ fn wholePartVariantRecord(runID:u32,run:Run,role:u32,size:u32)->u32{
  }
  return NONE;
 }
-// Crawl brief item D core (lane T5): insertion, not resampling. Source row 0
+
 // is the first anchor and the last source row is the last anchor; rows
 // 1..partRows-2 map one-to-one, top-aligned; every further source row is an
 // inserted whole unit repeating native row partRows-2 (row 1 when partRows==2
@@ -3203,7 +3203,7 @@ fn programmedWholePart(runID:u32,run:Run,role:u32,size:u32,row:i32,portion:u32,s
  if(!seen||portion>0u){return true;}
  let first=grammar[record];let count=grammar[record+1u];let width=grammar[record+4u]&0xffffu;let partRows=i32(grammar[record+5u]);let spanWidth=u32(whole.z);let extra=spanWidth-width;
  // Preflight every source row and every inserted middle unit before emitting
- // any proposal (perf-impl-129: evaluated once per run and record). The first
+
  // and last native atoms remain anchors; only the interior sequence repeats.
  if(!wholePartRowsFit(record,whole)){return false;}
  let startPhase=finiteRunStart(run).position.w;let endPhase=finiteRunEnd(run).position.w;
@@ -3216,7 +3216,7 @@ fn programmedWholePart(runID:u32,run:Run,role:u32,size:u32,row:i32,portion:u32,s
   for(var repeat=0u;repeat<repeats;repeat++){
    if(x!=growth.x&&x!=growth.y&&repeat>0u){q=sourceQ;q.w=phase;}
    let pageX=whole.x+i32(wholePartAtomX(x,growth,repeat));
-   // perf-impl-143 CANONICAL WHOLE-PART MEMBER IDENTITY (crawl brief item G):
+
    // the first anchor row is 0, the LAST anchor row is a fixed 0x3ff (it keeps
    // its name when whole units are inserted above it), middle and inserted rows
    // their top-aligned source row; low 16 bits = repeat ordinal x atoms + atom.
@@ -3286,7 +3286,7 @@ fn limbScan(run:Run,at:vec2f)->vec2f{
 // its two outlines. x: side as limbScan, 0 no pair. y: the other edge's page
 // x at mid-row.
 const LIMB_PAIR_PARALLEL=5.0;
-// SOURCE-BACKED PAIRED LIMB (perf-impl-109). A run whose paper.w carries a
+
 // compiled LIMB chain label (gpu-construction-runs limbVertex) is one of that
 // tube's silhouettes. skylineReduce (earlier in the same frame) records, per
 // (owner, chain, row), the least and greatest page x of the chain's VISIBLE
@@ -3294,7 +3294,7 @@ const LIMB_PAIR_PARALLEL=5.0;
 // from that record. The pair is the chain's own two outlines, by source
 // identity: no owner/depth field is read (limbScan stays only for sources
 // without a compiled limb table, the incumbent).
-// One slot (perf-impl-109c, EXACT identity): words 0-3 hold the complete tuple
+
 // [row word, chain label, owner domain word, owner eid], then four ordered x
 // words (least top, greatest top, least bottom, greatest bottom). The hash only
 // picks where probing starts; a slot is this tuple's only when all four words
@@ -3541,12 +3541,12 @@ fn limbPair(run:Run,top:vec2f,bottom:vec2f)->vec2f{
  if(abs((b.y-a.y)-(bottom.x-top.x))>LIMB_PAIR_PARALLEL){return vec2f(0.0);}
  return vec2f(a.x,(a.y+b.y)*.5);
 }
-// THE SOFT UNIT STANDS ON VISIBLE SOURCE (slice 1d, perf-impl-84). A unit of the
+
 // shallow pen walk is spelled only where, inside its own x-span and this row
 // portion, the run's VISIBLE intervals (pair start flag) are not outweighed by its
 // HIDDEN ones (D1(6): a glyph at a visibility cut keeps its place when most of its
 // ink lies on the visible portion). A 2 px visible crumb of an 8 px terrain piece
-// spelled a whole unit and took a slope stroke's cells (trace-held-c1 run 1465).
+
 // A fully visible run has no hidden interval and keeps every unit.
 fn softUnitStands(run:Run,startPair:u32,startT:f32,endPair:u32,endT:f32,lo:f32,hi:f32)->bool{
  var shown=0.0;var hidden=0.0;
@@ -3582,14 +3582,14 @@ fn softSourcePair(run:Run,seed:u32,row:i32)->u32{
  }
  return best;
 }
-// perf-impl-133 FULL SOURCE MAPPING (crawl brief item E). A programmed run's
+
 // pairs are its source edges' visible AND hidden finite intervals in source
 // relation order, so the source point at a row centre is the same however
 // visibility splits the edge. The row reads the first pair (source order) with
 // a chord of at least 1 px whose source y-span contains the row centre, else
 // the nearest such pair, else pair 0. Visibility is never read: moving the
 // anchor to the first VISIBLE fragment would restore the rephasing failure.
-// perf-impl-135: the mapping is PREPARED once per run (one invocation plays
+
 // one run) and looked up per row, instead of scanning every pair for every row.
 const ROW_PAIR_ROWS=64u;
 var<private> rowPairRun:u32=0xffffffffu;
@@ -3635,7 +3635,7 @@ fn softProgramRowPair(runID:u32,run:Run,row:i32)->u32{
  if(at>=0&&at<i32(ROW_PAIR_ROWS)&&rowPairTable[at]!=0xffffffffu){return rowPairTable[at];}
  return softProgramRowPairScan(run,row);
 }
-// perf-impl-145: the source point on the pair at page x (a lattice pen), kept
+
 // inside the row's band. A vertical source segment, or a pen whose line point
 // leaves the row, reads the row-centre point (softSourceAt) as before.
 fn softSourceAtPen(run:Run,pair:u32,x:f32,row:i32)->vec4f{
@@ -3657,7 +3657,7 @@ fn softSourceChart(run:Run,pair:u32,row:i32)->vec2f{
  let t=select(.5,clamp((rowY-a.position.y)/dy,0.0,1.0),abs(dy)>.00001);
  return sourceChartAt(a,b,t);
 }
-// perf-impl-131 CANONICAL SOFT MEMBER IDENTITY (crawl brief item G). A
+
 // lattice unit is named by the source-anchored position it is placed at: its
 // row relative to the anchor point's row (14 bits) and its exact integer pen
 // offset from the anchor along the row direction (15 bits), never by the
@@ -3668,7 +3668,7 @@ fn softMemberOrdinal(anchor:Point,row:i32,offset:i32)->u32{
  let anchorRow=i32(floor(anchor.position.y/17.0));
  return ((u32(clamp(row-anchorRow+8192,0,16383))&0x3fffu)<<16u)|(u32(clamp(offset+16384,0,32767))&0x7fffu);
 }
-// perf-impl-147: the row-level soft members (one unit per steep row k=0, its
+
 // paired flanks k=1/2, a conifer whole k=3) at fixed offsets past any lattice
 // pen offset (pages narrower than about 16000 px): never the visibility portion.
 fn softRowOrdinal(anchor:Point,row:i32,k:u32)->u32{return softMemberOrdinal(anchor,row,16383-i32(k));}
@@ -3716,7 +3716,7 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
  // Glyph vocabulary and direction belong to the source span; enter and leave
  // remain projected interval bounds used only for placement geometry.
  let sourceA=points[base+sourcePair*2u];let sourceB=points[base+sourcePair*2u+1u];
- // perf-impl-148 RUN-ANCHORED LATTICE (crawl brief item F): pens and member
+
  // identities are anchored at the RUN's own first source point, as the lattice
  // rule states. The row's source pair start (sourceA) changed whenever a row
  // crossed into the next source pair, shifting every pen of that row.
@@ -3792,14 +3792,14 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
   // (grammar[11], pairedFlanks), each centred on its own edge, and the right
   // silhouette spells nothing on that row. The interior is left to tone. A
   // pair narrower than LIMB_PAIR_LEAST is one stroke: the left unit alone.
-  // Near view only (operator markup: the near-tree constructions end at the
+
   // red line; beyond it a trunk is its plain outline, then the far strip).
   // lineTier is the FORM's selection tier, set once per run in featurecurves:
   // every limb of one tree is paired, or none is.
   if(limbPairable(run)&&lineTier==0u){
    let top=f32(row*17)+2.5;let bottom=f32(row*17)+14.5;
    let topAt=vec2f(enter.x+(top-enter.y)*chord.x/chord.y,top);let bottomAt=vec2f(enter.x+(bottom-enter.y)*chord.x/chord.y,bottom);
-   // perf-impl-109: a run on a compiled LIMB chain pairs by that chain
+
    // (limbPairSource); a source without the compiled table keeps limbPair.
    var pair=vec2f(0.0);
    if((run.paper.w&1u)!=0u&&(run.range.z&0x10000u)==0u){pair=limbPairSource(run,row,topAt.x,bottomAt.x);}else{pair=limbPair(run,topAt,bottomAt);}
@@ -3866,7 +3866,7 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
     let f=select(0.0,clamp((probe-xa)/(xb-xa),0.0,1.0),abs(xb-xa)>.0001);
    cursor=k;
    if(programFeature==0u){sourcePair=softSourcePair(run,cursor,row);}
-   // perf-impl-145 SOURCE-OWNED PEN PHASE (crawl brief item F): the unit at
+
    // this lattice pen reads the source line AT THE PEN, so its phase (the
    // line's height within the row) and source scalar follow the line across
    // the row; the row-centre point gave every unit of the row one phase.
@@ -3895,7 +3895,7 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
   // slash column.
   if(grammar[record]==0u){
    let column=softColumn(table,role,band,dir);let whole=column+(max(grammar[column+11u],1u)-1u)*12u;
-   // perf-impl-146 SAME-COLUMN NEAREST PHASE (crawl brief item F): before the
+
    // whole-unit / clean-line fallback (a different vocabulary at a phase
    // threshold), take the nearest non-empty phase record of the SAME direction
    // column in fixed order phase-1, phase+1, phase-2, phase+2, ... (lower first
@@ -4061,7 +4061,7 @@ fn softRunPlayback(runID:u32,run:Run,table:u32,size:u32,priority:u32){
  }
  if(open){softPortion(runID,run,table,size,row,portion,startPair,startT,endPair,endT,seen,markPair,markT,priority);}
 }
-// THE ROW UNIT STANDS ON VISIBLE SOURCE (slice 1c, perf-impl-82; crawl brief
+
 // item H). A rowLed unit of a straight hard run is spelled wherever the run's
 // VISIBLE intervals (pair start flag, the run pass's occlusion: interval.cause)
 // cover ANY part of the span the unit stands for in row [r0,r1): its advance
@@ -4071,7 +4071,7 @@ fn softRunPlayback(runID:u32,run:Run,table:u32,size:u32,priority:u32){
 // depth test (sourceGlyphVisible) passes a
 // self-occluded span, since its own surface counts as visible, so a hidden wall
 // top was spelled a row-height above its line, across another house's gable
-// (perf-81 stray lid, trace-lid-b1-wide run 1111). The repeat and box programs
+
 // already skip hidden pairs; this is the same rule for the row walk.
 fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool)->bool{
  if(hi-lo<.00001){return fallback;}
@@ -4149,7 +4149,7 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
  // A foot passage is detail of a form that holds lines of its own. A form
  // that stands on under five rows away from the viewer is its profile on the
  // base line (farKind); the three-row passage stamped at its foot was as tall
- // as the form (capture trace-2 view 06: the same block at every far tree).
+
  // 中景 keeps "principal features and joins" (agreed design 1): only a form
  // the strip takes (too small for one unit), or a 遠景 form under five rows,
  // has no anchor of its own.
@@ -4307,7 +4307,7 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
    // members, not the phase/placement of the surviving construction.
    if(wholeSlope){origin=first.x+(f32(row)*17.0+8.5-first.y)*delta.x/delta.y;}
    for(var unit=0u;unit<units;unit++){
-    // perf-impl-150 CANONICAL HARD-ROW MEMBER IDENTITY (crawl brief item G): the
+
     // unit is named by its row relative to the run's first source point and its
     // integer pen offset from that point (softMemberOrdinal), not by a count from
     // the run's current top row and the row-centred origin.
@@ -4349,7 +4349,7 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
 }
 // ONE LEVEL LINE, ONE SPELLING. Two edges a few pixels apart on either side
 // of a row boundary were ＿ in the upper row and ￣ in the lower one: two
-// parallel strokes three pixels apart where the drawing has one line (operator
+
 // call-out 2026-11-10, view 06: "double stacked horizontal lines"; AGENTS
 // finding 4: parallel lines inside one glyph width collapse). A level unit
 // gives way to the opposite level unit of another run across the boundary
@@ -4495,7 +4495,7 @@ fn storedInsert(base:u32,pen:u32,address:u32){
  output[base+p.extent.x+1u+pen]=address;
  var i=pen+1u;while(i<=p.extent.x){output[base+i]++;i+=i&(~i+1u);}
 }
-// WORKGROUP ROW CURSOR (speed lane, perf-impl-83). The serial typesetter's
+
 // cursor queries were chains of dependent device-memory loads on its one lane
 // (about 23 us per word). featureplace keeps the row's occupancy as a pen
 // bitmask plus a Fenwick tree over its 256 word popcounts in workgroup memory
@@ -4714,7 +4714,7 @@ fn commitWord(word:Word,row:u32,cursor:u32)->bool{
  }
  return true;
 }
-// The row TYPESETTER (operator order 2026-11-09: no placement search). Every
+
 // word gets one bounded candidate pair from the row's fixed priority order;
 // admission confirms the nearest candidate, then the other existing interval
 // only when the real paper or source-visibility check rejects the first. No
@@ -4835,7 +4835,7 @@ fn tablePen(word:Word,cursor:u32)->u32{
 fn setWord(word:Word,pen:u32,row:u32,cursor:u32,cut:bool)->bool{
  if(pen==NONE||!tapeFits(word,pen,row,cursor)){return false;}
  if((cut||pen!=word.data[3])&&!wordSeen(word,pen,row)){return false;}
- var ready=word;ready.data[3]=pen;dtraceValue(26u,pen);dtraceValue(27u,word.data[7]);dtraceValue(28u,word.data[6]);return commitWord(ready,row,cursor);
+ var ready=word;ready.data[3]=pen;return commitWord(ready,row,cursor);
 }
 // D1 admission is bounded to the two existing intervals from the native
 // cursor. Candidate order is nearest legal pen, left on a tie; a candidate
@@ -4931,7 +4931,7 @@ fn sharedStamp(word:Word,cursor:u32)->bool{
 // two surfaces share arrives once per surface. In the fog room the wall's
 // silhouette (run 0, owner 1/7, class 0) and the floor's contact (run 33,
 // owner 1/1, class 2) both spelled the corner as "＼､" 24 px apart in every
-// row: two parallel lines (traced-fog-a, page 1190 and 1214, row 42). The
+
 // owner test is gone, and a copy is any same word of another run in the same
 // row within one and a half advances: parallels inside one glyph width
 // collapse (AGENTS.md finding 4).
@@ -4943,7 +4943,7 @@ fn straightUprightWord(word:u32)->bool{
 }
 fn terrainCopy(word:Word,cursor:u32)->bool{
  // Every edge, hard or not: 12 hard runs of one ledge (flags 0xc040200,
- // owner 146) spelled the same l and ￣ into one corner (traced-06-c 478,417;
+
  // crop-review-20261110 crop-2 J) and the hard contraction below, which
  // compares whole-run endpoint directions, missed them.
  if(word.data[9]!=0u){return false;}
@@ -4953,10 +4953,10 @@ fn terrainCopy(word:Word,cursor:u32)->bool{
   let reference=cursorAddr(cursor,pen);let at=(reference>>4u)*${WORD_WORDS}u;
   if(output[at]==word.data[0]||output[at+9u]!=0u){continue;}
   let glyph=storedGlyph(reference);
-  // ONE UPRIGHT, ONE STROKE (slice 1d, perf-impl-84): two straight uprights of
+
   // different runs with at most a half space (5 px, the narrowest spellable gap)
   // of paper between them are one stroke (AGENTS finding 4), whatever word each
-  // run chose (trace-held-c1: crease | 316 beside silhouette l 306, row 24).
+
   if(output[at+5u]!=word.data[5]){
    if(!straightUprightWord(word.data[5])||!straightUprightGlyph(glyph.y)){continue;}
    let gap=select(i32(wanted)-i32(glyph.x+glyph.z),i32(glyph.x)-i32(wanted+word.data[7]),glyph.x>=wanted);
@@ -5029,7 +5029,7 @@ fn typesetUnit(original:Word,row:u32,cursor:u32)->bool{
  // (rows over TONE_CAP words keep tone in this serial path; toneplace does the same).
  if(original.data[9]==3u&&toneOccluded(original,original.data[3],row)){return true;}
  var word=original;let wanted=word.data[3];let advance=word.data[7];
- if(terrainCopy(word,cursor)){atomicAdd(&counts[featureRecord(word.data[0])+1u],1u);dtraceValue(56u,1u);return true;}
+ if(terrainCopy(word,cursor)){atomicAdd(&counts[featureRecord(word.data[0])+1u],1u);return true;}
  if(word.data[9]==0u&&word.data[6]==1u&&(runs[word.data[0]].range.z&0x40000u)!=0u){
   // Fixed-rank geometry contraction: two parallel same-owner edges within
   // one native unit share that unit, not two displaced columns. Only the
@@ -5089,7 +5089,7 @@ fn typesetUnit(original:Word,row:u32,cursor:u32)->bool{
  if(anchor){if(word.data[9]==0u&&word.data[6]>=2u){return clipDeclared(word,row,cursor);}if(word.data[9]!=2u){return false;}return setTableWord(word,row,cursor,false);}
  // The same cells already carry a higher-rank word of the same role and
  // line class: a duplicate, neither shoved sideways nor counted as a loss.
- if(duplicateWord(word,cursor)){atomicAdd(&counts[featureRecord(word.data[0])+1u],1u);dtraceValue(56u,2u);return true;}
+ if(duplicateWord(word,cursor)){atomicAdd(&counts[featureRecord(word.data[0])+1u],1u);return true;}
 // Region tone keeps its +-2 px pen and is never clipped; a single scalar
 // has nothing shorter to clip to. A compiled whole-part word may contain
 // several repeated native scalars. If its group pen is rejected, split only
@@ -5289,7 +5289,7 @@ var<workgroup> toneRow:u32;
  if(count<=${ROW_CAP}u){for(var i=lane;i<count;i+=128u){if(levelTwinScan(start+i,row,lows,highs)){atomicOr(&twinBits[i/32u],1u<<(i%32u));}}}
  workgroupBarrier();
  let cursor=cursorBase(row);
- // The row's workgroup cursor (perf-impl-83): each lane derives 32-pen words
+
  // of the occupancy bitmask from the stored Fenwick (a pen's count is its node
  // minus its children), then the word popcount Fenwick.
  let narrow=p.extent.x<=LOCAL_WORDS*32u;
@@ -5413,56 +5413,17 @@ fn foreignCursorInsert(base:u32,pen:u32,address:u32){output[base+fp.width+1u+pen
  }
 }
 `;
-/** The ordinary build: the trace hooks are no-ops. */
-export const ARTICULATION_SHADER=ARTICULATION_SOURCE.replace('/*TRACE-HOOKS*/',TRACE_OFF_WGSL);
-/**
- * THE DECISION TRACE BUILD (gpu-trace.ts). Every function below records its
- * entry and the exact return it leaves by; the kernels and the placement loop
- * write one block per run and per placed word. Only runs with a point in the
- * requested page box are recorded.
- */
-export const TRACE_FUNCTIONS=['distanceTier','faceRows','tierSelects','farKind','farSkyline','profileUnits','profileSide','skyUnits','shadeCell','hardJunction','circleConstruction','hardBoundaryConstruction','limbPair','softPortion','softRunPlayback','emitMapped','realizeMapped','typesetWord','setWord','clipWord','levelTwin'] as const;
-export const TRACE_KERNELS=['featurecurves','skylineReduce','wordvisibility'] as const;
-export function articulationTraceShader(sites:TraceSite[]):string{
- const edit=(source:string,a:string,b:string)=>{if(source.split(a).length!==2)throw Error(`Trace build: anchor not unique: ${a.slice(0,60)}`);return source.replace(a,b);};
- let source=ARTICULATION_SOURCE.replace('/*TRACE-HOOKS*/',traceRecorderWgsl('counts',TRACE_AT));
- source=source.replace('/*WORD-VISIBILITY-TRACE-BEGIN*/','dtraceBegin(data[0],dtraceWanted(data[0]));').replace('/*WORD-VISIBILITY-TRACE-END*/','dtraceFlush();');
- source=edit(source,"fn featurecurves(@builtin(global_invocation_id) id:vec3u){\n let runID=scheduledRun(id);\n",
-  "fn featurecurves(@builtin(global_invocation_id) id:vec3u){\n let runID=scheduledRun(id);\n if(runID==0xffffffffu||runID>=p.extent.z){return;}\n dtraceBegin(runID,dtraceWanted(runID));\n");
- source=edit(source," var run=runs[runID];if(run.range.y==0u){return;}\n",
-  " var run=runs[runID];if(run.range.y==0u){return;}\n dtraceValue(15u,(run.range.z>>8u)&255u);dtraceValue(16u,run.range.z);dtraceValue(17u,run.identity.y);dtraceValue(18u,run.identity.z);dtraceValue(19u,run.range.y);\n for(var i=0u;i<min(run.range.y,32u);i++){let q=points[run.range.x+i];dtraceValue(29u,bitcast<u32>(i32(round(q.position.x))));dtraceValue(30u,bitcast<u32>(i32(round(q.position.y))));dtraceValue(31u,select(0u,1u,pointVisible(q)));}\n {let a=points[run.range.x].position;let b=points[run.range.x+run.range.y-1u].position;dtraceValue(22u,bitcast<u32>(i32(round(a.x))));dtraceValue(23u,bitcast<u32>(i32(round(a.y))));dtraceValue(24u,bitcast<u32>(i32(round(b.x))));dtraceValue(25u,bitcast<u32>(i32(round(b.y))));}\n");
- // Trace endpoint summaries must use the same descriptor-aware finite span as
- // production consumers; the first two points of a face packet are
- // homogeneous source anchors, not page coordinates.
- source=source.replace('{let a=points[run.range.x].position;let b=points[run.range.x+run.range.y-1u].position;', '{let a=finiteRunStart(run).position;let b=finiteRunEnd(run).position;');
- source=source.replace('for(var i=0u;i<min(run.range.y,32u);i++){let q=points[run.range.x+i];', 'for(var i=0u;i<min(run.range.y,32u);i++){let q=points[run.range.x+i];if(pointWholeEdgeDescriptor(q)){continue;}');
- const sky=source.indexOf('fn skylineReduce(');const skyLine=source.indexOf('let runID=scheduledRun(id);',sky);
- source=source.slice(0,skyLine)+'let runID=scheduledRun(id);if(runID==0xffffffffu||runID>=p.extent.z){return;}dtraceBegin(runID,dtraceWanted(runID));'+source.slice(skyLine+'let runID=scheduledRun(id);'.length);
- source=edit(source,"  if(levelTwin(index,row,lows,highs)){probeAdd(33u);continue;}\n  let word=expandWord(rowWords[index]);probeAdd(32u);if(!typesetWord(word,row,cursor)){atomicAdd(&counts[rowCount()+1u],1u);probeLoss(word,row,cursor);}\n",
-  // A region tone word (kind 3) has no run points: it is traced when its own
-  // pen and row lie in the box, with the region coordinates it carries.
-  "  {let r=rowWords[index].data;let tone=r[9]==3u;let b=dtraceBox();let tx=f32(r[3]);let ty=f32(row)*17.0+8.5;\n"+
-  "   dtraceBegin(r[0],select(r[9]!=2u&&dtraceWanted(r[0]),tx>=b.x&&tx<=b.z&&ty>=b.y&&ty<=b.w,tone));dtraceValue(8u,r[5]);dtraceValue(9u,row);dtraceValue(10u,r[3]);dtraceValue(11u,r[9]);if(tone){dtraceValue(53u,r[14]);dtraceValue(54u,r[15]);}}\n"+
-  "  if(levelTwin(index,row,lows,highs)){probeAdd(33u);dtraceValue(12u,0u);dtraceFlush();continue;}\n"+
-  "  let word=expandWord(rowWords[index]);probeAdd(32u);let placed=typesetWord(word,row,cursor);dtraceValue(12u,u32(placed));if(!placed){atomicAdd(&counts[rowCount()+1u],1u);probeLoss(word,row,cursor);dtraceBlocker(word,cursor);}\n");
- source=edit(source,"probeAdd(80u+min(distanceTier(r),2u));}}\n","probeAdd(80u+min(distanceTier(r),2u));}}\n  dtraceFlush();\n");
- source+=`
-fn dtraceWanted(runID:u32)->bool{
- if(runID>=arrayLength(&runs)){return false;}let r=runs[runID];if(r.range.y==0u||r.range.x+r.range.y>arrayLength(&points)){return false;}
- let b=dtraceBox();
- for(var i=0u;i<r.range.y;i++){let q=points[r.range.x+i].position.xy;if(q.x>=b.x&&q.x<=b.z&&q.y>=b.y&&q.y<=b.w){return true;}}
- return false;
-}
-fn dtraceBlocker(word:Word,cursor:u32){
- let ink=inkSpan(word);if(ink.y==0u){return;}
- let centre=min(p.extent.x,word.data[3]+(ink.x+ink.y)/2u);
- let ordinal=cursorCount(cursor,min(p.extent.x,centre+1u));if(ordinal==0u){return;}
- let at=(cursorAt(cursor,ordinal)>>4u)*${WORD_WORDS}u;dtraceValue(13u,output[at]);dtraceValue(14u,output[at+5u]);
-}
-`;
- source=source.replace('for(var i=0u;i<r.range.y;i++){let q=points[r.range.x+i].position.xy;', 'for(var i=0u;i<r.range.y;i++){let qPoint=points[r.range.x+i];if(pointWholeEdgeDescriptor(qPoint)){continue;}let q=qPoint.position.xy;');
- return instrumentWgsl(source,TRACE_FUNCTIONS,TRACE_KERNELS,sites);
-}
+
+export const ARTICULATION_SHADER=ARTICULATION_SOURCE;
+
+
+
+
+
+
+
+
+
 
 interface Pending {
  readonly runs:readonly ArticulationRun[];readonly width:number;readonly height:number;readonly field:SurfaceField;
@@ -5546,23 +5507,11 @@ export class GpuArticulation {
  private readonly wordVisibility:GPUComputePipeline;private readonly visibilityDispatch:GPUComputePipeline;private readonly activeRuns:GPUComputePipeline;private readonly activeRunArgs:GPUComputePipeline;
  /** skylineReduce: the merged far skyline profile, after the memo passes and before featurecurves. */
  private readonly skyline:GPUComputePipeline;
- /** The decision-trace build, made the first time a trace is requested. */
- private traced?:{layout:GPUBindGroupLayout;curves:GPUComputePipeline;place:GPUComputePipeline;skyline:GPUComputePipeline;visibility:GPUComputePipeline;sites:TraceSite[]};
- private traceBuild(){
-  if(this.traced)return this.traced;
-  if(this.tracePending)return undefined;
-  const sites:TraceSite[]=[],code=articulationTraceShader(sites);
-  const layout=this.layout;
-  const module=this.device.createShaderModule({label:'MAIN decision trace build',code}),pipeline=this.device.createPipelineLayout({bindGroupLayouts:[layout]});
-  // Compiled off the page's main thread; the request is served on the first
-  // frame after the three pipelines exist (the traced build is twice the
-  // ordinary one, and a synchronous build stalled the page: trace-cliff-1).
-  const make=(entryPoint:string)=>this.device.createComputePipelineAsync({layout:pipeline,compute:{module,entryPoint}});
-  this.tracePending=Promise.all([make('featurecurves'),make('featureplace'),make('skylineReduce'),make('wordvisibility')]).then(([curves,place,skyline,visibility])=>{this.traced={layout,curves,place,skyline,visibility,sites};},error=>{(globalThis as unknown as {__mainTrace?:unknown}).__mainTrace={error:`trace build failed: ${String(error)}`};});
-  return undefined;
- }
- private tracePending?:Promise<void>;
- /** The text of a compiled word (the decision trace names words by index). */
+
+
+
+
+
  private wordText(word:number):string{const at=word*WORD_STRIDE,count=this.packed.words[at]??0;let text='';for(let s=0;s<Math.min(count,32);s++){const glyph=this.packed.font[this.packed.words[at+2+s]!];text+=glyph?.text??'?';}return text;}
  private readonly rehashMemo:GPUComputePipeline;
  private readonly toneSeed:GPUComputePipeline;
@@ -5942,14 +5891,14 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   const paperWords=rows*Math.ceil(job.width/32),runCount=job.gpu?.count??job.runs.length;
   let epochExtent=1;for(const owner of job.gpu?.owners.keys()??[])epochExtent=Math.max(epochExtent,owner+1);
   const epochs=new Uint32Array(epochExtent).fill(0xffffffff);for(const [owner,reference]of job.gpu?.owners??[])epochs[owner]=Math.floor(reference/4294967296)>>>0;
-  // THE DECISION TRACE (gpu-trace.ts): requested from the page as
-  // globalThis.__mainTraceRequest={box:[x0,y0,x1,y1],camera?}; answered once,
-  // in globalThis.__mainTrace, for this frame's runs with a point in the box.
-  // A traced frame appends its log to this camera's counter buffer.
-  const traceHost=globalThis as unknown as {__mainTraceRequest?:{box:readonly number[];camera?:string};__mainTrace?:unknown};
-  const request=traceHost.__mainTraceRequest;
-  const build=request&&job.gpu&&(!request.camera||request.camera===job.gpu.camera)?this.traceBuild():undefined;
-  if(build)traceHost.__mainTraceRequest=undefined;
+
+
+
+
+
+
+
+
   const orderWords=rowCapacity>ROW_CAP?rowSlots:0;
   const proposalCapacity=job.proposalCapacity??this.proposalCapacity;
   const farPlanWords=runCount*FAR_PLAN_WORDS;
@@ -5957,7 +5906,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   // word per run, then the selection
   // cell grids (gridWrite), cleared every frame.
   // Then the ripple grids (rippleCell): two of 32 px x 2-row cells.
-  // Then the source-backed limb pair table (perf-impl-109 limbWrite), cleared with them.
+
  const gridWords=2*rows*(Math.ceil(job.width/16)+1)+2*(Math.ceil(rows/2)+2)*(Math.ceil(job.width/32)+2)+LIMB_SLOTS*LIMB_WORDS+sourcePartGroupSlots(runCount)*SOURCE_PART_HEAD_WORDS+runCount*SOURCE_PART_GROUP_WORDS;
   const rowLayoutWords=rows*2;
   // Seven source families each retain original source IDs; labels and tone
@@ -5965,9 +5914,9 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   // family in the same correspondence scratch, not a new binding.
   const activeQueueWords=job.gpu?ACTIVE_QUEUE_META_WORDS+job.gpu.runs.capacity*ACTIVE_SOURCE_QUEUE_FAMILIES+job.runs.length+(job.gpuTone?.capacity??0):0;
   const partAnchorWords=(job.partAnchorSnapshot?.size??0)/4;
-  const layout=mainTransientLayout({runCount,epochWords:epochs.length,paperWords,gridWords,orderWords,rowLayoutWords,proposalCapacity,farPlanWords,activeQueueWords,partAnchorWords},build?TRACE_LOG_WORDS:0);
+  const layout=mainTransientLayout({runCount,epochWords:epochs.length,paperWords,gridWords,orderWords,rowLayoutWords,proposalCapacity,farPlanWords,activeQueueWords,partAnchorWords});
   const {transientWords,proposalWords}=layout;
-  const memo=this.ensureMemo(encoder,camera,Math.max(job.memoSlots??0,job.gpu?8192:needed),transientWords+(build?TRACE_LOG_WORDS:0),epochs,!!job.gpu);
+  const memo=this.ensureMemo(encoder,camera,Math.max(job.memoSlots??0,job.gpu?8192:needed),transientWords,epochs,!!job.gpu);
   if(rows+4>MEMO_AT-1)throw Error('Native page exceeds the correspondence header extent');
   if(rows+4>SKY_AT||SKY_AT+SKY_COLUMNS*3>MEMO_AT-1||job.width>SKY_COLUMNS*16)throw Error('Native page exceeds the far skyline profile extent');
   const curveGroups=Math.max(1,Math.ceil(runCount/64)),curveColumns=Math.min(curveGroups,this.device.limits.maxComputeWorkgroupsPerDimension);
@@ -6088,25 +6037,15 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   const entries:GPUBindGroupEntry[]=buffers.map((buffer,index)=>({binding:bindings[index]!,resource:{buffer}}));entries.push({binding:10,resource:job.field.textures[0]!.createView()},{binding:11,resource:job.field.textures[1]!.createView()},{binding:12,resource:job.field.textures[3]!.createView()},{binding:13,resource:job.field.textures[4]!.createView()},{binding:5,resource:formDepths(this.device).view(job.field)});
   const stacked=this.occluderFor(encoder,job,rows,own);entries.push({binding:14,resource:stacked.mask.createView()},{binding:15,resource:this.materialInkView()});
   const group=this.device.createBindGroup({layout:this.layout,entries});
-  let trace:{read:GPUBuffer;base:number;build:NonNullable<typeof build>}|undefined;
-  if(build){
-   // Header: box, cursor 0, dropped 0, the log's first word; the log is cleared.
-   const base=MEMO_AT+memo.slots*MEMO_WORDS+transientWords,head=new Uint32Array(8);new Float32Array(head.buffer,0,4).set(request!.box.slice(0,4));head[6]=base;
-   encoder.copyBufferToBuffer(own(this.upload(head,GPUBufferUsage.COPY_SRC)),0,counts,TRACE_AT*4,32);
-   encoder.clearBuffer(counts,base*4,TRACE_LOG_WORDS*4);
-   // The readback is the trace task's, not the job's: the job releases what it
-   // owns when its submission settles, before this buffer's mapAsync resolves
-   // (sea-100 T1: "Buffer was destroyed before mapping was resolved"). The
-   // task destroys it after decoding (hull-104).
-   trace={read:this.device.createBuffer({label:'MAIN decision trace readback',size:(8+TRACE_LOG_WORDS)*4,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST}),base,build};
-  }
+
+
   const visibilityArguments=own(this.device.createBuffer({label:'MAIN active word visibility arguments',size:16,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.INDIRECT}));
   const visibilityDispatchGroup=this.device.createBindGroup({layout:this.visibilityDispatch.getBindGroupLayout(0),entries:[uniform,counts,visibilityArguments].map((buffer,binding)=>({binding,resource:{buffer}}))});
-  const construction=trace?[this.curves[0]!]:[...this.far,...this.curves];
+  const construction=[...this.far,...this.curves];
   const activeRunPipelines=new Set<GPUComputePipeline>([this.sourcePartInit,this.sourcePartReduce,this.claimMemo,this.resolveMemo,this.skyline,...this.far,...this.curves]);
   const standingGroups=standingDispatch(Math.max(1,runCount),this.device.limits.maxComputeWorkgroupsPerDimension);
   const activeArgumentOffset=(pipeline:GPUComputePipeline):number|undefined=>{
-   if(trace&&pipeline===this.curves[0])return 0;
+
    if(pipeline===this.sourcePartInit||pipeline===this.sourcePartReduce||pipeline===this.claimMemo||pipeline===this.resolveMemo||pipeline===this.skyline)return 0;
    const farIndex=this.far.indexOf(pipeline);if(farIndex>=0)return (4+farIndex)*12;
    const curveIndex=this.curves.indexOf(pipeline);if(curveIndex>=0)return (1+curveIndex)*12;
@@ -6136,17 +6075,11 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
     f.setBindGroup(0,this.device.createBindGroup({layout:foreign.getBindGroupLayout(0),entries:[{binding:5,resource:{buffer:fpBuffer}},{binding:6,resource:{buffer:output}},{binding:7,resource:{buffer:counts}},{binding:3,resource:{buffer:stacked.upper.words}},{binding:4,resource:{buffer:stacked.upper.count}}]}));
     f.dispatchWorkgroups(Math.ceil(rows/64));f.end();
    }
-   const pass=encoder.beginComputePass({label:pipeline===this.sourcePartInit?'MAIN source-part key initialization':pipeline===this.sourcePartReduce?'MAIN source-part exact-key reduction':pipeline===this.skyline?'MAIN merged far skyline profile':pipeline===this.claimMemo||pipeline===this.resolveMemo||pipeline===this.reclaimMemo?'MAIN exact source-key correspondence':construction.includes(pipeline)?'MAIN featurecurves compiled playback':pipeline===this.wordVisibility?'MAIN parallel whole-word visibility':'MAIN featureplace fixed native cursors'});const traced=trace&&(pipeline===this.skyline||construction.includes(pipeline)||pipeline===this.place||pipeline===this.wordVisibility);pass.setPipeline(traced?(pipeline===this.skyline?trace!.build.skyline:construction.includes(pipeline)?trace!.build.curves:pipeline===this.wordVisibility?trace!.build.visibility:trace!.build.place):pipeline);pass.setBindGroup(0,group);const argumentOffset=activeArgumentOffset(pipeline);if(pipeline===this.wordVisibility)pass.dispatchWorkgroupsIndirect(visibilityArguments,0);else if(job.gpu&&activeArguments&&activeRunPipelines.has(pipeline)&&argumentOffset!==undefined)pass.dispatchWorkgroupsIndirect(activeArguments,argumentOffset);else pass.dispatchWorkgroups(x,y);pass.end();
+   const pass=encoder.beginComputePass({label:pipeline===this.sourcePartInit?'MAIN source-part key initialization':pipeline===this.sourcePartReduce?'MAIN source-part exact-key reduction':pipeline===this.skyline?'MAIN merged far skyline profile':pipeline===this.claimMemo||pipeline===this.resolveMemo||pipeline===this.reclaimMemo?'MAIN exact source-key correspondence':construction.includes(pipeline)?'MAIN featurecurves compiled playback':pipeline===this.wordVisibility?'MAIN parallel whole-word visibility':'MAIN featureplace fixed native cursors'});pass.setPipeline(pipeline);pass.setBindGroup(0,group);const argumentOffset=activeArgumentOffset(pipeline);if(pipeline===this.wordVisibility)pass.dispatchWorkgroupsIndirect(visibilityArguments,0);else if(job.gpu&&activeArguments&&activeRunPipelines.has(pipeline)&&argumentOffset!==undefined)pass.dispatchWorkgroupsIndirect(activeArguments,argumentOffset);else pass.dispatchWorkgroups(x,y);pass.end();
    if(pipeline===this.far[0])rebuildActiveQueues?.();
    if(pipeline===this.place){const tone=encoder.beginComputePass({label:'MAIN parallel region tone words'});tone.setPipeline(this.tonePlace);tone.setBindGroup(0,group);tone.dispatchWorkgroups(x,y);tone.end();}
   }
-  if(trace){
-   encoder.copyBufferToBuffer(counts,TRACE_AT*4,trace.read,0,32);encoder.copyBufferToBuffer(counts,trace.base*4,trace.read,32,TRACE_LOG_WORDS*4);
-   // A later normal frame must not append: the header's log base goes back to 0.
-   encoder.clearBuffer(counts,TRACE_AT*4,32);
-   const {read}=trace,sites=trace.build.sites,cam=job.gpu!.camera,box=request!.box;
-   this.submittedTasks.push(()=>{void (async()=>{try{await read.mapAsync(GPUMapMode.READ);const decoded=decodeTrace(new Uint32Array(read.getMappedRange().slice(0)),sites);read.unmap();const wordTexts:Record<number,string>={};for(const block of decoded.blocks)for(const e of block.events)if(e.value!==undefined&&(e.tag==='emit word index'||e.tag==='place word index'||e.tag==='blocked by word index'))wordTexts[e.value]??=this.wordText(e.value);traceHost.__mainTrace={camera:cam,box,page:{width:job.width,height:job.height},sites,wordTexts,...decoded};}catch(error){traceHost.__mainTrace={camera:cam,box,error:String(error)};}finally{read.destroy();}})();});
-  }
+
   let sealed:Omit<GpuNativeTape,'seal'>|undefined;
   if(job.gpu){
    // Same metrics address as the resident grammar header; no second bank.
@@ -6311,7 +6244,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
    if(memory[at+9]===5)continue;
    if(literal){let entry=groups.get(literal.group.id);if(!entry){const atoms:NativeOccurrence[]=[];entry={owners:literal.owners??[],sources:literal.sources??[],support:literal.support,group:{...literal.group,occurrences:atoms},atoms,points:new Map()};groups.set(literal.group.id,entry);}const original=literal.group.occurrences[memory[at+1]!]!;entry.atoms.push({...original,x:memory[at+3]!,row:memory[at+4]!,foreground:memory[at+10]!});continue;}
    const encoded=memory[at+16]!,domain=encoded&0x5fffffff,ownerIndex=memory[at+17]!,producer=!!(encoded&0x80000000);
-   // A FAR AGGREGATE word (perf-impl-97; gpu-source-far-forms writes source
+
    // domain 0, never a registered source's domain): its owner is the parent
    // construction's stable key (an octree node id or a producer skyline column),
    // not an entity the camera tracks. Its lifetime is that key.
@@ -6339,9 +6272,9 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
     contact=`/receiver-${receiver}/face-${memory[at+30]}/port-${memory[at+31]}`;
    }
    // A run with no source address (0: a far form or far aggregate run of the
-   // perf-96 emitter) is told apart by its snapshot run index, so two far runs
+
    // of one owner on one page keep distinct occurrence identities (tonemapping
-   // export, perf-impl-97 session3). Source-addressed runs are unchanged.
+
    const id=`${owner}/gpu-run/${kind}/${memory[at+18]}${memory[at+18]===0?`/run-${runIndex}`:''}${contact}`;
    // A joined construction remains ONE group. Its words can be supported by
    // other source chunks; retain both root membership and the actual source
@@ -6375,7 +6308,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
     // pen, or ink. It is snapshot-local, NOT a temporal correspondence key.
    const edge=form===0&&memory[at+15]===1?`/edge-${memory[at+14]}`:'';
    // An address-0 run (far form / far aggregate) can commit one unit ordinal on
-   // two pens (tonemapping export, perf-impl-97 session4); like a tone tile it
+
    // is told apart by its committed-word address (snapshot-local).
    const ordinal=form===3?`${id}/node-${memory[at+14]}/${memory[at+15]}/${memory[at+22]}/${memory[at+23]}/${row}/word-${index}/${scalar}`:`${id}${edge}/unit-${memory[at+1]}/${sourceScalar}${memory[at+18]===0?`/word-${index}`:''}`;
     // Publication shades from this committed word. Export must retain the

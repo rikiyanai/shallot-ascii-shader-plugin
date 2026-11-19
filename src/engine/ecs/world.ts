@@ -671,18 +671,18 @@ export class World {
         return this._scheduler.time;
     }
 
-    /** Advance a virtual frame by `deltaTime` seconds, with paced fixed work, simulation and draw.
-     * After setup, preFixed systems may restore and replay with tick before the paced ticks.
-     * Replay changes fixedTick but not the accumulator, fixedAlpha or the four paced-tick cap;
-     * fixedSteps counts only paced ticks. Field marks accumulate until normal frame upload/clear.
-     * postFixed systems may capture after every completed fixed group, including replay ticks.
-     * Pause, scale and the catch-up cap apply only here. Refuses inside a step or tick,
-     * or a negative or non-finite delta.
-     * A propagated setup/update throw ends the step with a named Error and the thrown value as cause.
-     * A propagated draw throw drops the unfinished system encoder without submitting its commands.
-     * Only recorded table growth and staged upload copies replay through a fresh submission; if there are
-     * none, no submission or fence issues. The GPU frame does not advance. With
-     * {@link logAndPauseSystemErrors}, the failed system is paused, later draw systems run, and the frame submits. */
+
+
+
+
+
+
+
+
+
+
+
+
     step(deltaTime = Time.DEFAULT_DT): void {
         if (this._stepping || this._recovering)
             throw new Error("World.step: refuses inside a step or tick");
@@ -729,13 +729,13 @@ export class World {
         }
     }
 
-    /** Capture entity identity and allocation, simulation component membership, all stored and registered simulation
-     * fields and their pending change marks through the entity high-water mark, and fixedTick.
-     * Local to this world and registry;
-     * includes declared participants' hidden simulation state; excludes pacing, GPU and host state.
-     * During step/tick, allowed only in preFixed or postFixed, never in recovery callbacks.
-     * Query order is derived from restored membership. The image is reusable, opaque and independent
-     * of writes, not a save format. */
+
+
+
+
+
+
+
     snapshot(): WorldSnapshot {
         if (this._recovering) throw new Error("World.snapshot: refuses during recovery");
         this._recovering = true;

@@ -871,7 +871,7 @@ function releaseCapture(a: BrowserAdapter): void {
     a.lastPointerY = 0;
 }
 
-/** Move capture to the touch that now drives the pointer, or release it when none is held. */
+
 function followTouch(a: BrowserAdapter, d: DeviceRecord, pointerId: number): void {
     if (pointerId !== a.activePointerId) return;
     const canvas = a.activeCanvas;

@@ -59,10 +59,10 @@ export interface MaterialGeometryBatch {
   /** Same-encoder posed material output; never retained after submission. */
   readonly gpuPose?:GpuIndexedSourcePose;
 }
-/** Only a producer-owned certificate can authorize pose retention.  The
- * per-capture serial remains separate: cameras and the extraction pass may
- * change without changing posed content.  Unknown/deforming material stages
- * leave this undefined and therefore retain the incumbent per-frame path. */
+
+
+
+
 function posedContentRevision(draw:MaterialGeometryDraw):number|undefined{
  const source=draw.gpuIndexedSource,certificate=source?.poseContent;
  if(!source||!certificate||certificate.sourceGeneration!==source.generation)return;

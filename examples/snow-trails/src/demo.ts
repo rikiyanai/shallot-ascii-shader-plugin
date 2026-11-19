@@ -43,7 +43,7 @@ export const SnowTrails = {
         boulder: 0,
         stamp: 0,
         stampMaterial: null as MaterialHandle | null,
-        /** The boulder's travel since the capture last drew the stamp, in meters. */
+
         sweep: [0, 0, 0] as [number, number, number],
         snow: 0,
     }),
@@ -192,7 +192,7 @@ export const DemoPlugin: Plugin = {
             },
         },
         {
-            // The capture draws the stamp once a frame; sweeping it back over the ticks' travel since
+
             // the last frame leaves no gap between frames.
             name: "stamp-sweep",
             update(world) {

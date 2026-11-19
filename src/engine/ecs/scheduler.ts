@@ -105,7 +105,7 @@ export class Scheduler {
     /** optional fence-wait telemetry sink — installed by the profile plugin */
     fenceWait?: (ms: number) => void;
 
-    /** @internal Capture the integer simulation clock, not frame pacing. */
+
     snapshot(): number {
         return this._time.fixedTick;
     }

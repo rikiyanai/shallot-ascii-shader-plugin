@@ -152,7 +152,7 @@ export class MeshSourceCache<R extends SourceComplexRetention='full'> {
   if(!draw.sourceGeometry&&!draw.gpuIndexedSource)return;
   if(draw.gpuIndexedSource)return this.resident(draw);
   if(draw.mesh!==undefined&&selection?.outside?.has(draw.mesh))return;
-  // A MIXED mesh (perf-impl-94) returns its full resident; farForm draws its far members.
+
   if(draw.mesh!==undefined&&selection?.far.has(draw.mesh)&&!selection.full?.has(draw.mesh)){const form=this.form(draw);if(form)return form;}
   const resident=this.resident(draw);if(!resident)throw Error('Source revision is not registered; prepare the complete camera sources before drawing');
   return resident;
@@ -167,8 +167,8 @@ export class MeshSourceCache<R extends SourceComplexRetention='full'> {
   if(!Number.isSafeInteger(mesh)||mesh<0)throw new RangeError('contact corner request requires a mesh handle');
   this.contactCornerMeshes.add(mesh);
  }
- /** The compiled far form of a MIXED mesh's far members (perf-impl-94);
-  * undefined when the mesh has none (its members then all stay full). */
+
+
  farForm(draw:MaterialGeometryDraw):ResidentCompiledFarForm|undefined{return this.form(draw);}
  private form(draw:MaterialGeometryDraw):ResidentCompiledFarForm|undefined{
   const data=draw.sourceGeometry as SourceData|undefined;if(this.retention!=='summary'||!data||data.surface||data.lineage?.adjacency)return;

@@ -65,35 +65,35 @@ export const TOPOLOGY_PLANE_LOOPS_WORD=5;
 export const TOPOLOGY_PLANE_LOOP_COUNT_WORD=6;
 export const TOPOLOGY_PLANE_OPENING_COUNT_WORD=7;
 export const TOPOLOGY_TYPE_TERRAIN=5;
-/** SOURCE-BACKED PAIRED LIMB (perf-impl-109). A run slot of a source whose part
- * graph has LIMB chains holds the limb-vertex table: header word
- * TOPOLOGY_LIMB_MAGIC_WORD is TOPOLOGY_LIMB_MAGIC, +1 the offset of the table,
- * +2 its length. One word per ORIGINAL source vertex: 0 = the vertex is on no
- * limb, else ((chain id + 1) << PART_CHAIN_SHIFT) | PART_LIMB, the label of the
- * section or band whose surface it lies on (mesh-part-graph.ts). The two
- * silhouettes of one tube are runs of the SAME chain, so articulation pairs
- * them by this compiled identity instead of probing the frame's owner/depth
- * fields (limbScan). Words 8-10 are otherwise unused in a run slot; the magic
- * guards the GPU-derived run program (source-numeric-program seedRuntime),
- * whose header words beyond 0, 1, 16 and 37-43 are not written. */
+
+
+
+
+
+
+
+
+
+
+
 export const TOPOLOGY_LIMB_MAGIC_WORD=8,TOPOLOGY_LIMB_MAGIC=0x11b0c4a1;
-/** SOURCE-OWNED SOFT PART PROGRAM (perf-impl-110). A RUN slot may carry one
- * fixed-stride record per source part plus one compact membership word per
- * original halfedge. The table is deliberately after
- * the existing context tables and uses header words 11..15, which are free in
- * a run slot (the complete inspection packet retains its old header meaning).
- * Header words are [magic, program offset, program count, membership offset,
- * membership count]; records are [feature id, role/flags, direction, part
- * labels, original part id, part kind, six anchor words]. Direction is the
- * source-owned context token when an ordered contour supplies unambiguous
- * rest-space tangents, turn class and paper side; it remains zero for bands,
- * open parts and ambiguous geometry, so articulation keeps the incumbent
- * whole-run path. `role/flags` bit 8 is the source-owned D5 sequence bit.
- * The six anchor words (crawl brief item C, packet half) hold the halfedge
- * ids of the part member whose origin vertex is extreme in rest space along
- * -x,+x,-y,+y,-z,+z (ties: lowest halfedge id); 0xffffffff when the part has
- * no member positions. Words 0..5 keep their meaning, so stride-indexed
- * readers advance by TOPOLOGY_PART_PROGRAM_WORDS unchanged. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const TOPOLOGY_PART_MAGIC_WORD=11,TOPOLOGY_PART_MAGIC=0x50415254,TOPOLOGY_PART_PACKET_MAGIC=0x50505232,TOPOLOGY_PART_PROGRAM_WORDS=12;
 
 export interface ResidentTopologySource {
@@ -436,11 +436,11 @@ export const SOURCE_PART_FEATURE_ORDINAL_BITS=18;
 export const SOURCE_PART_FEATURE_ORDINAL_MASK=(1<<SOURCE_PART_FEATURE_ORDINAL_BITS)-1;
 export const SOURCE_PART_CONTEXT_CLASS_SHIFT=6;
 export const SOURCE_PART_CONTEXT_CLASS_MASK=7;
-/** Context classes (3 bits, zero = unsupported): 1 cap/below, 2 shoulder/
- * below, 3 flank/left, 4 flank/right, 5 return/above, 6 shoulder/left,
- * 7 shoulder/right (perf-impl-154: a side turn such as the retained
- * `sk-church101-rib-shoulder-flank`, inside right NE->S, is a genuine
- * shoulder; class 2 alone excluded it before tangent/port matching). */
+
+
+
+
+
 export type SourcePartContextClass=1|2|3|4|5|6|7;
 export type SourcePartContext={readonly incoming:number;readonly outgoing:number;readonly contextClass:SourcePartContextClass;readonly curvature:'convex';readonly inside:'below'|'above'|'left'|'right';readonly token:number};
 export interface SourcePartGeometryContext {readonly points:readonly (readonly [number,number,number])[];readonly center:readonly [number,number,number];}
@@ -492,14 +492,14 @@ const sourceSide=(chart:SourceSectionChart,a:readonly number[],b:readonly number
  const signed=dot3(cross3(tangent,toCenter),chart.axis);if(Math.abs(signed)<=epsilon)return 'enclosed';
  return signed>=0?'left':'right';
 };
-/** PAGE side (perf-impl-155, PARENT PRODUCER ONLY). Left/right are page sides
- * in the chart (u = page right), exactly like below/above (v = page down) and
- * like the retained entries' `inside` ("the vault interior right of the rib").
- * The live travel-relative rule flips every upward-travelling stroke (48-gon
- * probe side155.ts: 68/196 passages disagreed with their page side; 0 with
- * this rule). Kept separate so the live packet classification is unchanged;
- * the affected mapping is exactly: for an upward-travelling measured segment,
- * live class 3<->4 and 6<->7 are swapped; below/above/enclosed are identical. */
+
+
+
+
+
+
+
+
 const sourceSidePage=(chart:SourceSectionChart,a:readonly number[],b:readonly number[],center:readonly number[]):'above'|'below'|'left'|'right'|'enclosed'=>{
  const midpoint=[(a[0]!+b[0]!)/2,(a[1]!+b[1]!)/2,(a[2]!+b[2]!)/2];
  const tangent=vectorBetween(a,b),toCenter=vectorBetween(midpoint,center);
@@ -550,17 +550,17 @@ export function sourcePartContextCandidates(axis:readonly number[],role:0|1|2|3,
   const points=[...winding.slice(offset),...winding.slice(0,offset)];
   const context=sourcePartContextOne(axis,role,closed,{points,center:geometry.center},side);if(context)result.push({context,points});
  }
- // perf-impl-154: side-shoulder classes 6/7 only ADD contexts. A contour that
+
  // already had a below (class 2) rotation keeps it first, so the packet token
  // (`sectionContext` takes candidate 0) and the producer's contour order are
  // unchanged for every previously admitted section and stay independent of
  // which side rotation the exporter's first sample happens to be. Stable.
  return result.map((item,index)=>({item,index})).sort((a,b)=>(a.item.context.contextClass>=6?1:0)-(b.item.context.contextClass>=6?1:0)||a.index-b.index).map(value=>value.item);
 }
-/** One source-contiguous passage of a compiled closed contour (perf-impl-152).
- * `from`/`to` index the caller's contour points (its own sample order) at the
- * passage ends; `points` run from `from` to `to` in passage order. The ends are
- * source anchors, never camera or glyph positions. */
+
+
+
+
 export interface SourcePartPassage extends SourcePartContextGeometry {readonly from:number;readonly to:number;}
 /** Labelled end anchors for a passage that must join two different source
  * incidences (a fork band's branch sections). Label 0 is never an anchor. */
@@ -575,28 +575,28 @@ function passageContextClass(role:0|1|2|3,inside:'above'|'below'|'left'|'right'|
  if(role===2)return inside==='left'?3:inside==='right'?4:undefined;
  return inside==='above'?5:undefined;
 }
-/** ANCHOR-BOUNDED SOURCE PASSAGES (perf-impl-152, parent producer).
- *
- * The contour must be a convex closed source loop; every contiguous arc of it
- * is then convex too. Without explicit anchors, the passage anchors are the
- * DIRECTION-RUN boundaries: the source samples at which the quantized section-
- * chart tangent changes. On a convex loop the tangent turns monotonically, so
- * there are at most eight runs and every passage is a union of 1..R-1
- * consecutive runs, in both windings: at most 112 passages, each measured in
- * O(1) plus one arc-length walk. It is not an enumeration of every sample arc.
- * With explicit labelled anchors (a band's incidence), the passages are only
- * the arcs from the first anchor of one label run to the first anchor of the
- * next (different-label) run: each joins two different incidences.
- *
- * Admission measures exactly what the closed-contour context measures:
- * incoming/outgoing are the outward tangents of the passage's own first and
- * last segments in the source chart; the inside side is measured at the
- * passage's arc-length middle segment (an open passage's end segments sit at
- * its anchors, where the interior is beside the stroke, not under it). The role
- * to context-class rule is the closed-contour rule. Order is independent of the
- * exporter's first sample: longest passage first, then the loop's positive
- * chart winding, then the start run's direction code (or the start anchor's
- * cyclic rank from the lowest label for labelled anchors). */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export function sourcePartPassageCandidates(axis:readonly number[],role:0|1|2|3,geometry?:SourcePartGeometryContext,anchors?:readonly SourcePartPassageAnchor[]):readonly SourcePartPassage[]{
  if(!geometry||geometry.points.length<3)return [];
  const points=geometry.points,n=points.length;
@@ -620,7 +620,7 @@ export function sourcePartPassageCandidates(axis:readonly number[],role:0|1|2|3,
    const rankOf=new Map(order.map((index,k)=>[index,k]));
    const ranked=anchors.filter(anchor=>anchor.label!==0&&rankOf.has(anchor.index)).map(anchor=>({k:rankOf.get(anchor.index)!,label:anchor.label})).sort((a,b)=>a.k-b.k);
    if(ranked.length<2)continue;
-   // perf-impl-154 LABEL RUNS: cyclically consecutive anchors with one label
+
    // form one incidence run (dense anchors: every incident ring vertex on a
    // junction hull). A passage runs from the first anchor of one run to the
    // first anchor of the next run, so it covers one whole incidence and joins
@@ -654,7 +654,7 @@ export function sourcePartPassageCandidates(axis:readonly number[],role:0|1|2|3,
    const incoming=sourceAxisDirection(chart,vectorBetween(second,first)),outgoing=sourceAxisDirection(chart,vectorBetween(before,last));
    let total=0;for(let k=pair.start;k<pair.end;k++)total+=lengthOf(k);if(!(total>0))continue;
    let middle=pair.start,walked=0;for(let k=pair.start;k<pair.end;k++){const length=lengthOf(k);if(walked+length>=total/2){middle=k;break;}walked+=length;}
-   // Passages are parent-producer-only: the page side (perf-impl-155).
+
    const inside=sourceSidePage(chart,points[at(middle)]!,points[at(middle+1)]!,geometry.center);if(inside==='enclosed')continue;
    const contextClass=passageContextClass(role,inside);if(contextClass===undefined)continue;
    const token=(contextClass<<SOURCE_PART_CONTEXT_CLASS_SHIFT)&SOURCE_PART_CONTEXT_MASK;
@@ -814,7 +814,7 @@ function appendPartProgramTable(target:number[],item:TopologySourceItem):void{
 export function compileFaceEdges(item:TopologySourceItem):Uint32Array|undefined{
  const complex=item.complex,faces=item.faces,regions=item.planeRegions??[];if(!complex||!faces?.length)return undefined;
  const table=new Uint32Array(complex.halfedges.length);
- // Slice 1b (perf-impl-81): only the face's compiled decisions are face-owned.
+
  // A drawn halfedge owns its edge (the least face wins; outline before
  // opening); a hidden one marks the edge FACE_HIDDEN only where no face draws
  // it. Every other edge (a slanted gable side, a roof edge) keeps word 0.
@@ -893,40 +893,40 @@ export function packConstructionTopologyWhole(classes:readonly TopologySourceIte
 
 export function topologyTypeCode(type:CompiledConstructionGraph['type']):number{return TYPE_CODE[type];}
 
-/** COMPILED CONSTRUCTION LEVELS (representation frontier stage 2, perf-impl-93,
- * 2026-11-17). For each source edge, the lowest distance tier at which it can
- * contribute a line, compiled ONCE with the source program from the edge
- * classes above and the rest mesh; read by the relation producer
- * (surface-relations.ts levelDrops) so that a small or distant VISIBLE
- * instance produces only the lines its tier can draw. A level is a SUBSET of
- * the same edges and ports, never new geometry: an edge either is produced
- * exactly as before or is not produced; anchors, ports and feature identities
- * are untouched.
- *
- * The rule is TIER_SELECTION (gpu-articulation.ts), read per edge class:
- *  outline candidates (any edge that can be a silhouette: the producer emits
- *   kind 0 and kind 1 from every edge class; a level never limits kind 0 or
- *   kind 1) and PRINCIPAL creases: a class 1 crease (authored feature edge)
- *   whose feature chain spans at least DETAIL_FRACTION of its source's rest
- *   extent (the middle side of its box): a roof or lid edge, a building or box
- *   corner. Code 0, no level, produced at every tier at any length;
- *  a class 1 crease whose chain is shorter is DETAIL of a plane (a window or
- *   panel frame on a facade): the 2026-11-10 order's priority (silhouette,
- *   plane boundaries, folds, texture) drops it before the form's own plane
- *   boundaries, so it takes the facet crease's level below;
- *  a FACET CREASE (class 2) is drawn at 中景 and 遠景 only as a run of at least
- *   FACET_CREASE_LEAST_ROWS rows (TIER_SELECTION[1][3], [2][3]). Its code is its
- *   FEATURE CHAIN's rest length over its own rest length (EDGE_LEVEL_UNIT
- *   fixed point, rounded up), so the producer bounds the chain's projected
- *   length by the edge's own POSED length (which carries the instance's world
- *   scale) times the code. The chain: facet creases joined at a welded vertex
- *   where the line turns by 45 degrees or less (the widest continuation the run
- *   builder allows, gpu-construction-runs.ts straightMate), summed. A longer
- *   chain only keeps more.
- * Terrain sources and sources without a table keep everything (no table).
- * Layout: one u16 per ORIGINAL halfedge address h (the relation key.w and the
- * edge class address), two per word, h in bits (h & 1) * 16 of word h >> 1.
- * An empty array: no edge of the source is limited. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const EDGE_LEVEL_UNIT=8;
 /** Bit 15 of a code: the edge is class 1 DETAIL (a short authored feature edge
  * of a plane: window, panel). Bits 0-14: the chain ratio in EDGE_LEVEL_UNIT.
@@ -939,8 +939,8 @@ export const EDGE_LEVEL_DETAIL=0x8000;
  * chain's ONE construction edge is produced instead. levelDrops never drops
  * it (the ratio bits are all set), and no facet ratio takes this value. */
 export const EDGE_LEVEL_CHAINED=0x7fff;
-/** Least run, in text rows, of a facet crease at 中景 and 遠景: TIER_SELECTION
- * column 3, rows 1 and 2 (gpu-articulation.ts). perf-impl-93 check93 asserts it. */
+
+
 export const FACET_CREASE_LEAST_ROWS=1;
 const CHAIN_TURN_COS=0.70710678;
 /** A class 1 crease chain at least this share of its source's rest extent is
@@ -990,26 +990,26 @@ export function compileEdgeLevels(topology:Uint32Array,complex:MeshSourceComplex
  return any?out:new Uint32Array(0);
 }
 
-/** THE COMPILED CONNECTED OUTLINE (structural ladder L2, perf-impl-106).
- * The three compiled levels of one source program:
- *  L0 full: every source edge (the source program itself);
- *  L1 principal: the edge subset compileEdgeLevels codes (silhouette
- *   candidates and principal creases; detail and short facet creases out);
- *  L2 connected outline: THIS construction, the convex hull of the source's
- *   SUPPORT VERTICES along OUTLINE_DIRECTIONS. Each support point is an
- *   original source vertex (the least vertex id among the extreme ones), so
- *   the hull's corners ARE the source corners L0 and L1 spell: one anchor id
- *   (the vertex port) at every level. A box's support set is its eight corners
- *   and its hull is the box; a sheet's is its slab; a figure's is a closed
- *   polytope of at most 26 corners.
- * The GPU draws it per camera from the POSED positions of those vertices
- * (surface-relations hullOutlineAt): hull edge k is an outline exactly when
- * its two hull faces turn opposite ways to the eye, so the outline is closed
- * and evaluated at the current pose; nothing view-dependent is cached here.
- * Record per undirected hull edge: [a, b, c, d, face]: tri0 (a,b,c) and tri1
- * (b,a,d) are its two outward hull faces, `face` an original source face at
- * a (its owner, material and draw range). Section: [HULL_MAGIC, edges,
- * records...]. Undefined: no hull (rounded, terrain, degenerate or flat). */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const OUTLINE_HULL_MAGIC=0x48554c4c;
 export const OUTLINE_HULL_WORDS=5;
 /** Least share of its hull's volume a closed source fills to take the hull as
@@ -1044,7 +1044,7 @@ export function compileOutlineHull(complex:MeshSourceComplex,positions:ArrayLike
  }
  support.sort((a,b)=>a-b);
  const faces=convexHull(support.map(P),eps);if(!faces)return undefined;
- // ADEQUACY (operator 2026-11-18: a hull is not every form's outline). An OPEN
+
  // source (boundary edges: a sheet, an opening) or a CONCAVE one (its closed
  // volume under OUTLINE_HULL_FILL of the hull's: an L or U block, a court, an
  // arch, a figure) has no L2 construction; it stays at the principal level.
@@ -1103,27 +1103,27 @@ export function convexHull(points:readonly (readonly [number,number,number])[],e
  * section. Terrain and rounded sources keep their own whole-form producers:
  * codes only (terrain none). The relation stage finds the hull after the
  * codes (sourceHullAt) and checks its magic. */
-/** PARENT MEMBER ADEQUACY (perf-impl-108): whether a placement's upper profile
- * on the far skyline loses NO OPENING it owns. Closure is not the test: every
- * decoded Numabe geometry (2,034 of 2,034) is an open shell, a facade with no
- * back has no visible opening (numbers/numabe-solid.json). The mesh's own
- * triangles are sampled into a PROFILE_LATTICE occupancy lattice over its box
- * in its two side views (x-y and z-y) and its top view (x-z):
- *  - side views: every column the mesh covers is covered without a gap down
- *    to the base row (an empty cell under a covered one is an arch, a
- *    passage, a space under an overhang or between legs);
- *  - top view: every row and column is covered without a gap between its
- *    first and last covered cell (a court, a gap between two wings).
- * The same no-opening rule source-lod applies to a group on the page.
- * Compiled once per source revision from its own geometry.
- * The lattice is the GLYPH resolution of the largest parent (source-lod
- * PARENT_LEAVE_ROWS = 3.75 rows: 4 cells): an opening counts only when it is
- * about one glyph at that size. At 16 cells, sub-glyph holes (about 0.2 row)
- * rejected 967 of 2,034 Numabe geometries for openings no glyph can spell.
- * Coverage is AREA: the triangles are sampled on a PROFILE_FINE lattice and a
- * glyph cell is covered when more than half its fine cells are (sampled
- * straight at 4 cells, the faces lining a one-cube court fell inside the
- * court's own cells and no opening was ever found). */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const PROFILE_LATTICE=4,PROFILE_FINE=16;
 export function compileMeshProfileSafe(positions:ArrayLike<number>,indices:ArrayLike<number>):boolean{
  const n=Math.floor(positions.length/3);if(n<3||indices.length<3)return false;
@@ -1180,9 +1180,9 @@ export function latticeOpening(grid:ArrayLike<number>,columns:number,enclosed:bo
  }
  return false;
 }
-/** Closed-and-convex test (perf-impl-108 first draft, kept for the census in
- * numbers/numabe-solid.json): every welded edge shared by exactly two
- * triangles and the volume at least OUTLINE_HULL_FILL of the 26-direction hull. */
+
+
+
 export function compileMeshSolid(positions:ArrayLike<number>,indices:ArrayLike<number>):boolean{
  const n=Math.floor(positions.length/3);if(n<4||indices.length<12||indices.length%3)return false;
  const lo=[Infinity,Infinity,Infinity],hi=[-Infinity,-Infinity,-Infinity];
@@ -1219,20 +1219,20 @@ export function compileConstructionLevels(topology:Uint32Array,complex:MeshSourc
  const hullWords=hull??Uint32Array.of(OUTLINE_HULL_MAGIC,0),out=new Uint32Array(words+hullWords.length+(chains?.length??0));
  out.set(codes);out.set(hullWords,words);if(chains)out.set(chains,words+hullWords.length);return out;
 }
-/** THE COMPILED PRINCIPAL CONSTRUCTION (structural ladder L1, perf-impl-106).
- * Principal creases (class 1, level code 0: a roof or lid edge, a box or
- * building corner) are joined at compile time into STRAIGHT CHAINS: maximal
- * runs of principal creases through welded vertices where exactly two of them
- * meet in line (turn under CHAIN_STRAIGHT_COS). Each chain of two or more
- * edges is ONE construction edge between its two end vertices, the anchors
- * (source vertex ports) its members end at in L0. Its members take
- * EDGE_LEVEL_CHAINED in the code table; at 中景 the relation stage produces
- * the chain edge instead of its members, at 近景 the members.
- * Record: [a, b, face0, face1, first member halfedge]: the chain's end
- * vertices, the two faces of its first member (both chain sides are those
- * planes: a principal crease is a plane-region border) and the member whose
- * class and face word the chain carries. Section [CHAIN_MAGIC, m, records].
- * `codes` (ceil(H/2) words) is updated in place for the members. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const PRINCIPAL_CHAIN_MAGIC=0x4348414e;
 export const PRINCIPAL_CHAIN_WORDS=5;
 const CHAIN_STRAIGHT_COS=.99985;

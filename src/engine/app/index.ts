@@ -35,12 +35,12 @@ export interface Plugin {
      * Only built-ins guarantee cross-runtime replay within one engine version; games need not.
      * Fixed consumers of GPU readback declare false. Byte access is not guarded. */
     readonly deterministic?: boolean;
-    /** Binds a snapshot/restore pair to each world during plugin registration, before initialize.
-     * A plugin recovers state it owns that any fixed system reads, including read-only authoring
-     * resources. Fixed plugins must declare a participant or `"stateless"` when components or
-     * per-call reconstruction hold it all; registration refusal is not a completeness proof. Images are independent
-     * and reusable; restore sees recovered ECS identity, fields and fixedTick.
-     * Host handles and presentation are outside capture; live device reads are not replay inputs. */
+
+
+
+
+
+
     readonly recovery?: ((world: World) => import("../ecs").Recovery) | "stateless";
     /** systems this plugin adds to the scheduler */
     readonly systems?: readonly System[];

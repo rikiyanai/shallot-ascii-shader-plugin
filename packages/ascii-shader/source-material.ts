@@ -61,8 +61,8 @@ export function compileSourceStyleWord(source:SourceStyle,material:MaterialClass
 export function sourceToneStyleWord(source:SourceStyle):number{
  return source.styleWord===undefined?compileSourceStyleWord(source,0):source.styleWord>>>0;
 }
-/** Only when Y8 creates retained source geometry. AKM stems are the operator's
- * explicit authored registry keys, never an automatic class-name heuristic. */
+
+
 export function bankFamilyMaterialSource(facts:Readonly<Record<string,unknown>>):SourceMaterialKey|undefined{
  const names=[facts.authored_geometry_variant,facts.source_mesh_name].filter((v):v is string=>typeof v==='string'&&/\.akm$/i.test(v));
  const families=new Set(names.map(name=>name.replaceAll('\\','/').split('/').at(-1)!.replace(/\.akm$/i,'')));

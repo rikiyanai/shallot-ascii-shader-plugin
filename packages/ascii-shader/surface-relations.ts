@@ -25,28 +25,28 @@ export interface SurfaceGraphView {
  * two source ports and adjacent face addresses even when both ends are hidden. */
 export {RELATION_WORDS} from './source-coordinates.ts';
 import {RELATION_WORDS,RELATION_RECORD_WGSL,SOURCE_CHART_TAG,VOXEL_REST_CORNER_WGSL,VOXEL_REST_CORNER_ORDER} from './source-coordinates.ts';
-/** A voxel cluster's largest projected size, in native rows (perf-impl-106;
- * perf-impl-108: one glyph row). Steps inside one cluster snap to one level,
- * so contours of one terrace closer than a glyph are ONE line (AGENTS.md
- * finding 4; articulation FACET_COLLAPSE: two parallel lines closer than one
- * glyph cannot both be spelled). At a third of a row (perf-106) a contour
- * every third of a row still reached the page as two or three marks per cell
- * (the voxel island's interior clutter, perf-106 session voxel frame 0). */
+
+
+
+
+
+
+
 export const VOXEL_CLUSTER_ROWS=1;
-/** perf-impl-108 contact corner table bound: corner ids per frame (10-bit ids in
- * Relation.sourceChart.w). Beyond it a corner is not used: its edge ends keep
- * their own nodes (the incumbent). */
+
+
+
 export const CONTACT_PATCH_POINTS=1023;
-/** One supplied contact CORNER (source-corner incidence, perf-impl-108; Codex
- * review: a world point at the drawn pose cannot be fed from fixed-step solver
- * uploads, because the renderer draws GPU-interpolated transforms). An owner
- * (relation key: source domain, entity eid), the owner's SOURCE VERTEX on that
- * contact (the weld-canonical port its edge ends carry: the least original
- * vertex index among the coincident copies in the draw, surface-relations
- * vertexPort), and the corner id shared by both owners of the touching pair
- * (0..CONTACT_PATCH_POINTS-1). The host resolves the solver's body-local
- * contact point to that rest-space vertex once per completed step; it does not
- * move with the drawn pose, so no interpolation or tolerance enters the frame. */
+
+
+
+
+
+
+
+
+
+
 export interface ContactPatchPoint {readonly domain:number;readonly eid:number;readonly vertex:number;readonly id:number}
 /** The texture rows of a contact corner table: one rgba32uint texel per row,
  * row 0 .x = the count, row i+1 = [domain, eid, vertex, id], sorted by
@@ -86,14 +86,14 @@ ${FAR_AGGREGATE_MEMBER_WGSL}
 @group(0) @binding(12) var<storage,read_write> contactWork:array<atomic<u32>>;
 @group(0) @binding(13) var<storage,read> partCodes:array<u32>;
 @group(0) @binding(14) var<storage,read_write> partLevels:array<atomic<u32>>;
-// CONTACT CORNERS (perf-impl-108): explicit two-owner solver incidence by
+
 // SOURCE CORNER, supplied by the host (SurfaceRelations.setContactPatches);
 // never a screen, world or pose weld. rgba32uint, one texel a row; row 0 .x =
 // the count n; row i+1 = [owner domain, owner eid, source vertex port, corner
 // id], sorted by (domain, eid, vertex). An exact key lookup: the edge end's own
 // canonical vertex port, no distance and no drawn pose.
 @group(0) @binding(15) var contactPatches:texture_2d<u32>;
-// perf-impl-137/140: a source's declared part anchors [record base, parts, 6 vertex ids per part] and the ONE
+
 // owner-keyed extent table (heads + records).
 @group(0) @binding(16) var<storage,read> partAnchorVertices:array<u32>;
 @group(0) @binding(17) var<storage,read_write> partAnchorTable:array<atomic<u32>>;
@@ -148,7 +148,7 @@ fn cellParts()->bool{return (params.owners[3].y&2u)!=0u;}
 fn partBase()->u32{return contactSlots()*3u+sourceEdgeCount();}
 fn edgePartBase()->u32{return contactSlots()*6u+sourceEdgeCount();}
 fn partFlagsBase()->u32{return contactSlots()*6u+sourceEdgeCount()*2u;}
-// THE VOXEL CLUSTER LEVEL (perf-impl-106): contactSlots() claim words after
+
 // the contact and part regions, cleared with them (contactClear).
 fn clusterBase()->u32{return select(contactSlots()*3u+sourceEdgeCount(),contactSlots()*7u+sourceEdgeCount()*2u,cellParts());}
 // Page position, in native ROWS, of a posed point (the same row the part pass
@@ -167,7 +167,7 @@ fn voxelBlock(a:vec3f,s:f32,held:f32)->f32{
  var cell=0.0;
  for(var k=0u;k<3u;k++){var v=vec3f(0.0);v[k]=s;let q=pageRowsAt(a+v);if(q.x<-1e29){return 1.0;}cell=max(cell,length(q-p));}
  if(!(cell>0.0)){return 1.0;}
- // perf-impl-127: keep the held level inside the LOD_TIER_HOLD band (no flip
+
  // at a threshold; the rule is monotone in the projected cell size).
  if(held>=1.0&&voxelRuleBlock(cell/${LOD_TIER_HOLD})<=held&&held<=voxelRuleBlock(cell*${LOD_TIER_HOLD})){return held;}
  return voxelRuleBlock(cell);
@@ -211,7 +211,7 @@ fn voxelClusterEmit(a:vec3f,b:vec3f,t:Triangle,kind:u32,address:u32,faces:vec2u,
  }
  return true;
 }
-// THE VOXEL CELL-CHART REPRESENTATION (perf-impl-116; replaces the 110/111
+
 // world-y columns, which read a radially deformed chunk's terraces and caves
 // in the wrong frame). ONE level per chunk, selected BEFORE fine incidence.
 // The chart is the producer's REST cell lattice (closed-cell parts: each
@@ -221,7 +221,7 @@ fn voxelClusterEmit(a:vec3f,b:vec3f,t:Triangle,kind:u32,address:u32,faces:vec2u,
 // - -k face, centre = their mean); a vertex's rest LATTICE POINT is its cell
 // plus, per axis, the side of the centre it lies on (no mesher convention);
 // the posed position of every lattice point that is a vertex is recorded.
-// Generation-owned (retained per generation and block, perf-impl-114 home):
+
 // the CLUSTER occupancy, a cluster (block^3 cells) being occupied when any
 // declared cell lies in it, with a representative cell and face. The coarse
 // construction is the edges of that occupancy along all three chart axes,
@@ -255,7 +255,7 @@ fn scratchHome()->u32{return cornerBase()+chartCornerCount()*4u;}
 fn persistentHome()->bool{return params.owners[0].w!=0u;}
 fn homeBase()->u32{return select(scratchHome(),params.owners[0].w,persistentHome());}
 fn clusterCapacity()->u32{if(persistentHome()){return atomicLoad(&contactWork[homeBase()]);}return chartClusters();}
-// perf-impl-117: one word per source vertex, its packed rest lattice point
+
 // (x | y<<9 | z<<18, plus 1; 0 = none), written by chartCorners (which binds
 // the cell codes) so the boundary stage reads lattice points WITHOUT binding
 // partCodes (it stays within 8 storage buffers).
@@ -279,7 +279,7 @@ fn voxelColumnVertex(v:u32){
  atomicMax(&contactWork[chunkBlockWord()],5u-u32(round(log2(block))));
  atomicMax(&contactWork[chunkBlockWord()+1u],formOrdered(s));
 }
-// perf-impl-118 OCCUPANCY SEMANTICS, explicit per source (owners[3].y bit 3).
+
 // CLOSED (parts.kind 'closed-cells', unchanged): every declared cell has all
 // six faces, so a cluster with no declared cell is empty, as is space outside
 // the grid. SURFACE (restCellChart of a surface-only mesh: it does NOT promise
@@ -392,23 +392,23 @@ fn clusterState(c:vec3i,b:u32)->u32{
 fn clusterOccupied(c:vec3i,b:u32)->bool{return clusterState(c,b)==CLUSTER_SOLID;}
 // Holds a declared cell (closed: the same as occupied).
 fn clusterDeclared(c:vec3i,b:u32)->bool{let s=clusterSlot(c,b);return s!=NONE_CLUSTER&&atomicLoad(&contactWork[s])!=0u;}
-// perf-impl-124: declared and selected this draw (contactEdges marks; chartEmitAt emits).
+
 fn clusterEmits(c:vec3i,b:u32)->bool{let s=clusterSlot(c,b);return s!=NONE_CLUSTER&&atomicLoad(&contactWork[s])!=0u&&(atomicLoad(&contactWork[s+2u])&CLUSTER_SELECTED)!=0u;}
 fn clusterKnown(c:vec3i,b:u32)->bool{return clusterState(c,b)!=CLUSTER_UNKNOWN;}
-// perf-impl-119 CERTIFICATES, two explicit lifetimes, in the existing cluster words.
+
 // TOPOLOGY (word 3; generation + selected block: cleared with the home, kept
 // with a retained one): bit 4 computed, bit 5 every cluster of the 3x3x3
 // neighbourhood has a known state (what this cluster's emission reads).
 // POSE (word 2; this draw: reset with the emission flags): bit 1 computed,
 // bit 2 the least cell places its posed frame; bit 3 SELECTED (an owned fine
 // edge reaches it; contactEdges). Both certificates are written by ONE
-// thread per cluster in chartCertify (perf-impl-121), never by readers.
+
 const CLUSTER_FRAME_DONE=2u;const CLUSTER_FRAME_OK=4u;const CLUSTER_SELECTED=8u;const CLUSTER_NEAR_DONE=16u;const CLUSTER_NEAR_KNOWN=32u;
 fn nearKnown(c:vec3i,b:u32)->bool{
  for(var z=-1;z<=1;z++){for(var y=-1;y<=1;y++){for(var x=-1;x<=1;x++){if(!clusterKnown(c+vec3i(x,y,z),b)){return false;}}}}
  return true;
 }
-// Readers (perf-impl-121): the flags chartCertify wrote; absent = not certified.
+
 fn clusterNearKnown(s:u32)->bool{let w=atomicLoad(&contactWork[s+3u]);return (w&CLUSTER_NEAR_DONE)!=0u&&(w&CLUSTER_NEAR_KNOWN)!=0u;}
 fn clusterFramePlaced(s:u32)->bool{let w=atomicLoad(&contactWork[s+2u]);return (w&CLUSTER_FRAME_DONE)!=0u&&(w&CLUSTER_FRAME_OK)!=0u;}
 // Surface: the chart may own a fine edge around this cluster (closed: always).
@@ -429,7 +429,7 @@ fn closedFrame(c:vec3u)->Frame{
  return Frame(true,(f[0]+f[1]+f[2]+f[3]+f[4]+f[5])/6.0,mat3x3f(f[0]-f[1],f[2]-f[3],f[4]-f[5]));
 }
 // A vertex's rest lattice point (w 0: its cell frame is incomplete).
-// perf-impl-121: with the producer's CERTIFIED corner order (owners[3].y
+
 // bit 4: restCellChart.cornerOrder 'shallot-voxel-quad-v1', the mesher's
 // quad), the point is the shared direct lookup of (cell, face, v % 4): no
 // posed frame and no inference. Otherwise the posed cell-frame inversion.
@@ -502,7 +502,7 @@ fn clusterEmit(c:vec3i,b:u32,t:Triangle,address:u32,face:u32){
    let q0=c+ei*(oi-1)+ej*(oj-1);let q1=c+ei*oi+ej*(oj-1);let q2=c+ei*(oi-1)+ej*oj;let q3=c+ei*oi+ej*oj;
    let p=vec4<bool>(clusterOccupied(q0,b),clusterOccupied(q1,b),clusterOccupied(q2,b),clusterOccupied(q3,b));
    if(chartSurface()&&!(clusterKnown(q0,b)&&clusterKnown(q1,b)&&clusterKnown(q2,b)&&clusterKnown(q3,b))){continue;}
-   // perf-impl-124: the first declared AND SELECTED cluster owns the edge, so
+
    // a coarse edge beside an owned (suppressed) fine edge is always drawn,
    // exactly once, by a cluster that runs clusterEmit (only selected ones do).
    let d=vec4<bool>(clusterEmits(q0,b),clusterEmits(q1,b),clusterEmits(q2,b),clusterEmits(q3,b));
@@ -639,7 +639,7 @@ fn posedEdgeSlot(id:u32)->u32{
  return NO_CONTACT;
 }
 fn boundaryPort(v:u32,instance:u32)->u32{if(posedContacts()){return posedVertexPort(v);}return vertexPort(v,instance);}
-// perf-impl-137/140 SOURCE-DECLARED PART ANCHOR PROJECTION (crawl brief item C).
+
 // Projection, insertion and clearing are separate dispatches. A record is
 // published (its index exchanged into a bucket head) only after a previous
 // dispatch wrote its complete key and extent; readers walk the bucket list and
@@ -694,7 +694,7 @@ fn contactClearAt(id:u32){
  let slots=contactSlots();let count=columnEnd();
  if(id<count){let base=partBase();let low=cellParts()&&id>=base+slots&&id<base+slots*2u;atomicStore(&contactWork[id],select(0u,0xffffffffu,low));}
 }
-// perf-impl-113/116 EARLY-WORK ORDER: clear, voxelVote (every vertex: the
+
 // chunk's block and cell size, and the part cells the part flags read),
 // voxelHome, voxelBin (every quad: its cell face; the cluster occupancy unless
 // retained), chartCorners (every vertex's lattice point), then contactVertices and
@@ -712,7 +712,7 @@ fn voxelBinAt(id:u32){
  if(!posedContacts()||id>=sourceEdgeCount()||!edgeInDraw(id)){return;}
  if(id%5u==0u){chartQuad(id);}
 }
-// perf-impl-116: every vertex's rest lattice point and its posed position
+
 // (after voxelBin wrote every cell's faces; before any fine incidence).
 @compute @workgroup_size(64) fn chartCorners(@builtin(global_invocation_id) gid:vec3u){chartCornerAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn chartCornerAt(v:u32){
@@ -724,7 +724,7 @@ fn chartCornerAt(v:u32){
  atomicStore(&contactWork[at],1u);
  if(v<chartVertices()){let l=vec3u(lattice.xyz);atomicStore(&contactWork[latticeBase()+v],(l.x|(l.y<<9u)|(l.z<<18u))+1u);}
 }
-// perf-impl-121 CLUSTER CERTIFICATION STAGE, one thread per cluster, after
+
 // chartCorners (claims, face centroids and surface states complete) and
 // before contactVertices / contactEdges / boundaries read the flags. Surface
 // charts only (closed clusters are certified by construction). TOPOLOGY
@@ -740,7 +740,7 @@ fn chartCertifyAt(i:u32){
  let w=atomicLoad(&contactWork[s]);
  if(w!=0u){let k=~w;let e=partExtent();let ok=cellFrame(vec3u(k%e.x,(k/e.x)%e.y,k/(e.x*e.y))).ok;atomicOr(&contactWork[s+2u],CLUSTER_FRAME_DONE|select(0u,CLUSTER_FRAME_OK,ok));}
 }
-// perf-impl-114/116: between the vote and the bin, over the home's words.
+
 // KEPT when the home's stored token equals this source's generation token
 // (params.selection.w > 1: the cell chart is generation-owned, so posing and
 // moving never invalidate it) and its stored block equals this frame's vote.
@@ -762,7 +762,7 @@ fn voxelHomeAt(id:u32){
 @compute @workgroup_size(64) fn contactVertices(@builtin(global_invocation_id) gid:vec3u){contactVertexAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn contactVertexAt(v:u32){
  if(!posedContacts()||v>=min(sourceFaceCount()*2u,native[0]/6u*4u)){return;}
- // perf-impl-114: the table is complete (voxelBin ran). Record what it holds:
+
  // this content token and block, or nothing after an overflow (never kept).
  if(v==0u&&persistentHome()){
   let h=homeBase();let complete=atomicLoad(&contactWork[overflowWord()])==0u;
@@ -790,7 +790,7 @@ fn contactEdgeAt(id:u32){
   if(id%5u==0u&&smallClosedPart(code)){let at=partSlot(code);if(at!=NO_CONTACT){atomicOr(&contactWork[partFlagsBase()+at],1u);}}
  }
  // Owned by the selected coarse representation: its contact list is never read;
- // it selects its clusters for chartEmitAt (perf-impl-119).
+
  if(voxelEdgeCoarse(id)){chartSelect(id);return;}
  let key=posedEdgePorts(id);if(key.x==key.y){return;}let slots=contactSlots();let hash=contactHash(key.x^contactHash(key.y));
  for(var probe=0u;probe<slots;probe++){
@@ -909,7 +909,7 @@ fn emitLevel(a:vec3f,b:vec3f,t:Triangle,kind:u32,address:u32,ports:vec4u,coordin
  if(abs(center.w)>.000001){detail.z=center.x/center.w;detail.w=center.y/center.w;tag=tag|0x40000000u;}
  var chart=vec4f(0.0,0.0,f32(t.material),0.0);if(t.charted){chart=vec4f(triangleChart(t,a),triangleChart(t,b),f32(t.material),1.0);}
  chart.w+=select(0.0,2.0,partFar)+select(0.0,4.0,outline);
- // perf-impl-108: a silhouette or crease end whose canonical vertex port is a
+
  // supplied contact corner of its owner carries that corner (id+1) in chart.w bits 3-12 (end a) and 13-22
  // (end b); the run stage keys that end's line node by the point
  // (gpu-construction-runs key: CONTACT_DOMAIN), so the two owners' edges meet.
@@ -928,7 +928,7 @@ fn emitLevel(a:vec3f,b:vec3f,t:Triangle,kind:u32,address:u32,ports:vec4u,coordin
  // every hidden chunk still cleared its complete hash and launched contact
  // work from registration capacity before the kernels noticed instanceCount0.
  let contactActive=!invalid&&posedContacts()&&native[0]!=0u;
- // perf-impl-110: the clear reaches the voxel cluster columns and the two
+
  // chunk words (columnEnd), the same extent contactClearAt clears and the host
  // allocates (contactWords); short of it, column claims, tops/floors and the
  // chunk level vote would persist into the next frame.
@@ -953,9 +953,9 @@ fn boundaryAt(id:u32){
  let principal=principalLevel(edgeOwner(halfedge(e.x).x,instance));
  if(principal){principalChainAt(id%sourceEdgeCount(),instance);}
  if(!edgeInDraw(id%sourceEdgeCount())){return;}
- // perf-impl-110/113: a voxel chunk at a cluster level is drawn by its column
+
  // representation; this fine edge is then owned by it (not expanded), BEFORE
- // any posed contact lookup (its incidence was never built, perf-impl-113).
+
  if(posedContacts()){let inc=sourceEdgeCorner(halfedge(e.x).z,0u);if(inDraw(inc)&&validFace(inc)&&voxelColumnEdge(id%sourceEdgeCount(),triangle(inc,0u),inc/3u)){return;}}
  let contact=posedEdgeSlot(id%sourceEdgeCount());var canonical=canonicalEdge(id%sourceEdgeCount(),instance);
  if(contact!=NO_CONTACT){canonical=edge(atomicLoad(&contactWork[contactSlots()+contact])-1u).x;}
@@ -1088,14 +1088,14 @@ fn contourAt(id:u32){
  }
  if(count==2u){emit(points[0],points[1],t,1u,face,vec4u(ports[0],ports[1],face,face|bends(face,instance)),vec4f(parameters[0],parameters[1],0,0),false);}
 }
-// REPRESENTATION FRONTIER, stage 1 (perf-impl-92, 2026-11-17). An ENTITY
+
 // instance of a source that draws this frame's field, owning no texel of
 // that field, is not seen at this camera: its boundaries, creases and
 // contours are not produced (they could only reach the page through the
 // one-texel depth halo). Selected here, before any relation exists, from
 // the same frame's form table. Producer rows (one draw, many owners) and
 // sources the field does not attribute (flag bit 4 unset) keep everything.
-// THE EDGE'S OWN OWNER (perf-impl-95). An entity instance owns all its
+
 // vertices; a GPU producer row (voxel, batched static rows: entity word
 // 0xffffffff) owns the vertices its row wrote. Gates read the owner of the
 // edge or face they produce, never the draw's first vertex.
@@ -1107,12 +1107,12 @@ fn ownerUnseen(v:u32,instance:u32)->bool{
  if((params.owners[1].z&17u)!=17u||native[0]==0u){return false;}
  return !formExtent(edgeOwner(v,instance)).found;
 }
-// FAR AGGREGATE MEMBER (perf-impl-96). A GPU producer row (one draw, many
+
 // owners: voxel detail props, batched static rows) whose own visible form fits
 // one native cell with the hold (farAggregateMember, gpu-source-far-forms.ts)
 // produces no boundary, crease or occluding contour (boundaryAt, contourAt).
 // The interior stages (suggestive, ridge, view-face lines) are NOT gated here:
-// their bind groups do not bind the form table (perf-impl-96 first install
+
 // failed validation when emit() read it). It is a
 // member of the producer far aggregate, which the far aggregate emitter draws
 // once from the same field (its units on the merged far skyline where the
@@ -1132,7 +1132,7 @@ fn instanceUnseen(instance:u32)->bool{
  if(entity==0xffffffffu){return false;}
  return !formExtent(vec2u(params.domain,entity)).found;
 }
-// COMPILED CONSTRUCTION LEVELS (representation frontier stage 2, perf-impl-93,
+
 // 2026-11-17). A facet crease (its compiled level code, sourceEdgeLevel, is not
 // 0) of a VISIBLE instance whose form is 中景 or 遠景 is produced only when its
 // compiled feature chain could reach the tier's least run (TIER_SELECTION
@@ -1197,12 +1197,12 @@ fn levelRows(owner:vec2u)->f32{
  if(!form.found||formCut(form.box,extent)||formSpansDepth(form.near,form.far,extent,detailWorldFromClip)){return -1.0;}
  return (form.bottom-form.top)/bitcast<f32>(params.owners[1].y);
 }
-// THE ONE HELD LEVEL (perf-impl-107 reader hookup; writer: form-depths.ts
-// resolveLod, Codex): 0 near/full, 1 principal, 2 connected outline, held per
+
+
 // form and camera with separate entry/leave bands, read from the SAME form
 // texture (no new binding). The header texel's w word says the writer
 // published held levels this frame; without it every reader keeps the
-// perf-106 plain rule (rows against the lower hold edge), unchanged.
+
 fn formLodActive()->bool{return textureLoad(formDepths,vec2i(0,${FORM_DEPTH_HEADER_ROW}),0).w!=0u;}
 fn formLevel(owner:vec2u)->u32{
  let rows=levelRows(owner);if(rows<0.0){return 0u;}
@@ -1210,7 +1210,7 @@ fn formLevel(owner:vec2u)->u32{
  return select(select(1u,2u,rows<${FAR_STRIP_BELOW_ROWS*LOD_TIER_HOLD}),0u,!(rows<${NEAR_FROM_ROWS*LOD_TIER_HOLD}));
 }
 fn farStripForm(owner:vec2u)->bool{return formLevel(owner)==2u;}
-// L1, THE PRINCIPAL CONSTRUCTION (compilePrincipalChains, perf-impl-106): a
+
 // 中景 owner (under NEAR_FROM_ROWS with the hold, the levelDrops boundary)
 // draws each compiled straight principal chain as ONE crease edge between its
 // end anchors, instead of the chain's member creases (EDGE_LEVEL_CHAINED).
@@ -1231,7 +1231,7 @@ fn principalChainAt(k:u32,instance:u32){
  if(dot(t0.face,t0.face)<0.1||dot(t1.face,t1.face)<0.1||!front(t0)||!front(t1)||dot(t0.face,t1.face)>=0.70710678){return;}
  emit(position(c[0],instance),position(c[1],instance),t0,2u,c[4],vec4u(boundaryPort(c[0],instance),boundaryPort(c[1],instance),c[2],c[3]),vec4f(0),false);
 }
-// L2, THE CONNECTED OUTLINE (structural ladder, perf-impl-106). An owner at the
+
 // far-strip level (farStripForm) but still a unit or more (smaller ones are far
 // aggregate members, selected before this pass) is drawn as ONE connected
 // outline (D9): only its silhouette edges are produced, tagged (chart flag
@@ -1378,7 +1378,7 @@ fn suggestiveAt(id:u32){
  if(abs(ndv)<=1e-6||dot(gradient,w)*select(-1.0,1.0,ndv>=0.0)<=0.0){return;}
  emit(points[0],points[1],tri,3u,face,vec4u(ports[0],ports[1],face,face|bends(face,instance)),vec4f(parameters[0],parameters[1],0,0),false);
 }
-// RIDGES AND VALLEYS (operator order 2026-11-11, GOAL-EXECUTOR ledger: interior
+
 // lines joined into whole curves on the mesh before selection; the Studio
 // export's per-vertex curv/pdir1 is the input). The posed tensor above gives,
 // per source vertex, the principal curvatures k1 (largest magnitude) and k2
@@ -1489,7 +1489,7 @@ fn ridgeLineAt(id:u32){
  // The address keeps a ridge apart from a suggestive contour of the same face.
  emit(points[0],points[1],tri,3u,face|0x40000000u,vec4u(ports[0],ports[1],face,face|bends(face,instance)),vec4f(parameters[0],parameters[1],0,0),false);
 }
-// FUSED SOURCE STAGES (perf-impl-76, frame cost 2026-11-17). On the M3 Pro a
+
 // relation dispatch costs ~15 us of fixed time and the stages of ~137 in-view
 // sources ran as ~815 serial dispatches (14 ms of a 30 ms job). Stages of ONE
 // source that read nothing another of them writes share one dispatch: each
@@ -1507,7 +1507,7 @@ fn ridgeLineAt(id:u32){
  let id=gid.x+gid.y*params.owners[0].z*64u;suggestiveAt(id);ridgeLineAt(id);
 }
 `;
-// ONE DISPATCH PER STAGE OVER EVERY SOURCE (perf-impl-79, frame cost
+
 // 2026-11-17). The ~541 per-source dispatches of a Y8 view (~17 us each) become
 // one dispatch per stage per group of sources that share storage pages. The
 // stage bodies are the SAME functions as the per-source entries above; only
@@ -1644,21 +1644,21 @@ function planarRest(geometry:{readonly positions:Float32Array;readonly indices:U
   }
   planarRestCache.set(geometry,planar);return planar;
 }
-/** perf-impl-114: one chunk's persistent occupancy home (word offset in contactWork). */
-/** perf-impl-116: a closed-cell source's CELL CHART sizes (dense tables over its cell extent), or undefined when
- * they would exceed CHART_CELLS (that source keeps its fine producer). cells: per-cell face centroids (19 words);
- * corners: lattice points (4 words); clusters: at block 2, the largest table any block needs (4 words). */
+
+
+
+
 export const CHART_CELLS=32768;
-/** perf-impl-140: words per part anchor record [owner.x, owner.y, part ordinal (0 = none), link (0x80000000|next record+1), min.x, min.y, max.x, max.y]. */
+
 export const PART_ANCHOR_RECORD_WORDS=8;
-/** perf-impl-140 descriptor: the owner-keyed NDC extent table of source-declared part anchors. Word 0 = head slot
- * count, word 1 = record word base; head h (at headBase+h) holds record+1 of a bucket list (0 = empty). Key =
- * (domain|producer, native owner, part ordinal = packet program index + 1): a run's (identity.y, identity.z) and its
- * program ordinal. Bucket = 2 + (hash & (headSlots-1)) with the WGSL partAnchorBucket hash. Valid for the frame
- * after SurfaceRelations' dispatches; readers walk the list and compare the full key. */
+
+
+
+
+
 export interface SourcePartAnchorTable {readonly buffer:GPUBuffer;readonly headSlots:number;readonly headBase:number;readonly recordBase:number;readonly recordWords:number}
 const samePartAnchorVertices=(a:Uint32Array|undefined,b:Uint32Array|undefined):boolean=>a===b||(!!a&&!!b&&a.length===b.length&&a.every((value,index)=>value===b[index]));
-/** perf-impl-118: a surface source's rest-cell chart, only for the topology generation it names (stale: absent). */
+
 export function currentRestCellChart(indexed:{readonly generation:number;readonly restCellChart?:GpuIndexedRestCellChart}|undefined):GpuIndexedRestCellChart|undefined{
   const chart=indexed?.restCellChart;return chart&&chart.kind==='voxel-rest-cell-chart'&&chart.sourceGeneration===indexed!.generation?chart:undefined;
 }
@@ -1692,11 +1692,11 @@ export function posedContentToken(batch:{readonly source:{readonly posedRevision
   if(content===undefined||!Number.isSafeInteger(content)||content<0||content>POSED_CONTENT_MAX)return 1;
   return content+2;
 }
-/** perf-impl-115: the key under which a source's view-independent shape tensors (faceDifferentials,
- * principalCurvature, ridgeDerivative) may be REUSED, or undefined when they can never be. A GPU-indexed pose's
- * posedRevision is a per-capture serial (geometry.ts), so only the producer's exact posed CONTENT token
- * (posedContentToken > 1) can repeat; without it the tensor refreshes every frame and is computed only for
- * instances that consume it this frame. Every other source keeps its posedRevision (unchanged). */
+
+
+
+
+
 export function tensorRevision(batch:{readonly source:{readonly posedRevision?:number};readonly gpuPose?:{readonly posedContentRevision?:number}}):number|undefined{
   if(batch.source.posedRevision===undefined)return undefined;
   if(!batch.gpuPose)return batch.source.posedRevision;
@@ -1729,9 +1729,9 @@ export class SurfaceRelations {
   private retired:GPUBuffer[]=[];
   private differentials?:GPUBuffer;
   private contactWork?:GPUBuffer;
-  /** perf-impl-114: persistent occupancy homes in contactWork, after homeScratch words. */
-  /** perf-impl-137/140: lazily registered source-declared part anchors per material batch (posedBatchIdentity),
-   * retained while the residency source and its vertex array are unchanged, and the ONE owner-keyed extent table. */
+
+
+
   private readonly partAnchorSources=new Map<unknown,{source:unknown;vertices:Uint32Array;input:GPUBuffer;base:number;parts:number;instances:number}>();
   private partAnchorBuffer?:GPUBuffer;private partAnchorHeadSlots=0;private partAnchorRecords=0;private partAnchorRecordCapacity=0;
   private partAnchorFrameCleared=false;private partAnchorGrowTo=0;
@@ -1744,13 +1744,13 @@ export class SurfaceRelations {
     const vertices=(source as {partAnchorVertices?:Uint32Array}).partAnchorVertices;const key=posedBatchIdentity(batch);
     const instances=Math.max(1,batch.source.instanceCapacity??1);
     const held=this.partAnchorSources.get(key);
-    // perf-impl-142: physical wrapper sources change with pose; retain by anchor CONTENTS + instance capacity.
+
     if(held&&samePartAnchorVertices(held.vertices,vertices)&&held.instances===instances){held.source=source;this.expiry.use(held);return held;}
     if(held){this.partAnchorSources.delete(key);this.retired.push(held.input);}
     if(!vertices||vertices.length<6||vertices.length%6!==0)return undefined;
     const parts=vertices.length/6;
     if(this.partAnchorRecords+parts*instances>this.partAnchorRecordCapacity){
-      // perf-impl-142: never grow mid-frame (earlier sources' records and queued references stay valid);
+
       // the first table has no references yet. Otherwise skip this source until the frame boundary.
       if(this.partAnchorBuffer){this.partAnchorGrowTo=Math.max(this.partAnchorGrowTo,this.livePartAnchorRecords()+parts*instances);return undefined;}
       this.growPartAnchorTable(parts*instances);
@@ -1764,9 +1764,9 @@ export class SurfaceRelations {
     return entry;
   }
   /** A larger table restarts every registration (records are re-allocated lazily by later draws). */
-  /** perf-impl-144: pre-reserve the part anchor table for every batch a frame will draw, BEFORE its first draw.
-   * Grows immediately when nothing this frame references the table yet (no anchor dispatch encoded or queued);
-   * otherwise the growth waits for the frame boundary, so earlier sources and queued references stay valid. */
+
+
+
   reservePartAnchors(batches:Iterable<{readonly batch:PosedSourceBatch;readonly source:ResidentRelationSource}>):void{
     let additional=0,replaced=0;const seen=new Set<object>();
     for(const {batch,source}of batches){
@@ -1803,9 +1803,9 @@ export class SurfaceRelations {
   private detailPage?:readonly [number,number];
   private emptyDetail?:GPUTexture;
   private emptyDetailView?:GPUTextureView;
-  /** perf-impl-92: source domains whose material draws own texels of the
-   * current field (set by the caller after begin; cleared by begin). Only
-   * their entity instances may be found unseen in the form table. */
+
+
+
   fieldDomains?:ReadonlySet<number>;
   /** The form table the line stages read (binding 10); a stable empty
    * view when this frame has none (flag bit 0 unset, never read). */
@@ -1841,7 +1841,7 @@ export class SurfaceRelations {
     encoder.clearBuffer(this.status);this.contactsActive=!!view&&!!field;
     this.detailField=field;this.detailPage=view?.pageExtent;this.fieldDomains=undefined;
     if(view&&field)(this.intersections??=new SurfaceIntersections(this.device)).begin(encoder,view,field,this.status,contactScale);
-    // perf-impl-79: host-sized physical sources appended after this are queued
+
     // and dispatched together in finish(), before the contact-triangle finish.
     this.queue=this.interior?{items:[],clears:[],seen:new Set(),contactWords:0,dispatchItems:0}:undefined;
   }
@@ -1853,7 +1853,7 @@ export class SurfaceRelations {
     if(this.contactsActive)this.intersections!.append(encoder,batch,source,domain);
   }
   /** Every source's contact passes as two passes (surface-intersections appendAll). */
-  /** perf-impl-95: the contact producer reads the same field attribution. */
+
   appendContactsAll(encoder:GPUCommandEncoder,items:readonly {batch:PosedSourceBatch;source:ResidentRelationSource;domain:number;extent?:SourceDrawExtent}[]):void{
     if(this.contactsActive){this.intersections!.fieldDomains=this.fieldDomains;this.intersections!.page=this.detailPage;this.intersections!.appendAll(encoder,items);}
   }
@@ -1878,7 +1878,7 @@ export class SurfaceRelations {
     // ~4300 bind groups and ~1900 buffers per Y8 text frame, each validated in
     // the GPU process, which held a frame ~130 ms from submit to completion
     // while the GPU itself was busy 29% of the time.
-    // ONE DISPATCH PER STAGE (perf-impl-79): a host-sized physical source with
+
     // GPU instance visibility and a retained posed tensor is queued; finish()
     // dispatches every queued source's stage at once. A second use of the same
     // batch in one frame keeps the per-source path (its tensor would be shared).
@@ -1906,7 +1906,7 @@ export class SurfaceRelations {
     const contactEdges=posedContacts?sourceResidencyEdgeCount(source):0;
     const parts=posedContacts&&earlyDetail?indexed?.parts:undefined;
     let contactSlots=0,contactWords=1;
-    // perf-impl-116/118: the cell chart of a closed-cell source (parts) or of a surface-only source (the producer's
+
     // rest-cell chart of THIS generation), when its dense tables are bounded. Never both: parts win.
     const surfaceChart=posedContacts&&earlyDetail&&!parts?currentRestCellChart(indexed):undefined;
     const chart=posedContacts?(parts?cellChart(parts.extent):surfaceChart?cellChart(surfaceChart.extent):undefined):undefined;
@@ -1914,19 +1914,19 @@ export class SurfaceRelations {
     new Uint32Array(floats.buffer)[31]=chartToken(batch,source,!!chart);
     if(posedContacts){
       contactSlots=2**Math.ceil(Math.log2(Math.max(2,contactEdges*2,sourceResidencyFaceCount(source)*4)));
-      // + contactSlots: the voxel cluster claim words (clusterBase, perf-impl-106).
-      // perf-impl-110: + the voxel cluster columns (columnSlots x 8) and the seven chunk words (WGSL columnEnd).
+
+
       contactWords=(parts?contactSlots*7+contactEdges*2:contactSlots*3+contactEdges)+contactSlots+4+(chart?chart.cells*19+chart.corners*4+4+chart.clusters*4+sourceResidencyFaceCount(source)*2:4);
       const words=new Uint32Array(floats.buffer);words[41]=contactSlots;words[45]=1;
       if(parts){const [x,y,z]=parts.extent;words[45]=3|(chart?4:0)|((x-1)<<8)|((y-1)<<16)|((z-1)<<24);}
       // Surface: the chart (4) with explicit surface semantics (8); NEVER the closed-cell part bit (2).
       else if(chart&&surfaceChart){const [x,y,z]=surfaceChart.extent;words[45]=1|4|8|((x-1)<<8)|((y-1)<<16)|((z-1)<<24);}
-      // perf-impl-121: the producer certified its mesher quad corner order (surface and closed charts).
+
       if(chart&&currentRestCellChart(indexed)?.cornerOrder===VOXEL_REST_CORNER_ORDER)words[45]|=16;
     }
     if(batched){this.queueBatched(batch,source,new Uint32Array(floats.buffer),extent!,{posedContacts,contactWords,contactEdges,parts,chartCodes,chartClusters:chart?.clusters??0,earlyDetail,terrain,selection:selection!});return;}
     const held=entry!,params=held.params;
-    // perf-impl-114 OCCUPANCY HOMES. The buffer is [scratch (homeScratch words,
+
     // grow-only) | homes]. A source whose producer certifies its posed content
     // (posedContentToken > 1) gets a home sized from its column extent: the
     // closed-cell extent at the coarsest-but-one block (2), or one column per
@@ -1962,7 +1962,7 @@ export class SurfaceRelations {
     const used:Record<string,number[]>={prepare:[0,1,4,6,7],partAnchorClear:[0,17],partAnchors:[0,2,3,4,8,16,17],partAnchorInsert:[0,4,16,17],contactClear:[0,1,4,12],voxelVote:[0,1,2,4,12,13],voxelHome:[0,1,4,12],voxelBin:[0,1,2,4,12,13],chartCorners:[0,1,2,4,12,13],chartCertify:[0,1,4,12],contactVertices:[0,1,2,4,12],contactEdges:[0,1,2,4,12,13,14],boundaries:[0,1,2,3,4,5,6,8,10,11,12,15],contours:[0,1,2,3,4,5,6,8,10,11,15]};
     (buffers as RelationBinding[])[10]={view:this.lineDetailView(earlyDetail)};
     (buffers as RelationBinding[])[15]={view:this.contactPatchView()};
-    // perf-impl-93: the line stages read the same-pose form matrix (levelDrops).
+
     (buffers as RelationBinding[])[11]=earlyDetail?formDepths(this.device).matrix(field!):params;
     // ONE PASS PER SOURCE (frame cost, 2026-11-10): the seven stages of one
     // source are dispatches of one compute pass, in the same order. WebGPU
@@ -2000,7 +2000,7 @@ export class SurfaceRelations {
       direct('contactVertices',faces*2,held.groups,used.contactVertices!,buffers);
       direct('contactEdges',contactEdges,held.groups,used.contactEdges!,buffers);
     }
-    // perf-impl-140: project this source's declared part anchors, then insert them (separate dispatches).
+
     const anchors=this.partAnchorsFor(batch,source);
     if(anchors&&this.partAnchorBuffer){
       (buffers as RelationBinding[])[16]=anchors.input;(buffers as RelationBinding[])[17]=this.partAnchorBuffer;
@@ -2008,7 +2008,7 @@ export class SurfaceRelations {
       direct('partAnchors',anchors.parts*anchors.instances,held.groups,used.partAnchors!,buffers);
       direct('partAnchorInsert',anchors.parts*anchors.instances,held.groups,used.partAnchorInsert!,buffers);
     }
-    // FUSED SOURCE STAGES (perf-impl-76): with a host-sized extent, boundaries
+
     // and contours are ONE dispatch (WGSL surfaceLines: the same per-id bodies
     // over one id range, edges x instances then faces x instances).
     if(host){const instances=frontier?.indices.length??host.instances;direct('surfaceLines',(edges+faces)*instances,held.groups,used.boundaries!,buffers);}
@@ -2089,7 +2089,7 @@ export class SurfaceRelations {
     }
     end();
   }
-  // ---- ONE DISPATCH PER STAGE OVER EVERY SOURCE (perf-impl-79) ----
+
   private queue?:BatchQueue;
   /** Retained posed tensors of queued sources live in shared pages, so one
    * dispatch can address every source's tensor at its own base. */
@@ -2123,7 +2123,7 @@ export class SurfaceRelations {
     const push=(stage:BatchStage,threads:number,itemWords:Uint32Array,base2:readonly number[],itemBound:RelationBinding[])=>{if(threads>0)q.items.push({stage,threads,words:itemWords,base,base2,bound:itemBound});};
     const vertexCount=sourceResidencyVertexCount(source),faces=sourceResidencyFaceCount(source),edges=sourceResidencyEdgeCount(source);
     const lineBase2=[contactBase,0,0,0];
-    // perf-impl-140: Y8's batched sources project and insert their declared part anchors too.
+
     const anchorEntry=this.partAnchorsFor(batch,source);
     if(anchorEntry&&this.partAnchorBuffer){const anchorBound=[...bound];anchorBound[16]=anchorEntry.input;anchorBound[17]=this.partAnchorBuffer;push('partAnchors',anchorEntry.parts*anchorEntry.instances,words,lineBase2,anchorBound);push('partAnchorInsert',anchorEntry.parts*anchorEntry.instances,words,lineBase2,anchorBound);}
     if(posedContacts){push('contactClear',contactWords,words,lineBase2,bound);push('voxelVote',faces*2,words,lineBase2,bound);push('voxelBin',contactEdges,words,lineBase2,bound);push('chartCorners',faces*2,words,lineBase2,bound);push('chartCertify',chartClusters,words,lineBase2,bound);push('contactVertices',faces*2,words,lineBase2,bound);push('contactEdges',contactEdges,words,lineBase2,bound);}
@@ -2178,7 +2178,7 @@ export class SurfaceRelations {
     const dispatchBytes=Math.max(1,q.dispatchItems)*BATCH_DISPATCH_WORDS*4;
     if(!this.batchDispatch||this.batchDispatch.size<dispatchBytes){if(this.batchDispatch)this.retired.push(this.batchDispatch);this.batchDispatch=this.device.createBuffer({label:'MAIN batched source dispatch words',size:dispatchBytes*2,usage:GPUBufferUsage.STORAGE});}
     for(const clear of q.clears)encoder.clearBuffer(clear.buffer,clear.offset,clear.size);
-    // perf-impl-140: stale invalidation before the first anchor insertion of the frame (heads + link words; the
+
     // header [head slots, record base] survives).
     if(!this.partAnchorFrameCleared&&this.partAnchorBuffer&&q.items.some(item=>item.stage==='partAnchorInsert')){encoder.clearBuffer(this.partAnchorBuffer,8);this.partAnchorFrameCleared=true;}
     const limit=this.device.limits.maxComputeWorkgroupsPerDimension;
@@ -2227,7 +2227,7 @@ export class SurfaceRelations {
   }
   private oneFrame:RetainedBindings[]=[];
   /** A bind group is reused while every buffer it names is the same object. */
-  // perf-impl-108 CONTACT PATCHES: the host's explicit two-owner solver incidence
+
   // (contactPatchRows). Rewritten only when `revision` changes; an empty table
   // (count 0) keeps every edge end on its own node (the incumbent).
   private contactPatchTexture?:GPUTexture;private contactPatchRevision=-1;private retiredContactPatches?:GPUTexture;

@@ -9,5 +9,5 @@ import {gameplay} from 'virtual:shallot-example-gameplay';
 // remain byte-identical; applications can install mainRenderer() directly.
 const renderer=mainRenderer({ascii:new URL(location.href).searchParams.get('ascii')!=='0'});
 setDefaultPlugins([...DEFAULT_PLUGINS,renderer,OrbitMobileControlsPlugin,...gameplay]);
-// An open scene follows the working tree (operator order 2026-11-08).
+
 followWorkingTree();

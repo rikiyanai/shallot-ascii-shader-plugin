@@ -4,7 +4,7 @@ export const ROW_PITCH = 17 as const;
 export const FONT_PX = 16 as const;
 export const FULL_SPACE = 0x3000 as const;
 export const HALF_SPACE = 0x20 as const;
-/** Operator-selectable placement; scene, structure and vocabulary stay shared. */
+
 export type PresentationMode = 'text' | 'floating';
 
 /** Character flag 16: a glyph the composition visibility decision occluded
@@ -73,7 +73,7 @@ export interface TextFrame {
   /** Explicit replay contract. Preformatted text preserves ordinary spaces;
    * absence retains the existing constrained whitespace behavior. */
   whitespace?:NativeWhitespacePolicy;
-  /** Explicit operator-approved glyph extension; never attributed to Saitamaar. */
+
   font_extensions?: readonly TextFontExtension[];
   /** Current legal candidate page. In positioned_runs this is NOT the final
    * drawing: consumers must use compositionCharacters/displayCharacters. */
@@ -93,12 +93,12 @@ export interface TextFrame {
   export?: { dropped_frames: number; source_revision: string;
     /** Display verdicts of the frame's records (realize-gpu.ts): shown, hidden by the scene, provisional glyphs blocked by laid-out ink. */
     display_verdicts?: { shown: number; scene_hidden: number; provisional_blocked: number; crossing_break?: number } };
-  /** Display honesty. Governing rule: operator goal V4 (~/Desktop/goals/
-   * goal-v4.txt, rulings 2026-10-02 and 2026-10-04): in motion, intact runs
-   * translate continuously in both axes with their features; no glyph moves
-   * apart from its run; no fragments or overlaps; stationary compositions
-   * (or selected keyframes) are exact text. Retained compositions preserve
-   * their native drawing and declare the shared translation explicitly. */
+
+
+
+
+
+
   presentation?: { kind: 'exact_text' | 'positioned_runs' | 'floating' };
 }
 

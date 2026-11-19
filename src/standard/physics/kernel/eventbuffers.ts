@@ -17,7 +17,7 @@ export function eventCount(world: WorldState, kind: number): number {
     return kernel(world.ecsState).eventCount(world.worldId, kind) >>> 0;
 }
 
-/** A fresh public id from a resident event, including its capture-time world and generation. */
+
 export function eventId(world: WorldState, kind: number, index: number, lane: number): EntityId {
     const k = kernel(world.ecsState);
     const packed = k.eventWord(world.worldId, kind, index, lane + 1);

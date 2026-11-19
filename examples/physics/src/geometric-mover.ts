@@ -44,7 +44,7 @@ import {
 import { readPlayerControls } from "./player-controls";
 import type { Controls } from "./scenes";
 import stairsData from "./stairs.json" with { type: "json" };
-import testMap from "./test_map01.json" with { type: "json" };
+import testMap from "./physics-map01.json" with { type: "json" };
 
 const f = Math.fround;
 const TREE_SPAWN: [number, number, number] = [22, 1.5, 2];

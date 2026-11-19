@@ -90,10 +90,10 @@ fn currentPartPacket()->bool{
  if(id<arrayLength(&indexed)){store(p.core.y+id,indexed[id]);}
  if(id<p.dims.y){let klass=(semantic[semantic[12u]+id/16u]>>((id%16u)*2u))&3u;atomicStore(&program[TOPOLOGY_HEADER+id],klass);}
  if(id<semantic[15u]){atomicStore(&program[TOPOLOGY_HEADER+p.dims.y+id],semantic[semantic[14u]+id]);}
- // perf-impl-109: the compiled limb-vertex table (residual words 31/32), after
+
  // the vertex contexts, named by the run-slot limb magic (header words 8-10).
  if(id<semantic[32u]){atomicStore(&program[TOPOLOGY_HEADER+p.dims.y+semantic[15u]+id],semantic[semantic[31u]+id]);}
- // perf-impl-110: source-owned whole-part descriptors follow the existing
+
  // limb table. They are consumed by construction-runs through the same
  // resident program slot; visibility never changes these records.
  // Copy the opaque declared payload in parallel. Validate its VERSION only

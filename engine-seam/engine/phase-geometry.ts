@@ -23,8 +23,8 @@ export interface PhaseGeometryDraw {
 /** Opt-in observation of actual native draws. Recording never reissues a draw,
  * changes its state, or guesses an emitter from an example or resource name. */
 export const PhaseGeometryCapture={create:()=>({enabled:false,includeStandard:false,views:new WeakMap<View,PhaseGeometryDraw[]>(),
-  /** A primary producer replaces beauty, not simulation or phase preparation.
-   * Its completion runs once after capture and before any postFX. */
+
+
   isPrimary:undefined as undefined|(()=>boolean),
   primary:undefined as undefined|((world:World,view:View,eid:number)=>(()=>void)|undefined)})};
 

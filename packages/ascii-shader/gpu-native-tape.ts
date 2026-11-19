@@ -100,10 +100,10 @@ export function validateGpuNativeTape(tape: GpuNativeTape): void {
   }
 }
 
-/** Explicit export path for a displayed GPU tape.  It is created only when
- * the operator asks for text; display never maps the tape.  The full payload
- * copy is acceptable here because export is an explicit, non-frame operation
- * and the count is used to decode only the committed prefix. */
+
+
+
+
 export class GpuNativeTapeReadback {
   private readonly countRead: GPUBuffer;
   private readonly wordsRead: GPUBuffer;

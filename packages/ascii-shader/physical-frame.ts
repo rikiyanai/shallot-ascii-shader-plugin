@@ -64,7 +64,7 @@ export interface PhysicalTextFrame extends PresentedNativeFrame {
  readonly construction:{readonly sourceLines:number;readonly omitted:readonly string[];readonly pending?:readonly string[];readonly metrics:ConstructionMetrics};
 }
 interface Targets {width:number;height:number;field:GPUTexture[];depth:GPUTexture;comparison?:GPUTexture;underdrawing:GPUTexture;inspection?:GPUTexture}
-// THE FIELD IS SIZED BY THE GLYPH GRID (operator, 2026-11-12: "ISNT THE GLYPH
+
 // MATRIX RESOLUTION THE RESOLUTION?"). Every field consumer reads it through
 // the field extent (tone toField, articulation fieldPoint, visibility and the
 // form table by their texture size): one sample per CELL_STEP page pixels
@@ -210,7 +210,7 @@ export class PhysicalFrame {
   this.held=[light[0],light[1],light[2]];return this.held;
  }
  // TWO TEXT JOBS IN FLIGHT (speed, 2026-11-17; ownership table in
- // evidence/ascii-authoring/README.md "Speed lane — two text jobs in flight").
+
  // Job N+1 is encoded and submitted while job N's GPU work or header map is
  // still pending. Publication stays after the header seal and in serial order
  // (drain): a later serial is never displayed before an earlier one, and a
@@ -482,9 +482,9 @@ export class PhysicalFrame {
    return job.lod?.full?.has(source.domain)?[base,far]:[far];
   });
  }
-  /** The producer far aggregate (perf-impl-96 emitter): the far producer rows the
-   * relation stage gated this frame are drawn ONCE from the field (plugin.ts does
-   * the same for the examples). Perspective views only, as there. */
+
+
+
   private pushFarAggregate(classes:unknown[],job:Job):void{
    const perspective=job.sourceView.perspective,lod=job.lod;if(!perspective||!job.sources.length||!lod)return;
    const farDomains=[...lod.far.keys()].filter(domain=>job.sources.some(source=>source.domain===domain));
@@ -507,7 +507,7 @@ export class PhysicalFrame {
   }
  private encodeRelations(encoder:GPUCommandEncoder,job:Job):void{
   this.relations.begin(encoder,job.sourceView,job.sourceField,2);
-  // STRUCTURAL LOD on Y8 (perf-impl-97): the physical sources are the field's
+
   // sources, so the owner gates (no-texel owner, far producer row) run here too.
   this.relations.fieldDomains=new Set(job.sources.map(source=>source.domain));
   this.relations.retainPosedBatches(new Set(job.sources.map(source=>posedBatchIdentity(source.batch))));
@@ -586,7 +586,7 @@ export class PhysicalFrame {
   this.inflight.push(job);this.started=this.startKey(input,this.holdLight(input.light),job.pending);this.lastStartedJob=job;
   return job;
  }
- // PENDING SOURCES DO NOT HOLD PUBLICATION (speed, 2026-11-17; perf-impl-68).
+
  // A new job used to start only after every in-view source had compiled. A
  // camera turn at 0.8 rad/s brings uncompiled sources 60-320 units away into
  // view faster than the worker installs them (~25/s), so on Y8 no job started
@@ -681,7 +681,7 @@ export class PhysicalFrame {
   // awaits a source retry. Label-only jobs read the kept job's shared
   // visibility buffers, so they start only with nothing in flight; the legacy
   // CPU producer keeps one job at a time (its relation readbacks are shared).
-  // ONE JOB PER HOST ENCODER (tape lifetime, perf-impl-80): a source retry
+
   // re-encoded above already holds this encoder. GpuArticulation links every
   // same-camera job of one encoder into one cohort, and a member's overflow or
   // failure releases every resident of that cohort, so a new job here destroyed

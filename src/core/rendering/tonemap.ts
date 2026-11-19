@@ -26,8 +26,8 @@ export const tmLuma = tgpu.fn(
     return std.dot(v, d.vec3f(0.2126, 0.7152, 0.0722));
 });
 
-/** Khronos PBR Neutral (three.js `NeutralToneMapping` / modelviewer.dev) — preserves authored color,
- *  desaturating only past the compression knee. The default operator. */
+
+
 export const tmNeutral = tgpu.fn(
     [d.vec3f],
     d.vec3f,

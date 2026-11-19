@@ -4,60 +4,60 @@ import type {SurfaceField} from './surface-fields.ts';
 import {FORM_LOD_STATE_WORDS,conservativeFormLodScope,formLodScopeKey,validateFormLodScope} from './form-lod-state.ts';
 import type {FormLodScope} from './form-lod-state.ts';
 
-/** THE ONE PER-FORM TABLE of a field (a form = one source owner, the owner
- * field's id pair without the UV bit), the input of the distance tier
- * (gpu-articulation.ts "THE TIER IS THE ROWS THE DRAWING HAS").
- *
- * Owner: the surface-field stage, because the table is a reduction of the
- * field's own owner and depth channels and must live exactly as long as they
- * do: a retained same-pose field keeps its table, a cleared field gets a new
- * one. FormDepths.encode runs ONCE per field, right after the field's last
- * draw and before the relation, underdrawing, tone and articulation passes.
- * Every reader binds view(field) as a texture (read-only by construction) and
- * reads it through formExtent and formReference (FORM_DEPTH_WGSL); the
- * distance tier is distanceTierOf (gpu-articulation.ts DISTANCE_TIER_WGSL)
- * for every reader.
- *
- * Per owner, from ONE pass over its visible field pixels (reduce): its
- * nearest and farthest visible depth, its top and bottom field row (the page
- * rows it occupies), its page columns and the world box of its visible
- * surface. A compact form is an owner that does not span depth
- * (formSpansDepth) and is not cut by an edge of the field (formCut); its
- * level is its page rows. No scene reference length is derived (the
- * reference length L and its vote were deleted 2026-11-10 on operator
- * order: a world line across the ground was a guess).
- *
- * Layout: FORM_DEPTH_SLOTS slots of FORM_SLOT_WORDS u32 (four texels) in an
- * open-addressed hash, as a storage buffer for the one writer and copied to
- * an rgba32uint texture of FORM_DEPTH_COLUMNS columns for the readers (texel
- * t of the buffer is texel (t % columns, t / columns)). Slot = [key.x, key.y,
- * bits of the nearest visible depth, ~bits of the farthest] [~top field row,
- * bottom field row + 1, ~left field column, right field column + 1]
- * [~ordered lowest world x, ordered highest world x, the same for y]
- * [the same for z, 0, held LOD level]: every word but the keys is an atomic max, so a
- * cleared buffer is the empty table. key.x = owner.x & 0xdfffffff with
- * owner.y's top bit in bit 29; key.y = owner.y << 1 | 1, so both words of a
- * used slot are nonzero and the 64-bit owner is compared exactly. Depth is
- * reverse Z and positive: larger is nearer and the bit pattern orders as the
- * value. A slot is found within FORM_DEPTH_PROBES linear probes of the hash.
- * The texture row FORM_DEPTH_HEADER_ROW holds [bits of L, vote weight,
- * open background patches, 0] in its first texel and the vote histogram
- * after it.
- *
- * LIMIT, stated: an owner that finds no slot (more visible owners than the
- * table holds in one probe window) is read like an owner that spans depth:
- * at the point each reader asks about, by L. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const FORM_DEPTH_SLOTS=65536,FORM_DEPTH_COLUMNS=256,FORM_DEPTH_PROBES=32,FORM_SLOT_WORDS=16;
 export const FORM_DEPTH_HEADER_ROW=FORM_DEPTH_SLOTS*FORM_SLOT_WORDS/4/FORM_DEPTH_COLUMNS;
 /** The table's final word is written after reduction, never by pixel reduce. */
 export const FORM_LOD_WORD=15;
 /** Writer-only state; readers still bind only the existing form texture. */
 export const FORM_LOD_STATE_BYTES=FORM_DEPTH_SLOTS*FORM_LOD_STATE_WORDS*4;
-/** Rows a form occupies from which it is 近景 near: the practitioner's smallest
- * scale is the 7-row drawing, which has no tone, no gaps and no interior
- * detail (GOAL-EXECUTOR practitioner rules, "The smallest tier changes
- * vocabulary"); the operator's two near-tree constructions are 8 and 13 rows.
- * The run pass's compiled part size band uses the same 119 px. */
+
+
+
+
+
 export const NEAR_FROM_ROWS=7;
 /** Rows under which a form is 遠景 far, a place on the merged strip: the
  * markup's super-far marks are one to three rows; the strip's compiled words
@@ -334,7 +334,7 @@ fn parentMemberEligible(key:vec2u)->bool{
 }
 // TILE REDUCTION (frame cost, 2026-11-12). One thread per field pixel did a
 // global probe and up to 13 atomic max operations on the one slot every pixel
-// of its owner shares (16.6 ms at 3488x2252, Codex). A 16x16 tile holds a few
+
 // owners: its pixels first raise a slot of a 32-slot table in workgroup memory
 // (same words, same max), then one thread per tile slot raises the global
 // slot once per word. A max of maxima is the max: every owner's words are the

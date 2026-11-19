@@ -57,7 +57,7 @@ export const OrbitMobileInput: import("../../engine").Resource<OrbitMobileInputS
                 mobile.camera === eid &&
                 (mobile.strafe !== 0 || mobile.forward !== 0 || mobile.up !== 0);
             const touchCount = manual ? 0 : input.touch.count;
-            // Touch capture also holds pointer.left; reading mouse buttons here would orbit during pinch/pan.
+
             // A mobile thumb is the one explicit touch equivalent of fly.
             const orbitHeld =
                 !manual && !mobileActive &&

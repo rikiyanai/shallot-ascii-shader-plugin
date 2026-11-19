@@ -246,7 +246,7 @@ interface PhysicsRuntime {
     anyChanged: boolean;
     // only warm sets this to make the next sync walk every Body
     full: boolean;
-    /** The change tick of the last Transform.scale capture. */
+
     scaleRun: number;
     observing: boolean;
     // each hit record's material-id words (A low, A high, B low, B high), so fillHitRecords rebuilds a

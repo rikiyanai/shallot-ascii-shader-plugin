@@ -20,7 +20,7 @@ function opKey(kind: string, components: any[]): string {
     return kind + ":" + ids.sort((a, b) => a - b).join(",");
 }
 
-// Interned operator identity avoids structural hashing on repeated query calls.
+
 function makeOp(kind: "not" | "and" | "or") {
     const cache1 = new WeakMap<object, QueryOp>();
     return (...components: any[]): QueryOp => {

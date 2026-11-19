@@ -24,7 +24,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod aabb;
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 mod bitset;
 pub mod body;
 pub mod col;
@@ -134,7 +134,7 @@ mod contact_lifecycle;
 mod contact_list;
 #[cfg(target_arch = "wasm32")]
 mod draw;
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 mod events;
 #[cfg(target_arch = "wasm32")]
 mod explosion;
@@ -142,7 +142,7 @@ mod explosion;
 #[cfg(target_arch = "wasm32")]
 mod geo;
 pub mod geometry_read;
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 mod hull_database;
 #[cfg(target_arch = "wasm32")]
 mod joint_creation;

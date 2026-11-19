@@ -89,7 +89,7 @@ export const TrailPlugin: Plugin = {
         world.own(s.image);
         world.own(s.previous);
         world.own(s.ground);
-        // The ground under each texel's center; row v runs toward -z, as the capture looks.
+
         const ground = new Float32Array(RESOLUTION * RESOLUTION);
         for (let v = 0; v < RESOLUTION; v++)
             for (let u = 0; u < RESOLUTION; u++)

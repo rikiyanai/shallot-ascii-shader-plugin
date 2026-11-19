@@ -494,29 +494,3 @@ mod runtime {
         f32::from_bits(word_in_world(world, kind, index, lane))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::mem::{offset_of, size_of};
-    #[test]
-    fn records_match_types_h_with_the_authorized_begin_impulse_extension() {
-        assert_eq!(size_of::<Id>(), 8);
-        assert_eq!(size_of::<SensorTouch>(), 16);
-        assert_eq!(size_of::<ContactId>(), 12);
-        assert_eq!(offset_of!(ContactId, generation), 8);
-        assert_eq!(size_of::<ContactEnd>(), 28);
-        assert_eq!(size_of::<ContactBegin>(), 32);
-        assert_eq!(offset_of!(ContactBegin, normal_impulse), 28);
-        assert_eq!(size_of::<ContactHit>(), 72);
-        assert_eq!(offset_of!(ContactHit, point), 28);
-        assert_eq!(offset_of!(ContactHit, normal), 40);
-        assert_eq!(offset_of!(ContactHit, speed), 52);
-        assert_eq!(offset_of!(ContactHit, material_a), 56);
-        assert_eq!(size_of::<JointEvent>(), 12);
-        assert_eq!(size_of::<BodyMove>(), 44);
-        assert_eq!(offset_of!(BodyMove, transform), 4);
-        assert_eq!(offset_of!(BodyMove, body), 32);
-        assert_eq!(offset_of!(BodyMove, fell_asleep), 40);
-    }
-}

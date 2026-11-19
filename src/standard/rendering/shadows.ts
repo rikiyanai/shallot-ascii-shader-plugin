@@ -110,7 +110,7 @@ function lightBasis(dir: ArrayLike<number>, out: Float64Array): Float64Array {
 }
 const _basis = new Float64Array(9);
 
-// Texel snapping prevents shadow crawl. Extend the near plane toward the light to capture occluders
+
 // between the light and a tight fitted slice; otherwise receivers in the slice incorrectly appear lit.
 // Move the eye back by cover+margin, leaving the far edge fixed (depth 2*cover+margin). This shift
 // is perpendicular to the snap plane, so extending the occluder range does not change texel snapping.

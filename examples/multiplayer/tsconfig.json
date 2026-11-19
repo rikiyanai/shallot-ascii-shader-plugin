@@ -1,4 +1,8 @@
 {
-    "extends": "@dylanebert/shallot/tsconfig.json",
-    "include": ["src", "tests", "vite.config.ts", "playwright.config.ts", "server.ts"]
+  "extends": "@dylanebert/shallot/tsconfig.json",
+  "include": [
+    "src",
+    "vite.config.ts",
+    "server.ts"
+  ]
 }

@@ -137,9 +137,9 @@ export class GpuSourceNumerics {
   at=align(at);const indexOffset=take(H);at=align(at);const csrOffset=take(csr.words);
   const vertexCanon=take(V),vertexNext=take(V),vertexCounts=take(V);
   const contactRecords=take(C*2),edgeContact=take(E),contactMembers=take(M*2),faceMaterials=s.faceMaterials.length?take(s.faceMaterials.length):0;
-  // Compiled construction levels (perf-impl-93), header word 20; copied after the clears below.
+
   const edgeLevels=s.edgeLevels?.length?take(s.edgeLevels.length):0;
-  // perf-impl-109: the compiled limb-vertex table follows the vertex contexts in the run program.
+
   const limbWords=s.limbVertices?.length??0,partWords=s.partPrograms?.length??0;
   const words=at,runWords=TOPOLOGY_HEADER_WORDS+H+s.vertexContexts.length+limbWords+partWords;
   let hashSlots=1;while(hashSlots<2*Math.max(V,H,E))hashSlots*=2;

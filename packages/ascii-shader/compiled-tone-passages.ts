@@ -25,12 +25,12 @@ const TEXTURE_EDGE_PASSAGES:readonly TonePassage[]=[
  {id:'canopy-underside',role:'texture_edge',context:'canopy',text:"'''",source:'C#8 2f0353dc8e23bde120d1c050746f937c aa[8] canopy underside row',status:'retained: hand label CANOPY, a defined underside line',paper:''},
  {id:'canopy-tip',role:'texture_edge',context:'canopy',text:'"',source:'T#7 9636c2401facd04b90778f4bfea720c3 aa[7] crown underside',status:'retained: operator label yes, branch entry into foliage',paper:''},
 ];
-/** The even ground field's single member. The operator markup
- * (apps/stroke-matcher/references/review-untitled-24.png, lower-right and
- * medium-far insets) fills open ground with one colon at a constant pitch on
- * every row, `: : : : :`; the bank's `: : :` word cannot hold that pitch
- * across a surface-lattice cell of any other width, so the member is placed
- * singly. Appended after every other passage, so no index moves. */
+
+
+
+
+
+
 const GROUND_MEMBER_PASSAGES:readonly TonePassage[]=[
  {id:'ground-member',role:'tone_fringe',context:'ground',text:':',source:'operator markup review-untitled-24.png, lower-right inset ground rows and medium-far inset field',status:'retained: operator markup, EXAMPLE OF MEDIUM FAR LOD',paper:''},
 ];
@@ -145,21 +145,21 @@ const SEA_ROW_PASSAGES:readonly TonePassage[]=[
 const PARTICLE_PASSAGES:readonly TonePassage[]=[
  {id:'particle-spark',role:'tone_fringe',context:'ground',text:'ﾟ',source:'ascii-art-archive collections/aahub/bakuhatsu-kemuri/resK-106.txt lines 13-14 (AAHub 爆発・煙, the sparks)',status:'retained: verbatim reference glyph, a spark',paper:''},
 ];
-/** THE GRASS PATCH (tone2 g1, 2026-11-13): one constant pattern for turf, the
- * distant-grass patch of AAHub 9636c240 (T) aa-0003.txt lines 8, 10 and 15 (T#3,
- * operator "the patches of distnace grass"), followed by its own paper (one
- * full space). Replaces the grass bands, which the operator labelled bad
- * (an-r28-mi-dense; T#68 r1 "minus the superfluous inner tonal dots").
- * Appended last, so no index moves. */
+
+
+
+
+
+
 const GRASS_PATCH_PASSAGES:readonly TonePassage[]=[
  {id:'grass-patch',role:'tone_fringe',context:'grass',text:'ﾞ" ﾞ"',source:`AAHub ${T} aa-0003.txt lines 8, 10, 15 (T#3, distant grass patches ﾞ" ﾞ"　ﾞ" ﾞ")`,status:'retained: operator verdict 9636c240:3 yes, patches of distance grass',paper:'one full space after the patch'},
 ];
-/** THE 10-12 SEA'S WORDS (sea-100 rebase of numabe-90, operator 2026-11-17):
- * the frozen 10-12 Y8 runtime's water vocabulary, runtimes/y8-20261012
- * packages/trueff/render/ff/style/materials.ts WATER (crestLevel, crestRising,
- * crestFalling, ripple, surf), spelled by its layout.ts:1081-1089. Contiguous,
- * in this order (the tone field addresses them from SEA_CREST). Appended last,
- * so no index moves. */
+
+
+
+
+
+
 const SEA_1012='runtimes/y8-20261012 packages/trueff/render/ff/style/materials.ts WATER';
 const SEA_CREST_PASSAGES:readonly TonePassage[]=[
  {id:'sea-crest-level-0',role:'texture_edge',context:'ground',text:'⌒ヽ_',source:`${SEA_1012}.crestLevel[0]`,status:'retained: 10-12 travelling crest, level',paper:''},
@@ -181,26 +181,26 @@ const edgePassage=(id:string):number=>{const index=TONE_PASSAGES.findIndex(passa
 export const TEXTURE_EDGE={left:edgePassage('canopy-left'),right:edgePassage('canopy-right'),top:edgePassage('canopy-top'),underside:edgePassage('canopy-underside'),tip:edgePassage('canopy-tip')} as const;
 /** Ring radius of the measure in page px: one and a half full-width glyphs. */
 export const TEXTURE_EDGE_RADIUS=24;
-/** PATH-LED OR REGION-LED, DECIDED BY THE FRAME'S OWN FIELDS (operator ruling
- * 5: a rendering rule, not a priority order). Shared verbatim by the tone
- * producer (tone-field.ts) and the line producer's selection
- * (gpu-articulation.ts tierSelects), so both read one function of the same
- * owner and depth fields. Needs p.field, p.rect, ownerField and depthField.
- *
- * A boundary can be spelled as a path (cap, shoulder, flank, return) only
- * when it holds its direction for about a glyph. On a ring of 16 samples
- * TEXTURE_EDGE_RADIUS page px about a point of the form beside its boundary,
- * a straight, convex or smoothly curved boundary enters and leaves the form
- * once (2 crossings). A lobed or serrated boundary whose lobes are finer than
- * the ring crosses it 4 times or more: no glyph run can follow it, and its
- * envelope is drawn as texture. A limb thinner than a glyph also crosses 4
- * times but covers under a quarter of the ring; the form must cover 6 of 16.
- * The form must also hang: down the page from the point, or from one ring
- * radius to either side of it, its surface ends within 288 page px on nothing
- * or on a surface a depth step behind it, not on a surface it rests on (a
- * rock, a bush on its ground and a terrain skyline keep their path-led
- * outline). The radius, the 6 of 16 and the 288 px are this rule's own
- * choices, not measured reference values. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export const TEXTURE_EDGE_MEASURE=/* wgsl */`
 // Owner (without the UV-contract flag, bit 29) and depth bits; zero when off.
 fn leafHit(q:vec2f)->vec3u{

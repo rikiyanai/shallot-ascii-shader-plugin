@@ -99,7 +99,7 @@ export interface View {
     frameCaptures?: CanvasFrameCaptureRequest[];
     /** A weak device-loss watcher serves this view's captures without retaining detached canvases. */
     frameCaptureLossWatched?: boolean;
-    /** Device loss is permanent for this view; later capture requests fail immediately. */
+
     frameCaptureLost?: Error;
     /** World-owned fixed-size final surface, absent on canvas and depth-only views. */
     texture?: GPUTexture;
@@ -243,7 +243,7 @@ const _canvasViews = (() => {
     return views;
 })();
 
-/** Live canvas binding used by the frame-capture path; no source exists before a camera binds. */
+
 export function canvasFrameBinding(
     canvas: HTMLCanvasElement,
 ): { world: World; view: View; device: GPUDevice } | undefined {

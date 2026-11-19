@@ -237,7 +237,7 @@ if(!frame.includes(presentationTicketMarker)){
 }
 const ticketBarrelMarker='/* TRUEFF_MAIN_PRESENTATION_TICKET_EXPORT_0105 */';
 if(!coreBarrel.includes(ticketBarrelMarker))coreBarrel+=`\n${ticketBarrelMarker}\nexport { requestPresentationTicket, takePresentationTicket } from "./presentation-ticket";\nexport type { PresentationTicket } from "./presentation-ticket";\n`;
-// perf-impl-120 (examples managed presentation): PER-CANVAS tickets for a
+
 // world that asks for them (engine/presentation-targets.ts). Without its
 // ticket a canvas is neither acquired nor presented, and its views render into
 // an engine-owned stand-in so cameras, scene data and new GPU jobs continue

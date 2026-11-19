@@ -33,7 +33,7 @@ import {
     TOTAL_HEIGHT,
 } from "./rigid-character";
 import stairs from "./stairs.json" with { type: "json" };
-import level from "./test_map01.json" with { type: "json" };
+import level from "./physics-map01.json" with { type: "json" };
 import voxel1 from "./voxel_mesh_01.json" with { type: "json" };
 import voxel2 from "./voxel_mesh_02.json" with { type: "json" };
 

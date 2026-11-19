@@ -194,9 +194,9 @@ export function gpuIndexedSourceVoxelVitePlugin({sourcePath,importSpecifier}={})
  };
 }
 
-/** Apply the transform to a pinned engine installation. This is intentionally
- * separate from apply.mjs so the root-owned main patch can choose ordering and
- * preserve its own visitor hunks. */
+
+
+
 export async function applyGpuIndexedSourceProducer(engine){
  const version=JSON.parse(await readFile(resolve(engine,'package.json'),'utf8')).version;
  if(version!=='0.10.5')throw Error(`MAIN GPU indexed source producer requires Shallot 0.10.5, received ${version}`);

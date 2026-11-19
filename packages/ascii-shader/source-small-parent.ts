@@ -1,22 +1,22 @@
 import {partPoint,PART_CAP,PART_ROOT,PART_LIMB,PART_FORK,type MeshPartGraph} from './mesh-part-graph.ts';
 
-/** SMALLEST-TIER PARENT CLASS (perf-impl-156, D9 + petit AA "one role per row").
- *
- * A far parent held at 2-5 page rows cannot spell the 9-row bank shoulder or the
- * 10-row bank flank. Its smallest construction is a different, connected
- * vocabulary of whole small units (README "Far-part scale consumer and
- * unresolved smallest representation"):
- *  - `round`: a compact form; the compact whole-circle / dome entries (2-4 rows,
- *    `γ⌒ヽ` over `ゝ__ノ`) at their own size.
- *  - `limb`: an elongated round tube; cap row, straight side rows (a straight
- *    source side may keep an upright, D5), return row; height grows by side
- *    rows, width by whole repeat units.
- *  - `box`: rectangular sections; lid run `＿`, straight sides, base run `￣`,
- *    or the one-glyph box (口 ロ ﾛ) at a single row.
- * This is source compilation only: it decides WHICH small construction the
- * source owns, from its own section geometry and part labels. Rows, width and
- * glyphs are chosen by the compiled small table and the far consumer per pose.
- * No camera, screen probe or glyph search occurs here. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export type SourceSmallParentKind='round'|'limb'|'box';
 export type SourceSmallParentEnd='cap'|'contact'|'open';
 export interface SourceSmallParent {
@@ -28,11 +28,11 @@ export interface SourceSmallParent {
   * including a geometric PART_ROOT end), a KNOWN support contact ('contact',
   * only from an authored support), or 'open'. */
  readonly positiveEnd:SourceSmallParentEnd;readonly negativeEnd:SourceSmallParentEnd;
- /** Measured evidence (counts), kept for review; not consumed by playback. */
+
  readonly sections:number;readonly rectangular:number;
- /** Required source relationships a generic small outline cannot spell
-  * (README "Small-parent integration ownership"): fork bands of the part
-  * graph, plane-region openings and source contacts. */
+
+
+
  readonly relations:{readonly forks:number;readonly openings:number;readonly contacts:number;readonly seams:number;readonly components:number;readonly defects:number};
  /** True only when the source has none of those relationships, so its whole
   * form may be replaced by one small outline. False means runtime parent
@@ -67,35 +67,35 @@ export interface SourceRelationshipComplex {
   * (`compileMeshSource` raises `open-boundary` only for an unclosed walk). */
  readonly boundaries:readonly {readonly component:number}[];
 }
-/** RELATIONSHIP PRODUCER (perf-impl-159; README "Relationship producer
- * correction for Claude"). `SourceContactCandidate` is not synonymous with an
- * external depicted contact: on a separately indexed or flat-shaded mesh every
- * ordinary seam is an index-boundary pair at one position, so its
- * coincident-source-boundaries / published-source-incidence group carries the
- * welded seam incidence that d607bdf515 already reads for edge classes.
- *
- * A group is a PROVEN closed-shell seam only when ALL hold: exactly two
- * members; their halfedges are welded twins of each other (so the weld paired
- * them with consistent winding and the welded edge is manifold); both faces lie
- * in one welded component; and that component is a CLOSED shell: no welded
- * boundary cycle (an open sheet's complete boundary loop counts) and no
- * nonmanifold, inconsistent-winding or open-boundary issue. Every other group stays a
- * REQUIRED contact (three or more members, unpaired, cross-component, or on an
- * open/defective shell). Multi-component sources and defects are reported
- * separately; nothing is zeroed globally and the relation contract is
- * unchanged. Worker and baked compilation call this same function. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export function compileSourceRelationships(complex:SourceRelationshipComplex):{readonly contacts:number;readonly seams:number;readonly components:number;readonly defects:number}{
  const required=sourceContactRequirements(complex);
  let contacts=0;for(const value of required)contacts+=value;
  const components=new Set<number>();for(let face=0;face<complex.faceComponents.length;face++)components.add(complex.faceComponents[face]!);
  return {contacts,seams:required.length-contacts,components:components.size,defects:complex.issues.length};
 }
-/** The ONE per-candidate classification (perf-impl-161): entry i is 1 when
- * `complex.contacts[i]` is a REQUIRED contact and 0 when it is a proven
- * ordinary seam of one closed welded shell (rule above). Compiled once per
- * source revision; `compileSourceRelationships` (counts) and the whole-
- * template producer (which candidates to serialize) both read it, so the two
- * cannot disagree and no consumer re-derives topology per edge or frame. */
+
+
+
+
+
+
 export function sourceContactRequirements(complex:SourceRelationshipComplex):Uint8Array{
  const componentOf=(halfedge:number)=>{const face=complex.halfedges[halfedge]?.face;return face===undefined?undefined:complex.faceComponents[face];};
  const defective=new Set<number>();
@@ -160,7 +160,7 @@ export function compileSourceSmallParent(graph:MeshPartGraph|undefined,positions
  // Sections are level cuts, so include the source vertices beyond the end
  // levels (a cap dome above its last section) in the along-axis extent.
  for(let v=0;v<positions.length/3;v++){const along=positions[v*3]!*axis[0]+positions[v*3+1]!*axis[1]+positions[v*3+2]!*axis[2];lo=Math.min(lo,along);hi=Math.max(hi,along);}
- // perf-impl-162 (README "Next source-end correction"): PART_ROOT is the free
+
  // chain end reaching the source's LOWEST source-Y plane (mesh-part-graph.ts
  // 8-10, 244-265), computed with no world, placement or other surface. It is
  // geometry, not proof of an external support. A ROOT end, like a CAP end, is

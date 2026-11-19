@@ -35,15 +35,15 @@ export function* sourceSemanticResidualWork(source:SourceProgramInput):Generator
   if((group&0x60000000)===0x20000000)boundaryContexts.push(h,group);
  }
  const verticesAt=topology[40]!,vertexContexts=topology.slice(verticesAt,verticesAt+topology[41]!);
- // Compiled construction levels (perf-impl-93), with the same revision's
- // classes; perf-impl-106 appends the compiled L2 outline hull.
+
+
  const edgeLevels=compileConstructionLevels(topology,complex,source.positions,analysis.type);
  const positions=source.positions;
- // perf-impl-108: the parent member adequacy, with this revision (source-change work).
+
  const profileSafe=compileMeshProfileSafe(positions,source.indices);
- // perf-impl-109: the limb-vertex table for the GPU-derived run program (seedRuntime).
+
  const limbVertices=compileLimbVertices({structure:analysis.structure,complex});
- // perf-impl-110: the same source-owned part records are copied into the
+
  // baked/numeric route; no second pairing or projected-fragment program.
  const partPrograms=sourcePartProgramPacket(topology);
  // The baked path shares the worker's source producer. Reuse this build's

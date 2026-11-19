@@ -311,7 +311,7 @@ export interface ShaderArtifact {
     compilationError?: { errorClass: string; message: string };
 }
 
-/** the page-side artifact capture a browser driver opts into before application code runs. @internal */
+
 export interface GpuDiagnostics {
     artifacts: ShaderArtifact[];
 }
@@ -1263,7 +1263,7 @@ export async function requestGPU(
     },
 ): Promise<WorldGpu> {
     // before anything resolves: typegpu binds the console method a TGSL `console.log` calls at
-    // shader-generation time, so a capture installed later never sees that kernel's lines.
+
     captureGpuLog();
     checkTgsl();
     if (device !== undefined) checkRequirements(device.features, device.limits, requirements);

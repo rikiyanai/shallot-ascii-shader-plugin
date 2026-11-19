@@ -91,30 +91,30 @@ export interface CompiledConstructionGraph {readonly styleWord?:number;readonly 
  /** Wall faces of a built form (compileWallFaces), packed into the run
   * topology slot as the face owner's edge table. Empty for every other source. */
  readonly faces?:readonly SourceFace[]}
-/** A WALL FACE (face construction slice 1, README "Whole-part construction for
- * planar subjects", 2026-11-17): plane regions within FACE_PLANE_DEGREES and
- * FACE_OFFSET of one vertical plane (a facade: the wall, its timbers, trims and
- * door frame), holding at least FACE_LEAST_SHARE of the source's surface,
- * whose largest region spans at least two member widths both ways (a fence
- * rail is no wall).
- * `regions` are indices into planeRegions, `outline` the regions whose loops
- * are the face's outline and openings, `members` its thin strips (smaller
- * in-plane extent under FACE_OFFSET), `corners` the welded source vertices
- * where the main region's outline turns 20 degrees or more (its long edges
- * joined at cos .985). Faces are numbered by their least plane-region id, so
- * the id is stable for a source revision. Compiled once, in the worker. */
+
+
+
+
+
+
+
+
+
+
+
+
 export interface SourceFace {readonly id:number;readonly regions:readonly number[];readonly main:number;readonly members:readonly number[];readonly corners:readonly number[];readonly openings:number;readonly share:number;
  /** The member width of the source (FACE_OFFSET of its radius, source units). */
  readonly width:number;
- /** SLICE 1b (perf-impl-81): the face's edge decisions, compiled once.
-  * `drawn`: source halfedges the face construction draws (straight in the
-  * face plane: level or upright within FACE_AXIS_DEGREES). `hidden`: face
-  * halfedges compiled out, drawn by nothing (neither the face run nor a
-  * per-edge run): the second long side and the ends of a strip (one timber,
-  * one line), the outer sides of a frame's members (the frame is its inner
-  * loop), an opening side a jamb carries, and every edge of a return (a
-  * timber's or reveal's depth side inside the facade slab). A slanted edge of
-  * a face (a gable slope) is in neither list and keeps today's per-edge run. */
+
+
+
+
+
+
+
+
+
  readonly drawn:readonly number[];readonly hidden:readonly number[];
  /** Closed frames: a door (an opening loop of the main region) or a recess
   * bounded by two upright and two level timbers (a window). cell = the inner
@@ -156,7 +156,7 @@ export function compileWallFaces(positions:Float32Array,indices:Uint32Array,weld
    return Math.min(hu-lu,hv-lv);};
   const thin=(i:number)=>{const loop=planeRegions[i]!.boundary??[];return loop.length>0&&narrow(i)<w;};
   // Corners of the main region's outline: collinear halfedges joined into
-  // long edges (cos .985, the perf-74 threshold), a corner where two meet
+
   // turning 20 degrees or more, keyed by the welded source vertex.
   const loop=planeRegions[main]!.boundary??[],pts=loop.map(h=>({v:weld[indices[h]!]!,p:P(indices[h]!)}));
   const edges:{a:number;b:number;d:number[]}[]=[];

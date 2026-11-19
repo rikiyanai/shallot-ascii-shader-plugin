@@ -230,8 +230,8 @@ export class LimbConstruction {
   return {ok:true,configuration:`source-part/${geometry?.revision??'posed'}/${terminal?'terminal':subject.structure!.bands.map(b=>`${b.lower.join('.')}>${b.upper.join('.')}`).join(';')}`,
    pattern:{id,origin:[0,0],occurrences,contacts:[],paper,requiredSources:paths.map(path=>path.id),paths,repeatRuns,surfaces,sourceParts}};
  }
- /** Clip the DOMAIN of an already chosen repeat function, retaining its
-  * original ordinals. This does not trace a raster or choose a glyph. */
+
+
  private visibleOrdinals(points:readonly Point[],lengths:readonly number[],advance:number,count:number,view:DrawingFieldView,phase:number):[number,number][]{
   const ranges:[number,number][]=[],left=view.rect.x-advance,right=view.rect.x+view.rect.width,top=view.rect.y-phase-17,bottom=view.rect.y+view.rect.height-phase+17;
   for(let i=1;i<points.length;i++){

@@ -7,7 +7,7 @@ export interface FieldCandidates {
     fieldMarks: Uint32Array;
     count: number;
     tombstones: number;
-    /** The change tick of this queue's last capture; later captures latch only words marked since. */
+
     lastRun: number;
 }
 

@@ -70,7 +70,7 @@ export class WorldSnapshot {
     }
 }
 
-/** @internal Ordered simulation owners; validation precedes all capture and restore work. */
+
 export class SnapshotComposition {
     readonly #participants = new Map<string | symbol | object, Participant>();
     readonly #boundary: (operation: "snapshot" | "restore") => boolean;

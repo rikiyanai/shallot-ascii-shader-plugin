@@ -107,7 +107,7 @@ fn quantize(l:f32)->f32{return select(select(select(select(.42,.58,l>=.2),.72,l>
 // again. Sky and empty space: the displayed value alone (atmosphere).
 // The value bands are the inspection backdrop: faint on white paper so the
 // native glyph pass, drawn afterward, remains the foreground authority.
-// THE LINES ARE NOT BACKDROP (operator, 2026-11-12: "no red lines"). The D10
+
 // line classes and the construction intervals (alpha 1) keep their own legend
 // colour at full strength; from 2026-11-08 (449fe04) they were mixed to 20 %
 // with the bands, a pale tint no reader could find under the glyphs.

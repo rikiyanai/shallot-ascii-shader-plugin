@@ -2,18 +2,18 @@ import {FAR_STRIP_BELOW_ROWS,LOD_TIER_HOLD} from './form-depths.ts';
 import {latticeOpening} from './compiled-construction-topology.ts';
 import type {SourceSmallParent} from './source-small-parent.ts';
 
-/** THE PARENT TIER (perf-impl-108). An octree node of two or more placements
- * whose WHOLE posed box stands under the connected-outline tier (the L2 band,
- * FAR_STRIP_BELOW_ROWS with the hold) is ONE parent construction: its members
- * produce no fine relations, contacts, runs or placements, and the far
- * aggregate emitter draws the node once as its upper profile on the merged far
- * skyline (articulation farSkyline: one mass, its cap, flanks and base turn).
- * perf-99/105 traced the city stamp field to Numabe composing one building
- * from several placements: each sheet was its own owner under three rows and
- * took the box program's one-glyph stamp. A parent node is the building (or
- * the block) as one form. Entry at FAR_STRIP_BELOW_ROWS*LOD_TIER_HOLD rows;
- * a node that was a parent last frame stays one until FAR_STRIP_BELOW_ROWS/
- * LOD_TIER_HOLD (the same separated bands as the held per-form level). */
+
+
+
+
+
+
+
+
+
+
+
+
 export const PARENT_ENTER_ROWS=FAR_STRIP_BELOW_ROWS*LOD_TIER_HOLD,PARENT_LEAVE_ROWS=FAR_STRIP_BELOW_ROWS/LOD_TIER_HOLD;
 /** Page columns one parent profile may span (the emitter's workgroup table). */
 export const PARENT_MAX_COLUMNS=64;
@@ -34,16 +34,16 @@ export interface SourceLodInstance {
  readonly smallParent?:SourceSmallParent;
 }
 /** A complete source-owner extent, not a selected edge or an image glyph. */
-/** `parent`: the key of the octree aggregate this member belongs to (perf-impl-96).
- * Such a member is far for residency and relations, but it is drawn ONLY by its
- * parent's one aggregate record, never as a far form of its own. */
+
+
+
 export interface FarFormInstance {
  readonly eid:number;readonly box:readonly [number,number,number,number];readonly parent?:number;
  readonly smallParent?:SourceSmallParent;
  readonly sourceRevision?:number;
 }
-/** One compiled parent construction (perf-impl-96): an adequate octree node's
- * members, drawn once through the far aggregate emitter (gpu-source-far-forms). */
+
+
 export type SourceWholePartRole='cap'|'turn'|'flank'|'return';
 /** Rest-source construction samples. These are compiled once from the source
  * graph; they are not camera fragments or glyph coordinates. */
@@ -150,19 +150,19 @@ export interface SourceLodAggregate {
 }
 export interface SourceLodSelection {
  readonly far:ReadonlyMap<number,readonly FarFormInstance[]>;
- /** The parent aggregates of this camera (perf-impl-96); their members are in `far` with `parent`. */
+
  readonly parents?:readonly SourceLodAggregate[];
- /** The node keys drawn as parents this frame: next frame's held set (perf-impl-108). */
+
  readonly heldParents?:ReadonlySet<number>;
  readonly heldSmall?:ReadonlySet<string>;
  readonly defer:ReadonlySet<number>;
  /** Every instance is outside this camera's padded, same-pose page box. */
  readonly outside?:ReadonlySet<number>;
- /** PER-INSTANCE LEVELS (perf-impl-94): a mesh in BOTH `far` and `full` is
-  * mixed. `full` names the member eids this camera draws with the complete
-  * producer; its `far` members are compiled far forms. A mesh only in `far`
-  * is wholly far; a mesh in neither is wholly full (as before). In a merged
-  * (residency) selection the list is empty: full program AND far form needed. */
+
+
+
+
+
  readonly full?:ReadonlyMap<number,readonly number[]>;
  readonly exterior:boolean;
 }
@@ -185,16 +185,16 @@ function projectedBox(bounds:readonly number[],m:ArrayLike<number>,width:number,
  return box.every(Number.isFinite)?box:undefined;
 }
 
-/** Source demand before numeric incidence, material extraction and
- * relationships, PER INSTANCE (perf-impl-94). Each admitted instance takes its
- * own level: a complete form smaller than one native cell is a compiled far
- * form, any other (or unknown, clipped, moving) instance keeps the full
- * producer. One near copy no longer promotes every copy of its mesh: the mesh
- * is then MIXED (`full` lists its full members). No instance is removed. Only
- * bounded initial native-history warmup may defer work. */
-/** The far-form rule as a test on any posed bound: its complete projected
- * box fits ONE native cell with the hold (perf-impl-95: the octree asks it of
- * a node's tight aggregate box). */
+
+
+
+
+
+
+
+
+
+
 export function fitsNativeCell(bounds:readonly number[],clip:ArrayLike<number>,width:number,height:number,pageWidth:number,pageHeight:number):boolean{
  const box=projectedBox(bounds,clip,width,height);if(!box)return false;
  return box[2]-box[0]<16*LOD_TIER_HOLD*width/Math.max(1,pageWidth)&&box[3]-box[1]<17*LOD_TIER_HOLD*height/Math.max(1,pageHeight);
@@ -211,17 +211,17 @@ export function fitsParentTier(bounds:readonly number[],clip:ArrayLike<number>,w
  return !!box&&parentBox(box,PARENT_LEAVE_ROWS,width,height,pageWidth,pageHeight);
 }
 /** An octree node selected as ONE representation (engine source-workset). */
-/** `key`: the node's stable identity (spatial-index node id, perf-impl-96); the
- * aggregate keeps it while the node exists, so its skyline units keep their tag. */
+
+
 export interface SourceLodParent {readonly bounds:readonly number[];readonly instances:readonly SourceLodInstance[];readonly key?:number}
-/** Members of one candidate node that touch in the WORLD: their bounds meet
- * within PARENT_TOUCH of the smaller member's largest side (view-independent,
- * so a group does not change with the camera). A member without bounds is a
- * group of its own. Groups in least-eid order.
- * perf-impl-112: only PROFILE-SAFE members join. One member whose own upper
- * profile would close an opening (an arch sheet) is a group of its own and
- * keeps its own producer; it no longer returns every touching safe member of
- * the building to its per-sheet stamp (whole-group rejection on one member). */
+
+
+
+
+
+
+
+
 export const PARENT_TOUCH=.02;
 const touchSide=(b:readonly number[])=>Math.max(b[3]!-b[0]!,b[4]!-b[1]!,b[5]!-b[2]!);
 /** Two member bounds meet within PARENT_TOUCH of the smaller one's largest side. */
@@ -240,21 +240,21 @@ function parentGroups(members:readonly SourceLodInstance[],safe:readonly boolean
  order.forEach((index,i)=>{const r=find(i);const g=groups.get(r)??[];g.push(index);groups.set(r,g);});
  return [...groups.values()];
 }
-/** Allocated group ids carry this bit, so they never meet an octree node id
- * (the one-cell aggregate's key, perf-impl-96) in the held set or a run tag. */
+
+
 export const PARENT_GROUP_ID_BIT=0x80000000;
 export interface ParentGroup {readonly id:number;readonly members:readonly SourceLodInstance[]}
 interface CachedMember {readonly eid:number;readonly ref:number;readonly mesh:number;readonly safe:boolean;readonly sourceRevision?:number;readonly poseRevision?:number;readonly bounds?:readonly number[]}
 const sameBounds=(a:readonly number[]|undefined,b:readonly number[]|undefined)=>a===b||(!!a&&!!b&&a.length===b.length&&a.every((v,i)=>v===b[i]));
 const instanceSourceRevision=(instance:SourceLodInstance):number|undefined=>instance.sourceRevision??instance.construction?.revision;
-/** THE CACHED PARENT REPRESENTATION (perf-impl-108). Per octree node (a
- * SpatialIndex node id never recycles within its world), the node's world
- * touching groups are compiled when its membership, a member's lifetime ref,
- * mesh or bounds change, and only then; an unchanged node costs one O(N)
- * comparison per view. A group's id is ALLOCATED once per exact member
- * content (the sorted lifetime ref and mesh of every member, compared as
- * exact keys, never a hash), so a hold or an aggregate tag is inherited only
- * by the identical group. One cache per host world. */
+
+
+
+
+
+
+
+
 export class ParentGroupCache{
  private readonly nodes=new Map<number,{members:readonly CachedMember[];groups:readonly (readonly number[])[];ids:readonly number[]}>();
  private readonly ids=new Map<string,number>();private next=1;
@@ -281,11 +281,11 @@ export class ParentGroupCache{
   return cached!.groups.map((group,g)=>({id:cached!.ids[g]!,members:group.map(i=>members[i]!)}));
  }
 }
-/** THE PARENT HOLD across frames (perf-impl-108), per host LOD scope: the
- * camera lifetime, world and owner epoch of FormLodLifetimes.scope, never a
- * View object or slot that the engine can recycle. Bounded: the least
- * recently written scopes beyond PARENT_HOLD_SCOPES are dropped (a dropped or
- * new scope starts with no parents held, the conservative entry band). */
+
+
+
+
+
 export const PARENT_HOLD_SCOPES=64;
 export interface ParentHoldScope {readonly cameraId:number;readonly worldId:number;readonly epoch:number}
 export class ParentHolds{
@@ -355,12 +355,12 @@ export function composeParentConstruction(members:readonly SourceLodInstance[]):
  const paper=programs.flatMap(program=>program.paper??[]);
  return {revision:revision||1,parts,openings,contacts,protectedVoids,...(paper.length?{paper}: {})};
 }
-/** NO OPENING (perf-impl-108): on the glyph-cell lattice over the group's
- * projected box, no empty cell is covered on both sides in its row and above
- * it (latticeOpening: an arch, a gap between piers under a lintel) that the
- * upper profile would close. Cells are judged at their centres from the
- * members' complete projected bounds; each member's OWN openings are its
- * compiled compileMeshProfileSafe (the host's `profileSafe`). */
+
+
+
+
+
+
 function parentAdequate(group:readonly SourceLodInstance[],clip:ArrayLike<number>,width:number,height:number,pageWidth:number,pageHeight:number,box:readonly number[]):boolean{
  const cw=16*width/Math.max(1,pageWidth),rh=17*height/Math.max(1,pageHeight);
  const boxes=group.map(instance=>projectedBox(instance.bounds!,clip,width,height));if(boxes.some(b=>!b))return false;
@@ -402,7 +402,7 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
  // Only a complete form smaller than ONE native cell may merge. A narrow
  // two-row house still holds its own construction, whatever its class.
  const maximumX=16*LOD_TIER_HOLD*width/Math.max(1,pageWidth),maximumY=17*LOD_TIER_HOLD*height/Math.max(1,pageHeight);
- // PARENT CONSTRUCTION (perf-impl-96; perf-impl-95 selected the node): an
+
  // adequate octree node is ONE aggregate. Its members are far (residency, no
  // relations) and carry the node's key; the far aggregate emitter draws the
  // node once from all their pixels. A node that no longer fits (or an unknown
@@ -412,7 +412,7 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
   for(const instance of group){seen.add(instance.mesh);const members=far.get(instance.mesh)??[];members.push({eid:instance.eid,box:groupBox,parent:groupKey});far.set(instance.mesh,members);}
   aggregates.push({key:groupKey,box:groupBox,members:group.map(instance=>({mesh:instance.mesh,eid:instance.eid})),construction});
  };
- // perf-impl-108 PARENT TIER: the octree node is only the candidate set, never
+
  // the form. Its members split into groups of placements that TOUCH in the
  // world (parentGroups); a group is one parent only when its upper profile
  // loses nothing (every member compileMeshProfileSafe, and parentAdequate: no
@@ -423,11 +423,11 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
   const box=exterior&&perspective?projectedBox(node.bounds,clip,width,height):undefined;
   const key=node.key??Math.min(...node.instances.map(instance=>instance.eid));
   const pending=node.instances.some(instance=>instance.boundsPending);
-  // perf-impl-96, unchanged: a node whose whole box fits ONE native cell is one
+
   // aggregate (nothing inside one cell can be spelled as an opening).
   if(box&&!pending&&box[2]-box[0]<maximumX&&box[3]-box[1]<maximumY){
    const construction=composeParentConstruction(node.instances);
-   // An absent construction is the incumbent source contract, not evidence
+
    // that the old one-cell parent is unsafe. Only a known replacement that
    // cannot preserve its relations forces the legal child fallback.
    if(construction||node.instances.every(instance=>instance.construction===undefined)){adopt(key,box,node.instances,construction);continue;}
@@ -436,7 +436,7 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
   if(box&&!pending&&parentBox(box,PARENT_LEAVE_ROWS,width,height,pageWidth,pageHeight))for(const group of cache.groups(key,node.instances,identity,profileSafe))pieces.push(group);
   else rest.push(...node.instances);
  }
- // perf-impl-112 ACROSS NODES. The octree keeps a placement that crosses a
+
  // split plane in the node ABOVE the split; when that node is too large to be
  // a parent, the placement used to be listed singly (its own one-glyph stamp)
  // and the sheets beside it, in the child nodes, could never group with it, so
@@ -491,7 +491,7 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
   if(group.length>1&&tryParent(group,only?.id??cache.contentId(group.map(m=>({ref:identity(m.eid),mesh:m.mesh,revision:instanceSourceRevision(m)})))))continue;
   // The first legal alternative, in fixed order: a merged group that fails
   // (too tall, or an opening between its pieces) falls back to its node
-  // groups exactly as perf-108 judged them; merged singles stay single.
+
   if(parts.length>1){for(const i of parts){const p=pieces[i]!;if(p.id===undefined||!tryParent(p.members,p.id))rest.push(...p.members);}}
   else rest.push(...group);
  }
@@ -529,10 +529,10 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
  return {far,parents:parentsOut,heldParents,heldSmall:smallOut,defer,outside,full,exterior};
 }
 
-/** RESIDENCY across cameras (perf-impl-94): a mesh needs its full program when
- * any camera draws a member at full, and its compiled far form when any camera
- * draws a far member. Each camera's own selection still decides its drawing;
- * this merge never promotes one camera's far members to full detail. */
+
+
+
+
 export function mergeSourceLod(selections:readonly {readonly selection:SourceLodSelection;readonly meshes:readonly number[]}[]):SourceLodSelection{
  const far=new Map<number,FarFormInstance[]>(),defer=new Set<number>(),needFull=new Set<number>(),outside=new Set<number>(),shown=new Set<number>();
  for(const {selection,meshes}of selections)for(const mesh of meshes){

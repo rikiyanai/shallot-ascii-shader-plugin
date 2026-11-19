@@ -445,7 +445,7 @@ export class Components {
     private _owners: number[][] = [[]];
     private _presentation: number[] = [];
 
-    /** @internal Capture membership without taking ownership of component assignments. */
+
     snapshot() {
         return {
             masks: this._masks.map((m, gen) => m.map((mask) => mask & ~this._presentation[gen])),

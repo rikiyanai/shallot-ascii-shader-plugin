@@ -68,7 +68,7 @@ export function captureCoreSource(source){
     #withPriors(patch) {
 `);
  // Only descriptor dictionaries are copied; GPU objects/layout identity stay
- // exact. Native and capture both consume this SAME resolved descriptor.
+
  source+=`\n${CORE_MARK}
 function snapshotRecipeDescriptor(d) {
  const freeze = Object.freeze;

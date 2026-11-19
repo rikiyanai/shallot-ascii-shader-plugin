@@ -1,4 +1,4 @@
-import {instrumentWgsl,traceRecorderWgsl,decodeTrace,type TraceSite} from './gpu-trace.ts';
+
 import type {RelationVisibility} from './relation-visibility.ts';
 import type {CompiledConstructionGraph,ConstructionType} from './composition.ts';
 import type {MeshSourceComplex} from './source-complex.ts';
@@ -154,7 +154,7 @@ const PAIR_NODE=3u;
 const STYLE_WORDS=5u;
 // The domain word of a welded terrain seam node (key): never a source domain.
 const SEAM_DOMAIN=0x1ffffffdu;
-// perf-impl-108: the node namespace of a supplied two-owner contact point.
+
 const CONTACT_DOMAIN=0x1ffffffcu;
 fn count()->u32{return min(sourceStatus[2],p.extent.x);}
 fn kind(r:Relation)->u32{return r.key.z&0x1fffffffu;}
@@ -221,7 +221,7 @@ fn edgeClass(r:Relation)->u32{
 // borders no wall face (roof, ridge, eave sheets, foliage, terrain). Every
 // silhouette or crease of a face-owned edge is ONE edge of the owner's face
 // construction (roundReserve, assemble), as every edge of a box is of its box.
-// Slice 1b (perf-impl-81): a word with FACE_HIDDEN is a face edge compiled out
+
 // (the second side of a strip, a frame member's outer side, a return's
 // edge): it is counted, reserved, assembled and linked by nothing.
 const FACE_MAGIC=${TOPOLOGY_FACE_MAGIC}u;const FACE_HIDDEN=${FACE_HIDDEN}u;
@@ -272,7 +272,7 @@ fn hardEdge(r:Relation)->bool{
 // step 1): an occluding contour (kind 1) and an interior turn (kind 3) cross a
 // tessellated surface face by face and jog at every face exactly as a facet
 // silhouette does; held to the 18 degree straight rule they broke at almost
-// every face (trace-rock-near-c: 30 occluding-contour runs, median 3 page px;
+
 // 42 interior turns, median 2 px, every one under one row and deselected).
 fn tessellated(r:Relation)->bool{
  let form=shape(r);let k=kind(r);
@@ -313,7 +313,7 @@ fn topologyGroup(r:Relation,port:u32)->u32{
  if(port<work[header+41u]){return work[header+work[header+40u]+port];}
  return 0u;
 }
-// The compiled limb-vertex table of the relation's source (perf-impl-109,
+
 // compiled-construction-topology TOPOLOGY_LIMB_MAGIC): the chain label of an
 // original vertex port, 0 when the slot has no table or the vertex no limb.
 fn limbVertex(r:Relation,port:u32)->u32{
@@ -418,7 +418,7 @@ fn key(endpoint:u32,mode:u32)->SourceKey{
  // height sample). Exact equality, no tolerance: it is the source compiler's
  // rest-position weld carried across chunk sources, not a screen weld; two
  // different world points cannot share all four words.
- // TWO OWNERS ACROSS ONE SOLVER CONTACT (perf-impl-108). A silhouette or
+
  // crease end whose canonical vertex port is a host-supplied contact CORNER of
  // its owner (surface-relations contactCorner: explicit solver incidence of a
  // touching pair, the same id listed for both owners) is keyed by that point,
@@ -642,7 +642,7 @@ fn junctionRepresentative(node:u32,endpoint:u32){
 // ridge) passes vertices where a third and fourth crease meet it; stopping
 // there cut every fold into pieces under three rows, which selection then
 // dropped (view 06 cliff: the folds of the underdrawing missing from the text;
-// operator call-out 2026-11-10). As line-drawing renderers stitch strokes, at
+
 // such a vertex each edge end pairs with the end that continues it most
 // straightly, of the same hardness, when that end chooses it back (mutual, so
 // the links stay one consistent chain) and the turn is 45 degrees or less.
@@ -1270,7 +1270,7 @@ fn pairBefore(a:u32,b:u32)->bool{
   let here=endpointPage(own);var ownLeg=chord(here,own);var mateLeg=chord(here,mate);
   // A STEP: a level line ends where a parallel line one row away begins and
   // the mesh joins them by a near-upright edge shorter than one native row.
-  // The two lines' units lie one row apart with nothing between (operator
+
   // Y8 view-02 call-out 2026-11-12). The step is ONE corner glyph at the
   // connector's LOWER end, its upright reaching up into the upper line's row
   // (∟ ｣ by the compiled two-leg table); the connector's upper end spells
@@ -1293,7 +1293,7 @@ fn pairBefore(a:u32,b:u32)->bool{
  // A T on this run's own line: part.w and, for a run that is not a contact,
  // paper.x and paper.y carry throughT words (articulation hardJunction).
  if(kind(r)!=4u){contact.x=teeWords.y;contact.y=teeWords.z;}
- // SOURCE-OWNED SOFT PART PROGRAM (perf-impl-110): range.w retains its old
+
  // size in bits 0..1 and carries the selected source feature/role in the
  // high bits. Articulation reads it once for the whole run; absent/legacy
  // records leave the incumbent role path unchanged.
@@ -1311,11 +1311,11 @@ fn pairBefore(a:u32,b:u32)->bool{
   // temporal key. Occlusion may remove visible words but cannot rename it.
   correspondence=vec4u(r.key.w,r.ports.x,r.ports.y,sourceProgram.w);
  }
- // SOURCE-BACKED PAIRED LIMB (perf-impl-109): a path-led silhouette or
+
  // occluding contour on a compiled LIMB part carries that part's chain label
  // in paper.w (0 = no limb, the incumbent). Articulation pairs a tube's two
  // silhouettes by this identity (limbPairSource), not by field probes.
- // perf-impl-109c: BOTH end vertices must lie on the SAME compiled chain. An
+
  // edge from a limb onto a fork, a cap or another chain (or onto a vertex
  // with no limb word) carries 0: its run keeps the incumbent pairing rather
  // than taking whichever endpoint happened to answer first.
@@ -1323,37 +1323,17 @@ fn pairBefore(a:u32,b:u32)->bool{
  runs[slot]=Run(vec4u(base,output-base,flags,programmedSize),vec4u(identity,r.key.x|(r.key.z&0x80000000u),r.key.y,identity),vec4u(r.key.w,r.key.z,joins,teeWords.x),contact,correspondence);
 }
 `;
-/**
- * THE JOINING STEP'S DECISION TRACE (gpu-trace.ts). `connectExplain` is the
- * body of `connect` itself, copied from this source when the trace build is
- * made, with its three writes to the link table replaced by trace values: it
- * makes the same decisions on the same state (dispatched right after
- * `connect`) and records every branch with its outcome, the vertex degree at
- * each end and where each end continues or why it stops. The anchors below
- * are exact text of `connect`: if `connect` changes, the build fails loudly
- * instead of tracing a stale copy.
- */
-export function connectTraceShader(sites:TraceSite[]):string{
- const head='@compute @workgroup_size(64) fn connect(@builtin(global_invocation_id) gid:vec3u){';
- const from=GPU_CONSTRUCTION_RUNS_SHADER.indexOf(head),to=GPU_CONSTRUCTION_RUNS_SHADER.indexOf('\n}\n',from)+3;
- if(from<0||to<3)throw Error('Trace build: connect not found');
- let body=GPU_CONSTRUCTION_RUNS_SHADER.slice(from,to).replace('fn connect(','fn connectExplain(');
- const edit=(a:string,b:string)=>{if(body.split(a).length!==2)throw Error(`Trace build: connect anchor changed: ${a.slice(0,60)}`);body=body.replace(a,b);};
- edit(' let span=front(r);let a=page(mix(r.a,r.b,span.x)).xy;let b=page(mix(r.a,r.b,span.y)).xy;\n',
-  ' let span=front(r);let a=page(mix(r.a,r.b,span.x)).xy;let b=page(mix(r.a,r.b,span.y)).xy;\n dtraceBegin(id,dtraceHit(a)||dtraceHit(b)||dtraceHit((a+b)*.5));dtraceValue(40u,kind(r));dtraceValue(41u,u32(hardEdge(r)));dtraceValue(42u,bitcast<u32>(i32(round(a.x))));dtraceValue(43u,bitcast<u32>(i32(round(a.y))));dtraceValue(44u,bitcast<u32>(i32(round(b.x))));dtraceValue(45u,bitcast<u32>(i32(round(b.y))));\n');
- edit('  let endpoint=id*2u+end;let node=nodeFor(endpoint,LINE_NODE);var continuation=NONE;\n',
-  '  let endpoint=id*2u+end;let node=nodeFor(endpoint,LINE_NODE);var continuation=NONE;\n  dtraceValue(46u,end);if(node!=NONE){dtraceValue(47u,atomicLoad(&nodes[node].degree));}\n');
- edit('   if(roundBoundary||hardBoundary||(kind(r)==4u&&kind(n)==4u)||aligned){continuation=next;}\n',
-  '   dtraceValue(49u,u32(aligned));dtraceValue(50u,u32(hardBoundary));dtraceValue(51u,u32(extrema));\n   if(roundBoundary||hardBoundary||(kind(r)==4u&&kind(n)==4u)||aligned){continuation=next;}\n');
- edit('   let mate=straightMate(endpoint,node);\n','   let mate=straightMate(endpoint,node);dtraceValue(52u,mate);\n');
- edit('  work[at+end]=continuation;\n  work[at+2u+end]=select(continuation^1u,endpoint,continuation==NONE);\n  work[at+4u+end]=endpoint;\n','  dtraceValue(48u,continuation);\n');
- const source=GPU_CONSTRUCTION_RUNS_SHADER+`
-@group(0) @binding(9) var<storage,read_write> traceLog:array<atomic<u32>>;
-${traceRecorderWgsl('traceLog',0)}
-fn dtraceHit(q:vec2f)->bool{let b=dtraceBox();return q.x>=b.x&&q.x<=b.z&&q.y>=b.y&&q.y<=b.w;}
-${body}`;
- return instrumentWgsl(source,['straightMate'],['connectExplain'],sites,['connectExplain','straightMate']);
-}
+
+
+
+
+
+
+
+
+
+
+
 
 /** The shader's source form of a compiled construction type: 1 planar, 2
  * rounded, 3 terrain (a height surface), 0 every other (path-led). Compared
@@ -1377,19 +1357,10 @@ interface PreparedSourceRunPipelines extends PreparedRunFamily {readonly indexed
 export class GpuConstructionRuns {
  private runExtent=65536;private pointExtent=262144;private hashExtent=0;
  private readonly layout:GPUBindGroupLayout;private readonly pipelines:ReadonlyMap<string,GPUComputePipeline>;
- /** The joining step's decision trace (connectTraceShader), built on the first request, off the main thread. */
- private explain?:{layout:GPUBindGroupLayout;pipeline:GPUComputePipeline;sites:TraceSite[]};private explainPending?:Promise<void>;
- private traceTasks:(()=>void)[]=[];
- private explainBuild(){
-  if(this.explain||this.explainPending)return this.explain;
-  const sites:TraceSite[]=[],code=connectTraceShader(sites);
-  // Only what connect reads: the run and point tables (5, 6) are left out, so
-  // the traced pass stays inside the device's eight storage buffers.
-  const layout=this.device.createBindGroupLayout({label:'MAIN joining-step trace',entries:[{binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:'uniform'}},...[1,2,3,4].map(binding=>({binding,visibility:GPUShaderStage.COMPUTE,buffer:{type:'read-only-storage' as const}})),...[7,8,9].map(binding=>({binding,visibility:GPUShaderStage.COMPUTE,buffer:{type:'storage' as const}}))]});
-  const module=this.device.createShaderModule({label:'MAIN joining-step trace build',code});
-  this.explainPending=this.device.createComputePipelineAsync({layout:this.device.createPipelineLayout({bindGroupLayouts:[layout]}),compute:{module,entryPoint:'connectExplain'}}).then(pipeline=>{this.explain={layout,pipeline,sites};},error=>{(globalThis as unknown as {__mainTraceConnect?:unknown}).__mainTraceConnect={error:`joining trace build failed: ${String(error)}`};});
-  return undefined;
- }
+
+
+
+
  private readonly spare=new Map<string,GPUBuffer>();private readonly active=new Set<GPUBuffer>();
  private readonly retiredWork:GPUBuffer[]=[];
  private encoding?:GPUCommandEncoder;
@@ -1614,23 +1585,11 @@ export class GpuConstructionRuns {
    const pass=encoder.beginComputePass({label:`MAIN GPU construction ${name}`});pass.setPipeline(pipeline);pass.setBindGroup(0,group);pass.dispatchWorkgroups(Math.min(columns,Math.ceil(amount/64)),Math.ceil(Math.ceil(amount/64)/columns));pass.end();
   };
   dispatch('initialize',linkA,linkB,Math.max(hashCapacity,runCapacity));dispatch('incidence',linkA,linkB,capacity);dispatch('connect',linkA,linkB,capacity);
-  // THE JOINING STEP'S TRACE: page sets globalThis.__mainTraceConnectRequest={box};
-  // answered once in globalThis.__mainTraceConnect.
-  const host=globalThis as unknown as {__mainTraceConnectRequest?:{box:readonly number[]};__mainTraceConnect?:unknown};
-  const explain=host.__mainTraceConnectRequest?this.explainBuild():undefined;
-  if(explain&&host.__mainTraceConnectRequest){
-   const box=host.__mainTraceConnectRequest.box;host.__mainTraceConnectRequest=undefined;
-   const words=8*1024*1024,log=this.device.createBuffer({label:'MAIN joining-step trace log',size:words*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
-   const head=new Uint32Array(8);new Float32Array(head.buffer,0,4).set(box.slice(0,4));head[6]=8;this.device.queue.writeBuffer(log,0,head);
-   const uniform=this.device.createBuffer({label:'MAIN joining-step trace dispatch',size:64,usage:GPUBufferUsage.UNIFORM,mappedAtCreation:true});
-   {const u=new Uint32Array(uniform.getMappedRange()),f=new Float32Array(u.buffer);u.set([capacity,pointCapacity,hashCapacity,linkB]);f.set([rect.x,rect.y,rect.width,rect.height],4);u.set([arena.table.offset,0,runCapacity,0],8);u.set([arena.table.capacity,linkA,columns,arena.anchors],12);uniform.unmap();}
-   const list:[number,GPUBuffer][]=[[0,uniform],[1,source.lines],[2,source.intervals],[3,source.partitions],[4,source.status],[7,nodes],[8,work],[9,log]];
-   const group=this.device.createBindGroup({layout:explain.layout,entries:list.map(([binding,buffer])=>({binding,resource:{buffer}}))});
-   const pass=encoder.beginComputePass({label:'MAIN joining-step trace'});pass.setPipeline(explain.pipeline);pass.setBindGroup(0,group);pass.dispatchWorkgroups(Math.min(columns,Math.ceil(capacity/64)),Math.ceil(Math.ceil(capacity/64)/columns));pass.end();
-   const read=this.device.createBuffer({label:'MAIN joining-step trace readback',size:words*4,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});encoder.copyBufferToBuffer(log,0,read,0,words*4);
-   const sites=explain.sites;
-   this.traceTasks.push(()=>{void (async()=>{try{await read.mapAsync(GPUMapMode.READ);const decoded=decodeTrace(new Uint32Array(read.getMappedRange().slice(0)),sites);read.unmap();host.__mainTraceConnect={box,sites,...decoded};}catch(error){host.__mainTraceConnect={box,error:String(error)};}finally{read.destroy();log.destroy();uniform.destroy();}})();});
-  }
+
+
+
+
+
   let rounds=0;for(let jump=1;jump<capacity*2;jump*=2){dispatch('jump',linkA,linkB,capacity,++rounds);}
   if(rounds&1)dispatch('finishJumps',linkA,linkB,capacity);
   dispatch('roundReserve',linkA,linkB,capacity);dispatch('anchors',linkA,linkB,capacity);dispatch('assemble',linkA,linkB,capacity);dispatch('canonPackets',linkA,linkB,runCapacity);
@@ -1656,7 +1615,7 @@ export class GpuConstructionRuns {
   for(const buffer of this.retiredWork.splice(0))buffer.destroy();for(const buffer of this.gpuIndexedParams.splice(0))buffer.destroy();
   const heap=this.arena?.heap;for(const range of this.released.splice(0))heap?.release(range.offset,range.words);
   if(heap)Object.assign(constructionArena,{usedBytes:(heap.capacity-heap.freeWords)*4,freeBytes:heap.freeWords*4});
-  for(const task of this.traceTasks.splice(0))task();
+
  }
  dispose():void{this.submitted();this.gpuIndexedEmptyPlaneFaces.destroy();this.arena?.buffer.destroy();this.arena=undefined;this.slots.clear();this.retiring.clear();this.released.length=0;this.styleSnapshot.clear();for(const buffer of this.spare.values())buffer.destroy();this.spare.clear();for(const buffer of this.active)buffer.destroy();this.active.clear();}
 }

@@ -28,19 +28,19 @@ export interface SourceSemanticResidual {
  readonly toneRegions?:ToneRegions;
  /** Compiled construction levels (compiled-construction-topology.ts compileEdgeLevels), header words 28/29; absent keeps all. */
  readonly edgeLevels?:Uint32Array;
- /** perf-impl-108 parent member adequacy (compileMeshProfileSafe), compiled with
-  * this source revision; header word 30: 0 unknown (every older residual: the
-  * member keeps its incumbent single representation), 1 safe, 2 not safe. */
+
+
+
  readonly profileSafe?:boolean;
- /** perf-impl-109 compiled limb-vertex table (compiled-construction-topology
-  * compileLimbVertices), header words 31/32 after the levels; absent: no limb
-  * (the GPU-derived run program then carries no limb table, the incumbent). */
+
+
+
  readonly limbVertices?:Uint32Array;
- /** perf-impl-110 source-owned soft-part packet, header words 33/34 after
-  * the limb table. The packet contains one record per section/band plus a
-  * one-word original-halfedge membership table. Older packets omit this
-  * section and keep incumbent soft playback; records are source-revision-owned,
-  * not projected runs. */
+
+
+
+
+
  readonly partPrograms?:Uint32Array;
  /** Source-owned whole parent construction for baked/numeric residency,
   * header words 35/36. Older packets omit it and remain unknown/incumbent. */
@@ -106,9 +106,9 @@ export function encodeSourceSemanticResidual(source:SourceSemanticResidual,ident
  words[26]=source.contactMembers;words[30]=source.profileSafe===undefined?0:source.profileSafe?1:2;words.set(identity,40);return new Uint8Array(words.buffer);
 }
 
-/** perf-impl-108: the compiled parent member verdict alone (header word 30),
- * O(1): true safe, false not safe, undefined unknown (an older residual, or not
- * a semantic packet); the caller keeps the incumbent for undefined. */
+
+
+
 export function semanticProfileSafe(bytes:Uint8Array|undefined):boolean|undefined{
  if(!bytes||bytes.byteOffset%4||bytes.byteLength<HEADER_WORDS*4)return undefined;
  const words=new Uint32Array(bytes.buffer,bytes.byteOffset,HEADER_WORDS);

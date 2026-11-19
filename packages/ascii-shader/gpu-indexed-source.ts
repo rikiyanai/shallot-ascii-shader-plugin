@@ -15,12 +15,12 @@ import {sameStorageBinding,SourceStorage,type SourceStorageRange} from './source
  */
 export const GPU_INDEXED_SOURCE_API_VERSION=1;
 export type GpuIndexFormat='uint32';
-/** Producer-authored part ownership, not a reconstruction from rendered pixels.
- * Each vertex's low24 bits are its cell x/y/z (8 bits each); bits 24-31 its
- * quad's face direction (0 +x, 1 -x, 2 +y, 3 -y, 4 +z, 5 -z; the MAIN cell
- * chart reads it, perf-impl-116, and treats any other value as unsupported).
- * All six faces of each declared cell are present. Native geometry remains
- * authoritative. */
+
+
+
+
+
+
 export interface GpuIndexedClosedCellParts {
  readonly kind:'closed-cells';
  readonly extent:readonly [number,number,number];
@@ -63,10 +63,10 @@ export interface GpuIndexedSourcePose {
  readonly sourceId:string;
  readonly generation:number;
  readonly posedRevision:number;
- /** perf-impl-114: OPTIONAL. Changes exactly when the posed vertex CONTENT may
-  * change (source generation, instance transform, a deforming vertex stage).
-  * posedRevision is a per-capture serial; only this field certifies that two
-  * captures hold the same posed geometry. Absent: nothing persists. */
+
+
+
+
  readonly posedContentRevision?:number;
  readonly vertices:GPUBufferBinding;
  readonly attributes:GPUBufferBinding;

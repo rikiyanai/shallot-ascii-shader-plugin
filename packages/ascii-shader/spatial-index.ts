@@ -2,9 +2,9 @@
  * acceptance. A caller's exact culler still decides individual instances. */
 export type SpatialBounds=readonly [number,number,number,number,number,number];
 type Entry<T>={bounds:SpatialBounds;value:T;node?:Node<T>};
-/** revision: bumped on the path to the root by every insert/detach below.
- * box/values: the tight aggregate of the subtree, rebuilt lazily when the
- * revision they were built at is stale (perf-impl-95 octree representation). */
+
+
+
 type Node<T>={id:number;low:[number,number,number];size:number;parent?:Node<T>;children:(Node<T>|undefined)[];entries:Set<Entry<T>>;count:number;revision:number;box?:{revision:number;bounds:SpatialBounds};values?:{revision:number;list:T[]}};
 function contains<T>(node:Node<T>,b:SpatialBounds):boolean{
  return b[0]>=node.low[0]&&b[1]>=node.low[1]&&b[2]>=node.low[2]&&
@@ -28,7 +28,7 @@ export class SpatialIndex<K,T>{
  private readonly entries=new Map<K,Entry<T>>();
  private readonly unbounded=new Set<Entry<T>>();
  private readonly stack:Node<T>[]=[];
- /** perf-impl-96: a node keeps its id for its whole life (its parent aggregate's key). */
+
  private nodeIds=0;
  private node(low:[number,number,number],size:number,parent?:Node<T>):Node<T>{return {id:++this.nodeIds,low,size,parent,children:[],entries:new Set(),count:0,revision:0};}
  /** Reports changed membership, bounds or value identity. Unchanged notifications must not force
@@ -113,10 +113,10 @@ export class SpatialIndex<K,T>{
   for(const child of node.children)if(child?.count)list.push(...this.members(child));
   node.values={revision:node.revision,list};return list;
  }
- /** REPRESENTATION SELECTION (perf-impl-95): a node of two or more members
-  * whose tight box passes `adequate` is emitted ONCE through `parent` and
-  * its subtree is not traversed; otherwise its entries are visited and its
-  * children traversed, as query() does. Frustum rejection is unchanged. */
+
+
+
+
  select(planes:ArrayLike<number>,adequate:(bounds:SpatialBounds)=>boolean,parent:(bounds:SpatialBounds,values:readonly T[],key:number)=>void,visit:(value:T)=>void,offset=0):void{
   for(const entry of this.unbounded)visit(entry.value);
   const stack:Node<T>[]=[];if(this.root)stack.push(this.root);

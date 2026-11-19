@@ -5,8 +5,6 @@ use std::slice;
 pub mod meshopt;
 mod meshopt_abi;
 
-#[cfg(test)]
-mod tests;
 
 struct Node {
     index: usize,

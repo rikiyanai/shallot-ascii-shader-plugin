@@ -48,6 +48,5 @@
   "artifactSha256": "2e4b54faa731b995e8db46db3efaae082bb505a99e215d9487e23d8955a159ee",
   "gzipByteLength": 552735,
   "gzipBytes": 552735,
-  "compressedArtifactSha256": "e59da83ff5a53950db5ca0fae83eaa029b1d385d5734414cba5d411e876502dd",
-  "generatedBy": "tools/compile-main-role-bank.mjs"
+  "compressedArtifactSha256": "e59da83ff5a53950db5ca0fae83eaa029b1d385d5734414cba5d411e876502dd"
 }

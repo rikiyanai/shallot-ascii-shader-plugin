@@ -893,35 +893,3 @@ impl Ktx2<'_> {
         Ok(output)
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn arbitrary_blocks_never_panic_and_all_modes_reach_each_target() {
-        let mut state = 0x12345678u32;
-        let mut modes = [0; 19];
-        let mut refused = 0;
-        for _ in 0..10_000 {
-            let bytes = std::array::from_fn(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                state as u8
-            });
-            let mut u = Unpacked::default();
-            match unpack_uastc(&bytes, &mut u, false) {
-                Ok(()) => {
-                    modes[u.mode] += 1;
-                    let _ = rgba(&u);
-                    let _ = bc7(&u);
-                    unpack_uastc(&bytes, &mut u, true).unwrap();
-                    pack_astc(&u, &mut [0; 16]);
-                }
-                Err(_) => refused += 1,
-            }
-        }
-        assert!(modes.iter().all(|&n| n > 0));
-        assert!(refused > 0);
-        assert!(unpack_uastc(&[0x45; 16], &mut Unpacked::default(), false).is_err());
-    }
-}

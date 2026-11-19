@@ -72,7 +72,7 @@ export interface CompiledNativeSample {
   readonly words:readonly CompiledNativeWord[];
   readonly anchors?:readonly CompiledNativeAnchor[];
   readonly spans?:readonly CompiledNativeSpan[];
-  /** Reversible UI constraints are evidence for this exact sample only. */
+
   readonly sourceDoc?:Readonly<Record<string,unknown>>;
   readonly source:string;
   /** Physical samples retain the complete caller camera, never frame%96. */

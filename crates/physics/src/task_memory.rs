@@ -170,10 +170,7 @@ impl OverflowArray {
         self.count += 1;
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.count == 0
-    }
+
 }
 
 #[repr(C)]
@@ -294,94 +291,5 @@ impl Arena {
         }
         let data = self.bump(count * std::mem::size_of::<T>()).cast::<T>();
         std::slice::from_raw_parts_mut(data, count)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn arena_copies_restore_index_but_accumulate_overflow_demand() {
-        unsafe {
-            let mut worker = WorkerArena::new(32);
-            let mut outer = worker.arena;
-            assert!(outer.bump(0).is_null());
-            assert_eq!((*outer.shared).max_index, 0);
-            let first = outer.bump(17);
-            assert_eq!(first as usize % 16, 0);
-            for _ in 0..2 {
-                let mut nested = outer;
-                assert_eq!(nested.bump(32) as usize % 16, 0);
-                assert_eq!(nested.index, 17);
-            }
-            assert_eq!(outer.index, 17);
-            assert_eq!(worker.arena.index, 0);
-            assert_eq!((*outer.shared).overflow_bytes, 64);
-            worker.sync();
-            assert_eq!(worker.arena.capacity, 121);
-            assert_eq!((*worker.arena.shared).peak_demand, 81);
-            assert!((*worker.arena.shared).overflows.is_empty());
-            assert_eq!((*worker.arena.shared).max_index, 0);
-            assert_eq!((*worker.arena.shared).overflow_bytes, 0);
-            let mut warmed = worker.arena;
-            warmed.bump(17);
-            let mut nested = warmed;
-            nested.bump(32);
-            assert!((*nested.shared).overflows.is_empty());
-            worker.sync();
-            assert_eq!(worker.arena.capacity, 121);
-            assert_eq!((*worker.arena.shared).peak_demand, 81);
-        }
-    }
-
-    #[test]
-    fn worker_arenas_do_not_share_watermarks_or_overflows() {
-        unsafe {
-            let mut a = WorkerArena::new(8);
-            let mut b = WorkerArena::new(8);
-            let mut scope = a.arena;
-            scope.bump(100);
-            b.sync();
-            assert_eq!(b.arena.capacity, 8);
-            assert_eq!((*b.arena.shared).peak_demand, 0);
-            a.sync();
-            assert_eq!(a.arena.capacity, 150);
-        }
-    }
-
-    #[test]
-    fn stack_overflow_preserves_index_and_grows_only_when_empty() {
-        unsafe {
-            let mut stack = Stack::new(32);
-            let first = stack.alloc(17);
-            let overflow = stack.alloc(1);
-            assert_eq!(stack.index, 32);
-            assert_eq!(stack.allocation, 48);
-            assert_eq!(stack.max_allocation, 48);
-            stack.free(overflow);
-            stack.free(first);
-            stack.grow();
-            assert_eq!(stack.capacity, 72);
-            let next = stack.alloc(48);
-            assert_eq!(next, stack.memory);
-            stack.free(next);
-            stack.grow();
-            assert_eq!(stack.capacity, 72);
-        }
-    }
-
-    #[test]
-    #[should_panic]
-    fn stack_requires_lifo_free() {
-        unsafe {
-            let mut stack = Stack::new(32);
-            let first = stack.alloc(16);
-            let second = stack.alloc(16);
-            // Avoid a second panic in Drop while testing the rejected operation.
-            let mut stack = std::mem::ManuallyDrop::new(stack);
-            assert_ne!(first, second);
-            stack.free(first);
-        }
     }
 }

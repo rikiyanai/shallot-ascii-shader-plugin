@@ -23,7 +23,7 @@ export function frameState(controller){
   // In-view sources still compiling: absent from the shown drawing until ready.
   const pending=[...metadata,...frames].flatMap(f=>f.construction?.pending??[]);
   const losses=[...metadata,...frames].map(f=>f.construction?.unresolvedWords);
-  // Unknown legacy/stored observations are not evidence of zero loss.
+
   const unresolvedWords=losses.length&&losses.every(n=>Number.isFinite(n))?losses.reduce((n,value)=>n+value,0):undefined;
   const errors=[...controller.errors];
   const glyphs=metadata.reduce((n,f)=>n+f.glyphCount,0)+frames.reduce((n,f)=>n+f.chars.filter(c=>c[0]!==32&&c[0]!==0x3000).length,0),count=frames.length+metadata.length;

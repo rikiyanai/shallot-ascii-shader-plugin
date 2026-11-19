@@ -119,19 +119,19 @@ export class FixedOutputs {
     }
 }
 
-/** Whole-World rollback over ordered confirmations. Install PredictionPlugin to prepare and capture
- * explicit ticks and paced steps, and process confirmations at preFixed. One controller per World.
- * maxAhead defaults to 32 ticks beyond the latest confirmation (or construction tick until one
- * arrives). Paced steps drain to the latest available confirmation and replay once. This controller
- * owns World's time scale (0.8–1.5); a game's slow motion belongs to the server's simulation,
- * while World.pause remains local. Pacing adjusts the next step toward an initial lead up to two
- * ticks. One smoothed command-age sample per server tick raises the target for late inputs;
- * 32 samples with more than two ticks of arrival slack permit a one-tick reduction.
- * Duplicate feedback never counts. The target reserves min(8, maxAhead / 2) ticks for confirmation jitter. Delays beyond
- * the available prediction window cannot be hidden: prediction holds, including its interpolation
- * fraction, while frames continue, then resumes on confirmation. Explicit tick beyond the bound
- * throws before gameplay; World's failed-tick clock semantics apply.
- * Intent values and permissions belong to the game. */
+
+
+
+
+
+
+
+
+
+
+
+
+
 export class ClientPrediction {
     readonly receiver: ReplicationReceiver;
     readonly interpolation: ClientInterpolation;

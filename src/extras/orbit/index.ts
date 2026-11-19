@@ -323,7 +323,7 @@ const OrbitSystem: System = {
             let sizeImpulse = zoomReset ? 0 : smooth.zoomSizeImpulse.get(eid);
             const distanceBeforeInput = distO;
             const sizeBeforeInput = sizeO;
-            // Touch capture also holds pointer.left; reading mouse buttons here would orbit during pinch/pan.
+
             // Fly has no touch equivalent.
             const orbitButton = orbit.orbitButton.get(eid);
             const panButton = orbit.panButton.get(eid);

@@ -56,8 +56,8 @@ export interface MainRendererController {
   readonly frames:ReadonlyMap<number,MainTextFrame>;
   readonly residentFrames:ReadonlyMap<number,ResidentFrameState>;
   exportText():Promise<readonly MainTextFrame[]>;
-  /** perf-impl-121: demand one fresh canvas presentation (read/export consumers); resolves at the
-   * submission of the next frame that presented a canvas. Starts no capture. */
+
+
   requestPresentation():Promise<void>;
   readonly errors:readonly string[];
   readonly graphs:ReadonlyMap<number,readonly PosedGraph[]>;
@@ -128,13 +128,13 @@ function sourceLod(world:World,view:View,materials:readonly MaterialGeometryDraw
  frameOwners(world,state);
  const staging=world.resource(RenderContext).viewStaging,offset=view.slot*VIEW_BYTES/4;
   const clip=staging.subarray(offset,offset+16),rect0=view.viewport??{width:view.surfaceTexture?.width??view.width,height:view.surfaceTexture?.height??view.height};
-  // OCTREE REPRESENTATION (perf-impl-95): a node whose tight box fits one
+
   // native cell is ONE far representation; otherwise its children are visited.
   const workset=sourceViewWorkset(world,view.slot,staging.subarray(offset+32,offset+35),bounds=>fitsParentTier(bounds,clip,view.width,view.height,rect0.width,rect0.height));if(!workset)return;
  const phases=world.resource(PhaseGeometryCapture).views.get(view)??[];
  const known=materials.every(draw=>draw.mesh!==undefined&&!!draw.sourceGeometry&&!draw.gpuIndexedSource)&&phases.every(draw=>draw.renderer.geometryAdapter==='standard-material');
  const rect=view.viewport??{width:view.surfaceTexture?.width??view.width,height:view.surfaceTexture?.height??view.height};
- // perf-impl-108 PARENT TIER. Member adequacy is the source's COMPILED verdict (its
+
  // semantic residual, this revision); unknown keeps the incumbent (not safe).
  const profiles=new Map(materials.flatMap(draw=>draw.mesh!==undefined?[[draw.mesh,state.sources.profileSafe(draw)===true] as const]:[]));
  const profileSafe=(mesh:number)=>profiles.get(mesh)===true;
@@ -151,9 +151,9 @@ function sourceLod(world:World,view:View,materials:readonly MaterialGeometryDraw
  parentHolds.set(holdScope,selection.heldParents??new Set(),selection.heldSmall??new Set());
  return selection;
 }
-/** perf-impl-108: the parent group ids drawn last frame, per host LOD scope. */
+
 const parentHolds=new ParentHolds();
-/** perf-impl-108: one compiled parent representation cache per world. */
+
 const parentCaches=new WeakMap<World,ParentGroupCache>();
 
 /** Runs inside the engine colour phase, BEFORE its postFX. The original
@@ -202,7 +202,7 @@ function build(world:World):void{
   state.semanticOwners=new Set([...world.query([Text])].map(eid=>world.ref(eid)));
   state.sources.collect(mesh=>world.resource(Meshes).has(mesh as MeshHandle));
   state.construction.retire(owner=>state.sources.isLive(owner.domain)&&(owner.kind==='producer-row'||state.liveOwners.has(owner.lifetime)));
-  // A far aggregate (source 0, perf-impl-97) is rebuilt from the same frame's
+
   // field every publication; it owns no registered source to outlive.
   state.targets.forEach(target=>target.presentation.retire(owner=>owner.source===SEMANTIC_TEXT_DOMAIN?state.semanticOwners.has(owner.reference):owner.source===0||state.sources.isLive(owner.source)&&(owner.kind==='producer-row'||state.liveOwners.has(owner.reference))));
   const jobs=new Map<number,TargetJob>();
@@ -340,7 +340,7 @@ function build(world:World):void{
     if(!primary)fields.appendAll(encoder,field,fieldInputs(world,world.resource(PhaseGeometryCapture).views.get(view)??[],resident));
     // The field is complete: reduce its one per-form nearest-depth table
     // before the relation, underdrawing, tone and articulation passes read it.
-    // perf-impl-108: the held per-form level (form-depths.ts resolveLod) is
+
     // scoped to this camera lifetime and world, with the same rows-per-pixel
     // the relation stage measures (17 native pixels per exported row).
     const lodPage=view.viewport?[view.viewport.width,view.viewport.height]:[job.width,job.height];
@@ -359,7 +359,7 @@ function build(world:World):void{
     const unresolved:string[]=[];const gpuPoses=new Map<number,GPUBufferBinding>();
     const relationView={clipFromWorld:clip,eye:pose.eye,direction:pose.forward,perspective:pose.perspective};
     state.graph.begin(encoder,{...relationView,pageExtent:view.viewport?[view.viewport.width,view.viewport.height]:[job.width,job.height]},field);
-    // REPRESENTATION FRONTIER stage 1 (perf-impl-92): the sources whose
+
     // material draws own texels of THIS field. Their unseen entity instances
     // produce no relations (surface-relations.ts instanceUnseen).
     state.graph.fieldDomains=new Set(fieldInputs(world,world.resource(PhaseGeometryCapture).views.get(view)??[],resident).flatMap(input=>input.sourceDomain===undefined?[]:[input.sourceDomain]));
@@ -392,7 +392,7 @@ function build(world:World):void{
       state.graph.reservePartAnchors(posedBatches);
       state.graph.appendContactsAll(encoder,posedBatches);
       const pass=encoder.beginComputePass({label:'MAIN source relations'});
-      // PER-INSTANCE LEVELS (perf-impl-94): a MIXED mesh produces relations
+
       // only for its full members (GPU owner selection); its far members are
       // the far-form class below. Without a far form every member stays full.
       try{for(const item of posedBatches)state.graph.append(encoder,item.batch,item.source,relationView,item.domain,state.playback?fullMembers(item.batch.source):selectedEntities,pass);}
@@ -409,7 +409,7 @@ function build(world:World):void{
     // Snapshot the geometry lines for EVERY text job, not the current UI flag.
     // This pair remains valid if overlay is toggled during asynchronous readback.
     // Compiled tone consumes these exact construction boundaries even when
-    // the operator hides the overlay. Presentation never changes the drawing.
+
     state.underlay.encode(encoder,visible,job.underlay,job.width,job.height,rect,job.records.length===0,state.playback||state.controller.underlay||state.controller.overlay?field:undefined,keyLight(world));
     const labels=collectNativeLabels(world,eid,clip,rect);
     // One material-ink table for this view's lines and tone (MATERIAL INK).
@@ -429,7 +429,7 @@ function build(world:World):void{
       const mixed=mixedFar(draw);
       return [{domain:source.domain,topologyRevision:source.geometry.revision,...source.analysis},...(mixed?[{domain:mixed.form.domain,topologyRevision:mixed.form.revision,...mixed.form.analysis,farForms:{domain:mixed.form.domain,instances:mixed.members}}]:[])];
     }):[];
-    // THE FAR AGGREGATES (perf-impl-96, the parent construction). ONE record per
+
     // adequate octree node, its members listed by the domain their pixels carry
     // (a wholly far mesh's compiled far form, or a mixed mesh's far form). A
     // member whose mesh resolved to the full producer draws itself and is not
@@ -535,7 +535,7 @@ function sceneMaterialInks(world:World):Uint32Array{
   return materialInkTable(pairs);
 }
 
-// perf-impl-120 EXAMPLES MANAGED PRESENTATION (changed-only canvas
+
 // acquisition). Before BeginFrame acquires any canvas, MAIN/PresentationGate
 // requests ONE ticket per canvas context only when what that canvas shows
 // would change: a view MAIN does not replace (scene data, other canvases), a
@@ -549,11 +549,11 @@ function sceneMaterialInks(world:World):Uint32Array{
 // cameras share their canvas's one ticket; separate canvases own their own.
 type CanvasPresentationView=View&{presentationTicket?:unknown;presentationTargetless?:boolean};
 const presentedCanvas=new WeakMap<GPUCanvasContext,string>();
-// perf-impl-125: the FENCED presentation ledger per controller (serials,
+
 // request epochs, demands; presentation-ledger.ts, PhysicalFrame's mechanics).
 const presentationLedgers=new WeakMap<object,PresentationLedger<GPUCanvasContext>>();
 const presentationLedger=(controller:object)=>{let ledger=presentationLedgers.get(controller);if(!ledger){ledger=new PresentationLedger<GPUCanvasContext>();presentationLedgers.set(controller,ledger);}return ledger;};
-// perf-impl-123: the key names WHAT the canvas shows (ASCII / underlay /
+
 // overlay), not only its size and text mode, so returning from a live-scene
 // mode re-presents the page instead of keeping the mesh on screen.
 const canvasKey=(state:MainState,view:View)=>{const c=state.controller;return `${view.canvas!.width}x${view.canvas!.height}|${c.mode}|${c.paused}|${c.ascii}|${c.underlay}|${c.overlay}`;};
@@ -582,7 +582,7 @@ function presentationGate(world:World):void{
 }
 function present(world:World,views:readonly View[]):void{
   const state=world.resource(stateKey).current;if(!state)return;const encoder=world.frameEncoder()!;
-  // perf-impl-125: this encode's serial and request epoch. A canvas whose ticket
+
   // was honoured shows this frame's key, its targets' pages become displayed and
   // exported, and the demands up to this epoch resolve, ONLY when this
   // submission's frame fence fulfils (never at encode or submission).
@@ -618,7 +618,7 @@ function present(world:World,views:readonly View[]):void{
     // a still decision can need: the job's own frame and every other
     // non-pending frame (a change is confirmed by frames N, N+2, N+4).
     if(target?.appearance&&(target.appearance.watched?.frame===world.gpu.frame||!target.pending&&((world.gpu.frame-(target.appearance.watched?.frame??0))&1)===0))target.appearance.encode(encoder,view.surfaceTexture,world.gpu.frame);
-    // perf-impl-120: not acquired this frame (the engine stand-in): the canvas
+
     // keeps the page it shows; nothing is rasterized, copied or exported.
     if((view as CanvasPresentationView).presentationTargetless)continue;
     if(!target?.native||target.error){
@@ -659,7 +659,7 @@ function present(world:World,views:readonly View[]):void{
   const snapshotLease=ledger.retainSnapshots(submittedResident.map(([,snapshot])=>snapshot),releaseRetired);
   const jobs=state.jobs;state.jobs=[];
   world.onFrameSubmit(()=>{
-    // perf-impl-125: publication waits for THIS submission's fence; a rejected
+
     // fence publishes nothing (the prior page stays displayed and exported,
     // demands stay pending), and an older fence never overwrites a newer serial.
     const commit=():void=>{
@@ -796,13 +796,13 @@ async function publishRetained(state:MainState,job:TargetJob):Promise<void>{
 export function mainRenderer(options:{ascii?:boolean;geometryCapacity?:number;whitespace?:NativeWhitespacePolicy;compiledPlayback?:boolean}={}):Plugin{
   return {name:'Shallot MAIN',gpu:{features:['indirect-first-instance']},dependencies:[StandardRenderingPlugin,MeshRenderPlugin],
     systems:[{name:'MAIN/CellMatrix',group:'draw',first:true,before:[PrepareViewsSystem],update(world){world.resource(stateKey).current?.matrix.apply(world);}},
-      // perf-impl-120: views bound and sized, before any canvas acquisition.
+
       {name:'MAIN/PresentationGate',group:'draw',first:true,after:[PrepareViewsSystem],before:[BeginFrameSystem],update:presentationGate},
       {name:'MAIN/Geometry',group:'draw',after:[MainPassSystem],before:[TonemappingSystem],update:build}],
     async initialize(world,onProgress){
       const device=world.gpu.device!;
       const matrix=cellMatrix(world);
-      // Operator order 2026-11-08: the compiled GPU playback is the default;
+
       // ?grammar=legacy keeps the CPU producer reachable until it is deleted.
       const compiled=options.compiledPlayback??new URL(location.href).searchParams.get('grammar')!=='legacy';
       const startupAbort=new AbortController();
@@ -812,7 +812,7 @@ export function mainRenderer(options:{ascii?:boolean;geometryCapacity?:number;wh
       try{state={matrix,displayedSnapshots:new Map(),retiredSnapshots:[],world:++nextWorld,transport:services.transport,graph:services.graph,sources:services.sources,visibility:services.visibility,relationExtent:32768,intervalExtents:[131072,131072],construction:new NativeConstruction(glyphs,options.whitespace??'preformatted'),primaryFields:new WeakMap(),lodLifetimes:new FormLodLifetimes(),fields:new Map(),underlay:services.underlay,targets:new Map(),jobs:[],controller:{ascii:options.ascii??true,overlay:new URL(location.href).searchParams.get('overlay')==='1',mode:'text',get rows(){return matrix.rows;},set rows(rows){if(rows!==undefined&&(!Number.isInteger(rows)||rows<1||rows>matrix.maxRows))throw Error(`Rows must be an integer from 1 to ${matrix.maxRows}`);matrix.rows=rows;},get pending(){return !!state.registration||this.paused&&!state.pauseLatched||[...state.targets.values()].some(target=>target.pending);},underlay:new URL(location.href).searchParams.get('underdrawing')==='1',paused:false,pause(paused){if(paused===this.paused)return;state.pauseLatched=false;this.paused=paused;if(paused)world.pause();else world.resume();},frames:new Map(),residentFrames:new Map(),async exportText(){const entries=[...state.displayedSnapshots];if(!entries.length)return [...this.frames.values()];return Promise.all(entries.map(async([target,snapshot])=>{const frame={...await exportResidentFrame(snapshot),comparison:snapshot.comparison};if(state.displayedSnapshots.get(target)===snapshot)this.frames.set(target,frame);return frame;}));},requestPresentation(){return presentationLedger(this).demand();},graphs:new Map(),errors:[]},serial:0,disposed:false,liveOwners:new Set(),semanticOwners:new Set(),pauseLatched:false};}
       catch(error){services.dispose();throw error;}
       world.resource(stateKey).current=state;
-      // perf-impl-125: a demand pending at disposal rejects; no late fence publishes.
+
       world.onDispose(()=>presentationLedger(state.controller).dispose());
       let disposeControls:(()=>void)|undefined;
       // Register lifetime cleanup BEFORE awaiting driver compilation: an

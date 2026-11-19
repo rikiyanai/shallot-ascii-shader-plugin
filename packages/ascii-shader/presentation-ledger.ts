@@ -1,22 +1,22 @@
-/** FENCED PRESENTATION LEDGER of the examples renderer (perf-impl-125; the same
- * mechanics as PhysicalFrame's fenced publication: a serial captured at encode,
- * request epochs, publication only when that submission's frame fence
- * fulfils).
- *
- * - Every `present()` encode takes the next monotonic `serial` and the current
- *   request `epoch`.
- * - Canvas acknowledgement (what a canvas shows) and target publication
- *   (displayed snapshot / exported frame) happen only in the fence's
- *   fulfilment, and only for the newest serial per canvas and per target: an
- *   older fence that resolves late never overwrites a newer publication.
- * - A rejected fence (device loss, failed submission) publishes nothing: the
- *   prior presentation stays authoritative and pending demands stay pending.
- * - A demand (`requestPresentation`) made after an encode is answered only by
- *   a later presented frame, never by the encode it raced.
- * - Disposal rejects every pending demand.
- * Resource submission bookkeeping (stage `submitted()` calls and non-snapshot
- * retired resources) is not owned here. Candidate snapshot leases are tracked
- * here because their lifetime crosses the fence. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 export interface PresentationSnapshotLease {
   /** Release this submission's ownership. Safe to call more than once. */
   release(): void;

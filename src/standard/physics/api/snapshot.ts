@@ -167,8 +167,8 @@ type SnapshotState = {
     bindings?: unknown;
 };
 
-/** Capture logical state and kernel regions, retaining opaque userData values, with an owner's plain
- * `bindings`. Refuses a stepping world or a sibling snapshot during a callback on the same kernel. */
+
+
 export function snapshot(state: WorldState, bindings?: unknown): PhysicsSnapshot {
     if (state.locked) throw new Error("physics: cannot snapshot a world while it is stepping");
     assertQueryWorld(state.ecsState, state.worldId);
