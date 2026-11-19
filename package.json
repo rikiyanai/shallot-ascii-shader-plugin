@@ -1,0 +1,23 @@
+{
+  "name": "shallot-ascii-shader-plugin",
+  "version": "0.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "packageManager": "bun@1.4.3",
+  "exports": {
+    ".": "./packages/ascii-shader/plugin.ts"
+  },
+  "dependencies": {
+    "@dylanebert/shallot": "0.11.0-next.0",
+    "typegpu": "0.12.8",
+    "wgsl_reflect": "1.6.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "@types/node": "26.6.3",
+    "@webgpu/types": "0.1.74",
+    "typescript": "7.0.2",
+    "vite": "8.3.1"
+  }
+}

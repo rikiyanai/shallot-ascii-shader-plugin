@@ -1,0 +1,14 @@
+Shallot engine sources are derived from dylanebert/shallot at
+04e449e6b127b59156476ebd39cb2f49410cb214.
+Copyright and MIT license: LICENSE-SHALLOT.
+Additional BOX3D terms: LICENSE-BOX3D.
+Other upstream notices are retained beside the corresponding source.
+
+The BR52 locomotive model is licensed under CC BY 4.0. Its original credit
+and source are retained in examples/train-set/src/controls.ts.
+
+Xanh Mono is provided under the SIL Open Font License; its original notice
+is retained at assets/font/XanhMono-OFL.txt. Saitamaar and GodotGrass font rights,
+derived glyph/grammar rights, and the complete file-level provenance review
+are unresolved. This private working copy grants no redistribution license
+for those materials and is not approved for publication.
