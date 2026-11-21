@@ -487,7 +487,7 @@ export class PhysicalSourceTransport {
      const storageRanges=allocateStorageRanges({vertices:{storage:this.posedVertices,data:bytes},attributes:{storage:this.posedAttributes,data:bytes},metadata:{storage:this.catalog,data:new Uint32Array([g.indices.length,size,0,0,0,0,0,0])}});
      const storage={identity:{},vertices:this.posedVertices.binding(storageRanges.vertices),attributes:this.posedAttributes.binding(storageRanges.attributes),metadata:this.catalog.binding(storageRanges.metadata)};
      const range=this.arena.allocate(size),bounds=this.arena.bounds,visibleInstances=this.arena.visibility;
-     retained={mesh:source,storageRanges,range,batch:{vertices:storage.vertices.buffer,attributes:storage.attributes.buffer,metadata:storage.metadata.buffer,storage,source:{vertexCapacity:count,indexBase:0,cullMode:1,instanceCapacity:size,bounds,visibleInstances,visibleInstanceOffset:range.base}},members:[],matrices:new Float32Array(size*16),revision:0,slots:[],settling:new Set()};this.batches.set(key,retained);
+     retained={mesh:source,storageRanges,range,batch:{vertices:storage.vertices.buffer,attributes:storage.attributes.buffer,metadata:storage.metadata.buffer,storage,source:{vertexCapacity:count,indexBase:0,cullMode:1,instanceCapacity:size,bounds,visibleInstances,visibleInstanceOffset:range.base,physicalUniformProducerRows:true}},members:[],matrices:new Float32Array(size*16),revision:0,slots:[],settling:new Set()};this.batches.set(key,retained);
     }
     changed.length=0;
     for(let index=0;index<size;index++){
