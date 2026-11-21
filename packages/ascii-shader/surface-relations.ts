@@ -2570,7 +2570,7 @@ export const SURFACE_PART_ANCHOR_BINDINGS={
  partAnchorClear:[0,17],
  // The generation-owned cache and current-frame marker live in the source
  // packet. Projection reads that marker and never re-walks canonical samples.
- partAnchors:[0,1,2,3,4,8,10,16,17,19],
+ partAnchors:[0,2,3,4,8,10,16,17,19],
 } as const;
 // Direct and batched stages share their bodies and resource contract. Frontier
 // compilation moved partCodes/anchor input from certification to vertex marking.
