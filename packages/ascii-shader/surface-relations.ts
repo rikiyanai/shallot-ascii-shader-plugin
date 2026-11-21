@@ -1651,6 +1651,42 @@ fn contactEdgeAt(id:u32){
   }
  }
 }
+// contactEdges links each coincident source edge by atomic insertion order.
+// The sort dispatch uses the SAME full/residual edge domain and indirect
+// extent as contactEdges. Only the canonical minimum source edge of each
+// bucket sorts its existing chain, so this remains one bounded pass over the
+// producer's edge work rather than a scan of every hash bucket.
+@compute @workgroup_size(64) fn contactSort(@builtin(global_invocation_id) gid:vec3u){contactSortAt(gid.x+gid.y*params.owners[3].w*64u);}
+fn contactSortAt(id:u32){
+ if(!posedContacts()||native[0]==0u){return;}
+ let residual=residualReady();var edgeId=id;
+ if(residual){if(id>=residualEdgeCount()){return;}edgeId=residualEdgeAt(id);}
+ else if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}
+ // The existing canonical bucket header is the membership certificate. An
+ // edge that contactEdges excluded cannot own a bucket; do not recertify its
+ // chart geometry here or pull the chart classifier into this integer stage.
+ let key=posedEdgePorts(edgeId);if(key.x==key.y){return;}
+ let slots=contactSlots();let slot=posedEdgeSlot(edgeId);if(slot==NO_CONTACT){return;}
+ // contactEdges atomically keeps the minimum source edge in the bucket
+ // header. Exactly that invocation owns the in-place sort.
+ if(atomicLoad(&contactWork[slots+slot])!=edgeId+1u){return;}
+ var current=atomicLoad(&contactWork[slots*2u+slot]);var sorted=0u;
+ loop{
+  if(current==0u){break;}
+  let next=atomicLoad(&contactWork[slots*3u+(current-1u)]);
+  if(sorted==0u||current<sorted){
+   atomicStore(&contactWork[slots*3u+(current-1u)],sorted);sorted=current;
+  }else{
+   var previous=sorted;var after=atomicLoad(&contactWork[slots*3u+(previous-1u)]);
+   loop{if(after==0u||after>current){break;}previous=after;after=atomicLoad(&contactWork[slots*3u+(previous-1u)]);}
+   atomicStore(&contactWork[slots*3u+(current-1u)],after);atomicStore(&contactWork[slots*3u+(previous-1u)],current);
+  }
+  current=next;
+ }
+ // Boundary traversal starts at the per-bucket tail word. It now walks the
+ // same ascending source-edge order as the historical nested selector.
+ atomicStore(&contactWork[slots*2u+slot],sorted);
+}
 fn contactMatches(a:u32,b:u32,instance:u32)->bool{
  let x=halfedge(a);let y=halfedge(b);let p=position(x.x,instance);let q=position(x.y,instance);
  if(!edgeInDraw(x.z)||!edgeInDraw(y.z)){return false;}
@@ -2681,6 +2717,9 @@ function ordinaryDirectSurfaceRelationsShader(source:string):string{
  if(sourceV>=min(sourceFaceCount()*2u,native[0]/6u*4u)){return;}`);
  specialized=replaceWgslFunctionSnippet(specialized,'contactEdgeAt',` let residual=residualReady();var edgeId=id;if(residual){if(id>=residualEdgeCount()){return;}edgeId=residualEdgeAt(id);}else if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}`,` var edgeId=id;if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}`);
  specialized=replaceWgslFunctionSnippet(specialized,'contactEdgeAt','if(!residual&&voxelEdgeCoarse(edgeId)){return;}','');
+ specialized=replaceWgslFunctionSnippet(specialized,'contactSortAt',` let residual=residualReady();var edgeId=id;
+ if(residual){if(id>=residualEdgeCount()){return;}edgeId=residualEdgeAt(id);}
+ else if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}`,` var edgeId=id;if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}`);
  return specialized;
 }
 export const SURFACE_RELATIONS_GENERIC_DIRECT_ORDINARY_SHADER=ordinaryDirectSurfaceRelationsShader(SURFACE_RELATIONS_SHADER);
@@ -2756,6 +2795,7 @@ ${batchEntry('batchPartAnchors','partAnchorAt(id);')}
 ${batchEntry('batchPrepareFrontier','if(local==0u){prepareIn();}')}
 ${chartEntry('batchContactVertices','contactVertexAt(id);')}
 ${chartEntry('batchContactEdges','contactEdgeAt(id);')}
+${chartEntry('batchContactSort','contactSortAt(id);')}
 ${batchEntry('batchBoundaryLines','boundaryAt(id);')}
 ${batchEntry('batchContourLines','contourAt(id);')}
 @compute @workgroup_size(64) fn batchPrepareInterior(@builtin(workgroup_id) wid:vec3u,@builtin(local_invocation_index) local:u32){batchEnter(wid.x);prepareInteriorIn(local);}
@@ -2774,10 +2814,10 @@ export const SURFACE_RELATIONS_BATCH_SHADER=makeBatchShader(SURFACE_RELATIONS_SH
  * their producer-owned chart. No chart or cave/frontier helper is reachable
  * from the line or anchor stages. */
 export const SURFACE_RELATIONS_PHYSICAL_BATCH_SHADER=makeBatchShader(SURFACE_RELATIONS_PHYSICAL_SHADER,true);
-type BatchStage='partAnchorClear'|'partAnchors'|'prepareFrontier'|'contactClear'|'voxelVote'|'voxelBin'|'chartCorners'|'chartCertify'|'chartSelectStage'|'chartEmit'|'chartPublish'|'contactVertices'|'contactEdges'|'boundaryLines'|'contourLines'|'prepareInterior'|'faceDifferentials'|'radialCurvature'|'suggestiveContours'|'principalCurvature'|'ridgeDerivative'|'ridgeLines'|'viewFaceLines';
+type BatchStage='partAnchorClear'|'partAnchors'|'prepareFrontier'|'contactClear'|'voxelVote'|'voxelBin'|'chartCorners'|'chartCertify'|'chartSelectStage'|'chartEmit'|'chartPublish'|'contactVertices'|'contactEdges'|'contactSort'|'boundaryLines'|'contourLines'|'prepareInterior'|'faceDifferentials'|'radialCurvature'|'suggestiveContours'|'principalCurvature'|'ridgeDerivative'|'ridgeLines'|'viewFaceLines';
 /** Global stage order. Per source it is the per-source order (contacts, lines,
  * prepareInterior, tensor, view lines); sources write disjoint ranges. */
-const BATCH_ORDER:readonly BatchStage[]=['partAnchorClear','prepareFrontier','contactClear','voxelVote','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','boundaryLines','contourLines','partAnchors','prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'];
+const BATCH_ORDER:readonly BatchStage[]=['partAnchorClear','prepareFrontier','contactClear','voxelVote','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','contactSort','boundaryLines','contourLines','partAnchors','prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'];
 const batchEntryName=(stage:BatchStage)=>'batch'+stage[0]!.toUpperCase()+stage.slice(1);
 // Direct and batched anchor dispatches execute the same projection body. It
 // links each complete record atomically; there is no second insertion owner.
@@ -2793,14 +2833,14 @@ export const SURFACE_CONTACT_BINDINGS={
  contactClear:[0,1,4,8,12],voxelVote:[0,1,2,4,8,12,13],voxelHome:[0,1,4,8,12],
  voxelBin:[0,1,2,4,8,12,13],chartCorners:[0,1,2,4,8,12,13],
  chartCertify:[0,1,4,8,12,18],contactVertices:[0,1,2,4,8,12,13,16],
- contactEdges:[0,1,2,4,8,12,13,14],chartSelectStage:[0,1,4,8,12],chartEmit:[0,1,2,3,4,5,6,8,10,11,12,15],chartPublish:[0,1,4,7,8,12],
+ contactEdges:[0,1,2,4,8,12,13,14],contactSort:[0,1,2,4,8,12],chartSelectStage:[0,1,4,8,12],chartEmit:[0,1,2,3,4,5,6,8,10,11,12,15],chartPublish:[0,1,4,7,8,12],
 } as const;
 const BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],...SURFACE_CONTACT_BINDINGS,boundaryLines:[0,1,2,3,4,5,6,8,10,11,12,15],contourLines:[0,1,2,3,4,5,6,8,10,11,12,15],prepareInterior:[0,1,2,3,4,6,7,8,9,10,11],faceDifferentials:[0,1,2,3,4,6,8,9],radialCurvature:[0,1,2,3,4,8,9],suggestiveContours:[0,1,2,3,4,5,6,8,9,15],principalCurvature:[0,1,2,3,4,8,9],ridgeDerivative:[0,1,2,4,8,9],ridgeLines:[0,1,2,3,4,5,6,8,9,15],viewFaceLines:[0,1,2,3,4,5,6,8,9,15]};
-const BATCH_INDIRECT_OFFSETS:Partial<Record<BatchStage,number>>={boundaryLines:0,contourLines:12,contactClear:24,contactVertices:36,contactEdges:48,partAnchors:72,voxelVote:84,voxelBin:108,chartCorners:120,chartCertify:132,faceDifferentials:24,radialCurvature:36,suggestiveContours:48,principalCurvature:36,ridgeDerivative:36,ridgeLines:48,viewFaceLines:48};
+const BATCH_INDIRECT_OFFSETS:Partial<Record<BatchStage,number>>={boundaryLines:0,contourLines:12,contactClear:24,contactVertices:36,contactEdges:48,contactSort:48,partAnchors:72,voxelVote:84,voxelBin:108,chartCorners:120,chartCertify:132,faceDifferentials:24,radialCurvature:36,suggestiveContours:48,principalCurvature:36,ridgeDerivative:36,ridgeLines:48,viewFaceLines:48};
 /** The physical shader's boundary no longer reaches partCodes or the chart;
  * binding 13 is therefore omitted from its host bind group. Generic and
  * GPU-indexed stages keep the producer-capable map above. */
-const PHYSICAL_BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...BATCH_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],contactClear:[0],voxelVote:[0],voxelBin:[0],chartCorners:[0],chartCertify:[0],chartSelectStage:[0],chartEmit:[0],chartPublish:[0],contactVertices:[0],contactEdges:[0],boundaryLines:BATCH_BINDINGS.boundaryLines.filter(binding=>binding!==12&&binding!==13),contourLines:BATCH_BINDINGS.contourLines.filter(binding=>binding!==12)};
+const PHYSICAL_BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...BATCH_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],contactClear:[0],voxelVote:[0],voxelBin:[0],chartCorners:[0],chartCertify:[0],chartSelectStage:[0],chartEmit:[0],chartPublish:[0],contactVertices:[0],contactEdges:[0],contactSort:[0],boundaryLines:BATCH_BINDINGS.boundaryLines.filter(binding=>binding!==12&&binding!==13),contourLines:BATCH_BINDINGS.contourLines.filter(binding=>binding!==12)};
 // Params grew by one vec4u for the per-source level prefix. The batch table
 // keeps its existing source/base/span trailer after the complete Params.
 const BATCH_ITEM_WORDS=68,BATCH_DISPATCH_WORDS=36;
@@ -3033,9 +3073,9 @@ export function tensorRevision(batch:{readonly source:{readonly posedRevision?:n
   if(!batch.gpuPose)return batch.source.posedRevision;
   const token=posedContentToken(batch);return token>1?token:undefined;
 }
-const SURFACE_RELATION_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','voxelVote','voxelHome','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','boundaries','contours','surfaceLines'] as const;
+const SURFACE_RELATION_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','voxelVote','voxelHome','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','contactSort','boundaries','contours','surfaceLines'] as const;
 const SURFACE_RELATION_GENERIC_DIRECT_ENTRIES=[...SURFACE_RELATION_ENTRIES.filter(entry=>entry!=='surfaceLines'),'boundariesVoxel','contoursVoxel'];
-const SURFACE_RELATION_GENERIC_DIRECT_ORDINARY_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','contactVertices','contactEdges','boundaries','contours'] as const;
+const SURFACE_RELATION_GENERIC_DIRECT_ORDINARY_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','contactVertices','contactEdges','contactSort','boundaries','contours'] as const;
 const SURFACE_RELATION_INTERIOR_ENTRIES=['prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'] as const;
 // The batched entries exist only with the interior stages (the physical path).
 const SURFACE_RELATION_BATCH_ENTRIES=BATCH_ORDER.map(batchEntryName);
@@ -3672,7 +3712,7 @@ export class SurfaceRelations {
     buffers[18]=occupancy?.columns??this.status;
     buffers[19]=this.partAnchorAlloc;
     (buffers as RelationBinding[])[17]=this.partAnchorBuffer??this.partAnchorAlloc;
-    const used:Record<string,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,...SURFACE_CONTACT_BINDINGS,prepare:[0,1,2,3,4,5,6,7,8,10,11],chartEmit:this.preparation==='generic-direct'?[0,1,2,3,4,5,6,8,10,12,15]:SURFACE_CONTACT_BINDINGS.chartEmit,boundaries:this.preparation==='generic-direct-ordinary'?[0,1,2,3,4,5,6,8,10,11,12,15]:this.preparation==='generic-direct'?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],boundariesVoxel:[0,1,2,3,4,5,6,8,10,11,12,15],contours:(this.preparation==='generic-direct'||this.preparation==='generic-direct-ordinary')?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],contoursVoxel:[0,1,2,3,4,5,6,8,10,12,15]};
+    const used:Record<string,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,...SURFACE_CONTACT_BINDINGS,prepare:[0,1,2,3,4,5,6,7,8,10,11],boundaries:this.preparation==='generic-direct-ordinary'?[0,1,2,3,4,5,6,8,10,11,12,15]:this.preparation==='generic-direct'?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],boundariesVoxel:[0,1,2,3,4,5,6,8,10,11,12,15],contours:(this.preparation==='generic-direct'||this.preparation==='generic-direct-ordinary')?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],contoursVoxel:[0,1,2,3,4,5,6,8,10,12,15]};
     (buffers as RelationBinding[])[10]={view:this.lineDetailView(earlyDetail)};
     (buffers as RelationBinding[])[15]={view:this.contactPatchView()};
     const anchors=this.partAnchorsFor(batch,source);
@@ -3708,11 +3748,11 @@ export class SurfaceRelations {
     if((posedContacts&&!host)||frontierAdmitted){
       indirect('prepare');
       if(posedContacts&&producerCapable){
-        indirect('contactClear',24);indirect('voxelVote',84);indirect('voxelHome',96);indirect('voxelBin',108);indirect('chartCorners',120);indirect('chartCertify',132);indirect('chartSelectStage',48);indirect('chartEmit',132);direct('chartPublish',1,held.groups,used.chartPublish!,buffers);indirect('contactVertices',36);indirect('contactEdges',48);
+        indirect('contactClear',24);indirect('voxelVote',84);indirect('voxelHome',96);indirect('voxelBin',108);indirect('chartCorners',120);indirect('chartCertify',132);indirect('chartSelectStage',48);indirect('chartEmit',132);direct('chartPublish',1,held.groups,used.chartPublish!,buffers);indirect('contactVertices',36);indirect('contactEdges',48);indirect('contactSort',48);
       }else if(posedContacts&&fineOnlyOrdinary){
         // Fine-only late producers still need posed contact/canonical ports,
         // but have no chart, residual or voxel stages in this profile.
-        indirect('contactClear',24);indirect('contactVertices',36);indirect('contactEdges',48);
+        indirect('contactClear',24);indirect('contactVertices',36);indirect('contactEdges',48);indirect('contactSort',48);
       }
     }else if(posedContacts){
       if(producerCapable){
@@ -3725,11 +3765,23 @@ export class SurfaceRelations {
         direct('chartSelectStage',contactEdges,held.groups,used.chartSelectStage!,buffers);
         direct('chartEmit',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartEmit!,buffers);
         direct('chartPublish',1,held.groups,used.chartPublish!,buffers);
-        indirect('contactVertices',36);indirect('contactEdges',48);
+        if(chart){
+          // chartPublish writes the compact/full producer count into the same
+          // indirect segment used by contactEdges. Sorting consumes that exact
+          // domain and offset; it must not fall back to hash-slot capacity.
+          indirect('contactVertices',36);indirect('contactEdges',48);indirect('contactSort',48);
+        }else{
+          // Without a chart there is no chartPublish writer. Use the complete
+          // host/native source extent directly so contact stages never consume
+          // unwritten indirect arguments.
+          direct('contactVertices',Math.max(faces*2,anchorParts),held.groups,used.contactVertices!,buffers);
+          direct('contactEdges',contactEdges,held.groups,used.contactEdges!,buffers);
+          direct('contactSort',contactEdges,held.groups,used.contactSort!,buffers);
+        }
       }else if(fineOnlyOrdinary){
         direct('contactClear',contactWords,held.groups,used.contactClear!,buffers);
         direct('contactVertices',Math.max(faces*2,anchorParts),held.groups,used.contactVertices!,buffers);
-        direct('contactEdges',contactEdges,held.groups,used.contactEdges!,buffers);
+        direct('contactEdges',contactEdges,held.groups,used.contactEdges!,buffers);direct('contactSort',contactEdges,held.groups,used.contactSort!,buffers);
       }
     }
 
@@ -3903,7 +3955,7 @@ export class SurfaceRelations {
     bound[16]=anchorEntry?.input??this.emptyPartAnchorVertices!;
     const relationBase2=[contactBase,0,frontierDispatchBase,Number(frontierAdmitted)];
     if(anchorEntry&&this.partAnchorBuffer){const anchorBound=[...bound];anchorBound[16]=anchorEntry.input;anchorBound[17]=this.partAnchorBuffer;push('partAnchors',anchorEntry.parts*anchorEntry.instances,words,relationBase2,anchorBound,frontierAdmitted);}
-    if(posedContacts){const compact=chartClusters>0;push('contactClear',contactWords,words,relationBase2,bound,frontierAdmitted);push('voxelVote',faces*2,words,relationBase2,bound,frontierAdmitted);push('voxelBin',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartCorners',faces*2,words,relationBase2,bound,frontierAdmitted);push('chartCertify',Math.max(chartClusters,anchorParts),words,relationBase2,bound,frontierAdmitted);push('chartSelectStage',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartEmit',chartClusters,words,relationBase2,bound,frontierAdmitted);push('chartPublish',1,words,relationBase2,bound);push('contactVertices',Math.max(faces*2,anchorParts),words,relationBase2,bound,frontierAdmitted||compact);push('contactEdges',contactEdges,words,relationBase2,bound,frontierAdmitted||compact);}
+    if(posedContacts){const compact=chartClusters>0;push('contactClear',contactWords,words,relationBase2,bound,frontierAdmitted);push('voxelVote',faces*2,words,relationBase2,bound,frontierAdmitted);push('voxelBin',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartCorners',faces*2,words,relationBase2,bound,frontierAdmitted);push('chartCertify',Math.max(chartClusters,anchorParts),words,relationBase2,bound,frontierAdmitted);push('chartSelectStage',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartEmit',chartClusters,words,relationBase2,bound,frontierAdmitted);push('chartPublish',1,words,relationBase2,bound);push('contactVertices',Math.max(faces*2,anchorParts),words,relationBase2,bound,frontierAdmitted||compact);push('contactEdges',contactEdges,words,relationBase2,bound,frontierAdmitted||compact);push('contactSort',contactEdges,words,relationBase2,bound,frontierAdmitted||compact);}
     const lineBound=[...bound];
     lineBound[11]=earlyDetail?formDepths(this.device).matrix(this.detailField!):(this.emptyMatrix??=this.device.createBuffer({label:'MAIN unselected detail matrix',size:64,usage:GPUBufferUsage.UNIFORM}));
     // Keep the original fused operation's boundary-before-contour order, but

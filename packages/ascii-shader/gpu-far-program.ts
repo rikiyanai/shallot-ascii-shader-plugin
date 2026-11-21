@@ -396,13 +396,6 @@ fn farNativePart(runID:u32,run:Run,priority:u32)->bool{
  }
  return emitted;
 }
-fn farRelationPart(runID:u32,run:Run,priority:u32)->bool{
- let relation=(run.paper.w&0x80000000u)!=0u;if(!relation||run.range.y<2u){return false;}
- // Contacts and protected openings share this boundary-only native path. The
- // source program has already retained the ordered relation geometry; no
- // skyline fallback is legal when native lowering fails.
- return farNativePart(runID,run,priority);
-}
 // A compound parent is one coherent source product: ordinary outer passages
 // carry the parent-paper marker, while opening/contact passages carry their
 // relation marker.  Route both through the native parent consumer before any
@@ -412,7 +405,6 @@ fn farRelationPart(runID:u32,run:Run,priority:u32)->bool{
 // legal incumbent.
 fn farCompoundParent(runID:u32,run:Run,priority:u32)->bool{
  let compound=(run.paper.w&0x10000000u)!=0u;if(!compound){return false;}
- if((run.paper.w&0x80000000u)!=0u){return farRelationPart(runID,run,priority);}
  return farNativePart(runID,run,priority);
 }
 `;
@@ -455,8 +447,7 @@ fn farCompoundParent(runID:u32,run:Run,priority:u32)->bool{
  // compound bit above is the only branch that suppresses skyline fallback for
  // ordinary outer parts; relation-free and legacy relation parents retain the
  // existing consumer behavior.
- if((run.paper.w&0x80000000u)!=0u){if(farRelationPart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}return;}
- let relationParent=(run.paper.w&0x20000000u)!=0u;
+ if((run.paper.w&0x80000000u)!=0u){if(farNativePart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}return;}
  if(farNativePart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);return;}
  if(farSkylineStanding(safeRunID,run,span,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}
 }`;
