@@ -1,6 +1,6 @@
 import {WORD_STRIDE} from './role-grammar-format.ts';
 import type {GpuNativeTape} from './gpu-native-tape.ts';
-import {compileComputePipelines,prepareComputePipelines,type ComputePipelinePlan} from './gpu-pipeline-preparation.ts';
+import {DeviceComputePrograms,type ComputePipelinePlan,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
 /** Canonicalize the committed native cursors, not the proposal words.
  * Shared glyphs have one cursor and therefore one displayed scalar. The
@@ -109,7 +109,6 @@ fn scalarAt(base:u32,ordinal:u32)->Scalar{
  * buffers transfer to publication; parameters and arguments retire with the job.
  */
 interface PreparedGpuNativeSealer{
- readonly plans:ReadonlyMap<'sealRows'|'seal',ComputePipelinePlan>;
  readonly pipelines:ReadonlyMap<'sealRows'|'seal',GPUComputePipeline>;
 }
 function nativeSealPipelinePlans(device:GPUDevice):ReadonlyMap<'sealRows'|'seal',ComputePipelinePlan>{
@@ -120,15 +119,15 @@ function nativeSealPipelinePlans(device:GPUDevice):ReadonlyMap<'sealRows'|'seal'
  }
  return plans;
 }
+const nativeSealPrograms=new DeviceComputePrograms((device:GPUDevice)=>({resources:undefined,plans:nativeSealPipelinePlans(device)}));
 export class GpuNativeSealer {
  private readonly rows:GPUComputePipeline;
  private readonly scalars:GPUComputePipeline;
- static async create(device:GPUDevice,progress?:(fraction:number)=>void):Promise<GpuNativeSealer>{
-  const plans=nativeSealPipelinePlans(device),pipelines=await prepareComputePipelines(device,plans,progress);
-  return new GpuNativeSealer(device,{plans,pipelines});
+ static async create(device:GPUDevice,progress?:ComputePipelineProgress):Promise<GpuNativeSealer>{
+  return new GpuNativeSealer(device,await nativeSealPrograms.prepare(device,progress));
  }
  constructor(private readonly device:GPUDevice,prepared?:PreparedGpuNativeSealer){
-  const plans=prepared?.plans??nativeSealPipelinePlans(device),pipelines=prepared?.pipelines??compileComputePipelines(device,plans);
+  const pipelines=prepared?.pipelines??nativeSealPrograms.get(device).pipelines;
   this.rows=pipelines.get('sealRows')!;
   this.scalars=pipelines.get('seal')!;
  }

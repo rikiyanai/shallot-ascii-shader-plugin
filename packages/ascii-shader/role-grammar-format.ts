@@ -97,6 +97,45 @@ export const SMALL_CONSTRUCTION_TABLE_POSITIVE_SHIFT=2;
 export const SMALL_CONSTRUCTION_TABLE_NEGATIVE_SHIFT=4;
 export const SMALL_CONSTRUCTION_TABLE_END_MASK=3;
 export const SMALL_CONSTRUCTION_TABLE_NONE=0xffffffff;
+/**
+ * Native whole-part vertical continuation.  A retained part is still emitted
+ * from its source rows; when a projected source is taller than that part, the
+ * inserted middle rows use the same native row with a precompiled left/right
+ * continuation shift.  The suffix is a lookup table, never a runtime glyph
+ * or pen search.  Each fixed-size record is
+ * [rowCount, continuationFlags, then (pivot,leftShift,rightShift) for the row count
+ * stored in the table header]. The default ABI reserves MAX_ROWS rows, while
+ * the compiler expands the stride/header for a larger admitted source.
+ * Shifts are signed i32 values stored as u32.
+ */
+export const WHOLE_GROWTH_TABLE_VERSION=1;
+export const WHOLE_GROWTH_TABLE_HEADER_WORDS=4;
+/** The repeated row is a complete pair of continuing native flank units. */
+export const WHOLE_GROWTH_CONTINUATION=1;
+// Current retained role data reaches 14 native rows; leave two rows of
+// default headroom. The compiler expands the packed stride if a future entry
+// exceeds this default rather than silently omitting its continuation table.
+export const WHOLE_GROWTH_TABLE_MAX_ROWS=16;
+export const WHOLE_GROWTH_TABLE_RECORD_WORDS=2+WHOLE_GROWTH_TABLE_MAX_ROWS*3;
+export const wholeGrowthTableRecordWords=(maxRows:number):number=>2+maxRows*3;
+/** The growth suffix follows the actual small-construction records. */
+export const wholeGrowthTableOffset=(smallRecordCount:number):number=>
+  SMALL_CONSTRUCTION_TABLE_AT+SMALL_CONSTRUCTION_TABLE_RECORDS_AT+
+  smallRecordCount*SMALL_CONSTRUCTION_TABLE_RECORD_WORDS;
+/** Shared location of the optional native word programme. Old banks end at
+ * the vertical continuation table; absence keeps their complete incumbent.
+ * No fixed retained-entry count or row stride enters this address. */
+export function nativeRowProgramsOffset(farStrip:Uint32Array):number|undefined{
+ const small=SMALL_CONSTRUCTION_TABLE_AT;
+ if(small+2>=farStrip.length||farStrip[small]!==SMALL_CONSTRUCTION_TABLE_VERSION||
+  farStrip[small+1]!==SMALL_CONSTRUCTION_TABLE_RECORD_WORDS)return;
+ const growth=wholeGrowthTableOffset(farStrip[small+2]!);
+ if(growth+WHOLE_GROWTH_TABLE_HEADER_WORDS>farStrip.length||farStrip[growth]!==WHOLE_GROWTH_TABLE_VERSION)return;
+ const stride=farStrip[growth+1]!,count=farStrip[growth+2]!,rows=farStrip[growth+3]!;
+ if(!rows||stride!==wholeGrowthTableRecordWords(rows)||count>(farStrip.length-growth-WHOLE_GROWTH_TABLE_HEADER_WORDS)/stride)return;
+ const next=growth+WHOLE_GROWTH_TABLE_HEADER_WORDS+count*stride;
+ return next<farStrip.length?next:undefined;
+}
 export type SmallConstructionKind='round'|'limb'|'box';
 export type SmallConstructionEnd='cap'|'contact'|'open';
 export interface PackedSmallConstructionRecord {

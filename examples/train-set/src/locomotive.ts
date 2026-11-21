@@ -2,6 +2,7 @@ import {GlobalTransform,Transform,type World} from '@dylanebert/shallot';
 import {loadGltfScene,poseGltfScene,spawnGltfScene,type Gltf,type GltfSceneInstance} from '@dylanebert/shallot/gltf';
 import {bodyPlacement,primitivePlacement} from './body-placement';
 import asset from './locomotive-asset.json';
+import {steamModelScale,steamGroundY} from './vehicle-shape';
 
 /** Scene asset/animation owner. Rendering stays in Shallot + the shared MAIN plugin. */
 export class Locomotives {
@@ -34,7 +35,7 @@ export class Locomotives {
         for(const [index,eid] of [body,instance.tender].entries()){
             const t=instance.body;t[0]=p.x.get(eid);t[1]=p.y.get(eid);t[2]=p.z.get(eid);
             t[3]=q.x.get(eid);t[4]=q.y.get(eid);t[5]=q.z.get(eid);t[6]=q.w.get(eid);
-            bodyPlacement(t,index===0?asset.bodies.locomotive.pivot:asset.bodies.tender.pivot,instance.placements[index]!);
+            bodyPlacement(t,index===0?asset.bodies.locomotive.pivot:asset.bodies.tender.pivot,instance.placements[index]!,steamModelScale,steamGroundY);
         }
         // poseGltfScene owns joint/morph playback. Keep base placement identity;
         // skinned primitive TRS is caller-owned and must be installed before it

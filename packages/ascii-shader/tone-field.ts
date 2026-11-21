@@ -1,4 +1,4 @@
-import {DeviceComputePrograms,type ComputePipelinePlan} from './gpu-pipeline-preparation.ts';
+import {DeviceComputePrograms,type ComputePipelinePlan,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
 import type {SurfaceField} from './surface-fields.ts';
 import {formDepths,FAR_STRIP_BELOW_ROWS} from './form-depths.ts';
@@ -2274,7 +2274,7 @@ const tonePrograms=new DeviceComputePrograms(device=>{
  ] as const){plans.set(entryPoint,()=>{const module=device.createShaderModule({label,code:isolateComputeEntry(TONE_ORDER_SHADER,entryPoint)});return {label,layout:order,compute:{module,entryPoint}};});}
  return {resources:{layout,rowLayout,orderLayout},plans};
 });
-export async function prepareToneFieldPrograms(device:GPUDevice,progress?:(fraction:number)=>void):Promise<void>{await tonePrograms.prepare(device,progress);}
+export async function prepareToneFieldPrograms(device:GPUDevice,progress?:ComputePipelineProgress):Promise<void>{await tonePrograms.prepare(device,progress);}
 
 export class ToneField {
  private readonly pipeline:GPUComputePipeline;private readonly reference:GPUComputePipeline;private readonly passages:GPUComputePipeline;private readonly seaCells:GPUComputePipeline;private readonly rowPrelude:GPUComputePipeline;private readonly layout:GPUBindGroupLayout;

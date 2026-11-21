@@ -16,13 +16,15 @@ interface Request {
  readonly reject:(error:Error)=>void;
  readonly complexMode:'full'|'summary';readonly physical:boolean;
 }
-function validateWholeConstruction(value:SourceWholeConstructionTemplate|undefined,revision:number):void{
+
+
+export function validateWholeConstruction(value:SourceWholeConstructionTemplate|undefined,revision:number):void{
  if(value===undefined)return;
  if(value.revision!==revision||!value.parts.length)throw Error('Invalid source whole construction revision');
  const roles=new Set(value.parts.map(part=>part.role));
  const required:readonly SourceWholePartRole[]=['cap','turn','flank','return'];
  if(!required.every(role=>roles.has(role)))throw Error('Incomplete source whole construction roles');
- const check=(items:readonly {feature:number;ports:readonly number[];sourceContributors:readonly number[]}[])=>{for(const item of items){if(!Number.isSafeInteger(item.feature)||item.feature<=0||item.ports.length<2||item.sourceContributors.length===0||item.ports.some(port=>!Number.isSafeInteger(port)||port<0)||item.sourceContributors.some(id=>!Number.isSafeInteger(id)||id<0))throw Error('Invalid source whole construction passage');}};
+ const check=(items:readonly {feature:number;ports:readonly number[];sourceContributors:readonly number[];geometry?:readonly (readonly number[])[];closed?:boolean;entryRef?:number;context?:number}[])=>{for(const item of items){if(!Number.isSafeInteger(item.feature)||item.feature<=0||item.ports.length<2||item.sourceContributors.length===0||item.ports.some(port=>!Number.isSafeInteger(port)||port<0)||item.sourceContributors.some(id=>!Number.isSafeInteger(id)||id<0))throw Error('Invalid source whole construction passage');if(item.geometry!==undefined&&(item.geometry.length<2||item.geometry.some(point=>point.length!==3||point.some(value=>!Number.isFinite(value)))))throw Error('Invalid source whole construction passage geometry');if(item.closed!==undefined&&typeof item.closed!=='boolean')throw Error('Invalid source whole construction passage closure');if(item.entryRef!==undefined&&(!Number.isSafeInteger(item.entryRef)||item.entryRef<1)||item.context!==undefined&&(!Number.isSafeInteger(item.context)||item.context===0))throw Error('Invalid source whole construction passage context');}};
  for(const part of value.parts){if(!Number.isSafeInteger(part.feature)||part.feature<=0||!Number.isSafeInteger(part.entryRef)||part.entryRef<1||!Number.isSafeInteger(part.context)||part.context===0||part.ports.length!==2||part.ports.some(port=>!Number.isSafeInteger(port)||port<0)||part.sourceContributors.length===0||part.sourceContributors.some(id=>!Number.isSafeInteger(id)||id<0)||!part.geometry?.length||part.geometry.some(point=>point.length!==3||point.some(value=>!Number.isFinite(value))))throw Error('Invalid source whole construction part');if(part.paper)check(part.paper);}
  check(value.openings);check(value.contacts);check(value.protectedVoids);if(value.paper)check(value.paper);
 }

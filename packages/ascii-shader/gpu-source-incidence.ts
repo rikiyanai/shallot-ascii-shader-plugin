@@ -1,6 +1,6 @@
 import {SourceStorage,type SourceStorageRange} from './source-storage.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
-import {compileComputePipelines,prepareComputePipelines,type ComputePipelinePlan} from './gpu-pipeline-preparation.ts';
+import {compileComputePipelines,prepareComputePipelines,type ComputePipelinePlan,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 
 /** Indexed incidence only. Rest-position welding and published P0 contacts
  * are different relations, not permission to merge these vertex addresses.
@@ -213,7 +213,7 @@ export class GpuSourceIncidence {
  private pending:Promise<void>=Promise.resolve();private disposed=false;
  private readonly queuedIndexed:IndexedBuildRequest[]=[];private indexedScheduled=false;
  private scratch?:{buffers:GPUBuffer[];summary:GPUBuffer};
- static async create(device:GPUDevice,storage:SourceStorage,scratchBudget=8*1024*1024,progress?:(fraction:number)=>void):Promise<GpuSourceIncidence>{
+ static async create(device:GPUDevice,storage:SourceStorage,scratchBudget=8*1024*1024,progress?:ComputePipelineProgress):Promise<GpuSourceIncidence>{
   const {layouts,plans}=incidencePipelinePlan(device),pipelines=await prepareComputePipelines(device,plans,progress);
   return new GpuSourceIncidence(device,storage,scratchBudget,preparedIncidence(layouts,pipelines));
  }

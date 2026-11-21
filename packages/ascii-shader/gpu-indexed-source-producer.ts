@@ -65,12 +65,20 @@ function validateRestCellChartInput(value:GpuIndexedRestCellChartInput,vertexCap
  const offset=value.vertexCellCodes.offset??0,size=value.vertexCellCodes.size??value.vertexCellCodes.buffer.size-offset;
  if(!Number.isSafeInteger(offset)||offset<0||offset%4||!Number.isSafeInteger(size)||size<vertexCapacity*4||offset+size>value.vertexCellCodes.buffer.size)
   throw Error('GPU indexed source producer rest-cell chart binding is shorter than vertex capacity');
+
+ if(value.occupancy){
+  if(value.occupancy.kind!=='voxel-column-occupancy-v1')throw Error('Unsupported GPU indexed source producer rest-cell occupancy kind');
+  const at=value.occupancy.columns.offset??0,bytes=value.occupancy.columns.size??value.occupancy.columns.buffer.size-at,need=value.extent[0]*value.extent[2]*Math.ceil(value.extent[1]/32)*4;
+  if(!Number.isSafeInteger(at)||at<0||at%4||!Number.isSafeInteger(bytes)||bytes<need||at+bytes>value.occupancy.columns.buffer.size)
+   throw Error('GPU indexed source producer rest-cell occupancy binding is shorter than its extent');
+ }
 }
 function cloneRestCellChartInput(value:GpuIndexedRestCellChartInput):GpuIndexedRestCellChartInput{
- return {kind:value.kind,cornerOrder:value.cornerOrder,extent:[...value.extent] as GpuIndexedRestCellChartInput['extent'],vertexCellCodes:value.vertexCellCodes};
+ return {kind:value.kind,cornerOrder:value.cornerOrder,extent:[...value.extent] as GpuIndexedRestCellChartInput['extent'],vertexCellCodes:value.vertexCellCodes,...(value.occupancy?{occupancy:{kind:value.occupancy.kind,columns:value.occupancy.columns}}:{})};
 }
 function sameRestCellChart(a:GpuIndexedRestCellChart|GpuIndexedRestCellChartInput,b:GpuIndexedRestCellChart|GpuIndexedRestCellChartInput):boolean{
- return a.kind===b.kind&&a.cornerOrder===b.cornerOrder&&a.extent.every((value,index)=>value===b.extent[index])&&sameStorageBinding(a.vertexCellCodes,b.vertexCellCodes);
+ return a.kind===b.kind&&a.cornerOrder===b.cornerOrder&&a.extent.every((value,index)=>value===b.extent[index])&&sameStorageBinding(a.vertexCellCodes,b.vertexCellCodes)&&
+  !!a.occupancy===!!b.occupancy&&(!a.occupancy||!b.occupancy||a.occupancy.kind===b.occupancy.kind&&sameStorageBinding(a.occupancy.columns,b.occupancy.columns));
 }
 function samePoseContent(a:GpuIndexedSourcePoseContent,b:GpuIndexedSourcePoseContentInput,sourceGeneration:number):boolean{
  return a.sourceGeneration===sourceGeneration&&a.kind===b.kind&&a.vertexRevision===b.vertexRevision&&

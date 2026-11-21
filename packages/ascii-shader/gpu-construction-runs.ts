@@ -2,14 +2,18 @@
 import type {RelationVisibility} from './relation-visibility.ts';
 import type {CompiledConstructionGraph,ConstructionType} from './composition.ts';
 import type {MeshSourceComplex} from './source-complex.ts';
-import {FACE_HIDDEN,PACKED_RUN_CONTEXT,TOPOLOGY_FACE_MAGIC,TOPOLOGY_FACE_MAGIC_WORD,TOPOLOGY_LIMB_MAGIC,TOPOLOGY_LIMB_MAGIC_WORD,TOPOLOGY_PART_MAGIC,TOPOLOGY_PART_MAGIC_WORD,TOPOLOGY_PART_PROGRAM_WORDS} from './compiled-construction-topology.ts';
+import {FACE_HIDDEN,PACKED_RUN_CONTEXT,TOPOLOGY_FACE_MAGIC,TOPOLOGY_FACE_MAGIC_WORD,TOPOLOGY_LIMB_MAGIC,TOPOLOGY_LIMB_MAGIC_WORD,TOPOLOGY_PART_MAGIC,TOPOLOGY_PART_MAGIC_WORD,TOPOLOGY_PART_PROGRAM_WORDS,
+ TOPOLOGY_PART_PACKET_MAGIC,TOPOLOGY_PART_CANONICAL_MAGIC,TOPOLOGY_PART_CANONICAL_VERSION,TOPOLOGY_PART_JUNCTION_MAGIC,TOPOLOGY_PART_JUNCTION_VERSION,TOPOLOGY_PART_JUNCTION_RECORD_WORDS,TOPOLOGY_PART_JUNCTION_ARM_WORDS,TOPOLOGY_PART_JUNCTION_EDGE_WORDS,
+ TOPOLOGY_PART_JUNCTION_FLAG_COMPLETE,TOPOLOGY_PART_JUNCTION_FLAG_MISSING_ARM,TOPOLOGY_PART_JUNCTION_ARM_COMPLETE} from './compiled-construction-topology.ts';
+import {SOURCE_JUNCTION_RECORD_LIMIT,SOURCE_JUNCTION_ARM_LIMIT} from './source-junction.ts';
 import {GPU_INDEXED_CONSTRUCTION_SHADER,gpuConstructionTypeCode,gpuIndexedConstructionSlot,gpuIndexedQuadContext,QUAD_RUN_CONTEXT} from './gpu-indexed-source-construction.ts';
 import type {GpuIndexedConstructionInput} from './gpu-indexed-source-construction.ts';
 import {storageBinding} from './source-storage.ts';
-import {compileComputePipelines,prepareComputePipelines} from './gpu-pipeline-preparation.ts';
+import {DeviceComputePrograms,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
 import {RELATION_RECORD_WGSL,CONSTRUCTION_POINT_WGSL,CONSTRUCTION_POINT_WORDS,POINT_SOURCE_CHART_WGSL,SPAN_SOURCE_TAG,WHOLE_EDGE_DESCRIPTOR} from './source-coordinates.ts';
 import {GpuSourceFarForms,type SourceFarForms} from './gpu-source-far-forms.ts';
+import {FAR_FORM_MERGE_PIXELS} from './form-depths.ts';
 import type {SurfaceField} from './surface-fields.ts';
 
 const LINK_WORDS=14;
@@ -256,9 +260,9 @@ fn faceEdge(r:Relation)->u32{
 // table one row at a time (compiled-role-grammar.ts terrainInstructions).
 fn hardEdge(r:Relation)->bool{
  if(kind(r)==4u){return true;}
- // A compiled L2 outline edge (surface-relations hullOutlineAt, chart flag
- // bit 2) is a straight edge of the form's outline polytope.
- if(kind(r)==0u&&(u32(r.sourceChart.w)&4u)!=0u){return true;}
+ // Compiled outline spans and their joined plane-turn creases are actual
+ // straight construction edges (chart flag bit 2), not facet curve samples.
+ if((kind(r)==0u||kind(r)==2u)&&(u32(r.sourceChart.w)&4u)!=0u){return true;}
  // A plane-class source's occluding contour or interior turn (kept where
  // its posed mesh bends, incidence) is a soft line of a curved surface.
  let form=shape(r);if(form==1u&&planarVolume(r)&&kind(r)!=1u&&kind(r)!=3u){return true;}
@@ -393,7 +397,9 @@ fn key(endpoint:u32,mode:u32)->SourceKey{
  let r=relations[endpoint/2u];var port=r.ports[endpoint&1u];
  // One node per ordered pair of contacting source owners: the exact pair, no
  // port, parameter or face, so every contact segment of the pair reaches it.
- if(mode==PAIR_NODE){return SourceKey(vec4u(r.key.x,r.key.y,(r.key.z&0x80000000u)|6u,NONE),0u,vec3u(r.ports.z,r.ports.w,0u));}
+
+ // owner, pair group) in the disjoint family 7 (authoredPairKey).
+ if(mode==PAIR_NODE){if(authoredPaired(r)){return authoredPairKey(r);}return SourceKey(vec4u(r.key.x,r.key.y,(r.key.z&0x80000000u)|6u,NONE),0u,vec3u(r.ports.z,r.ports.w,0u));}
  // Smooth crossings at different parameters on the same source edge must
  // not acquire a false junction. Keep the canonical source-edge parameter
  // separate from the port: XOR is a hash, not an equality comparison.
@@ -473,6 +479,18 @@ fn nodeFor(endpoint:u32,mode:u32)->u32{
 }
 fn ordered(value:f32)->i32{let b=bitcast<i32>(value);return select(b^0x7fffffff,b,b>=0);}
 fn real(value:i32)->f32{return bitcast<f32>(select(value^0x7fffffff,value,value>=0));}
+// An owner's SOURCE page rows (its node's bounds over every relation of the
+// owner, occluded ones included): top and bottom + 16384 in 16 bits each, the
+// run's paper.z. Articulation's standing-form rows read exactly these words.
+fn ownerRows(low:vec2f,high:vec2f)->u32{return u32(clamp(low.y+16384.0,0.0,65535.0))|(u32(clamp(high.y+16384.0,0.0,65535.0))<<16u);}
+
+// takes whole: an outline (silhouette or occluding contour) of a field-class
+// owner whose source rows stand under FAR_FORM_MERGE_PIXELS, the same rows and
+// bound articulation's farUnderGlyph reads.
+fn standingRetained(r:Relation,low:vec2f,high:vec2f)->bool{
+ if(shape(r)!=0u||kind(r)>1u){return false;}
+ let rows=ownerRows(low,high);return f32(rows>>16u)-f32(rows&0xffffu)<${FAR_FORM_MERGE_PIXELS};
+}
 fn linkAt(index:u32)->u32{return p.table.y+index*${LINK_WORDS}u;}
 fn other(endpoint:u32)->u32{
  let at=linkAt(endpoint/2u);return work[at+(endpoint&1u)];
@@ -539,6 +557,152 @@ fn junctionRepresentative(node:u32,endpoint:u32){
   let claim=atomicCompareExchangeWeak(&nodes[node].least,before,after);if(claim.exchanged){return;}before=claim.old_value;
  }
 }
+
+// TASK,00:09UTC"). surface-relations authoredPathAt emits each authored path
+// segment with address 0xb0000000 | role<<26 (1 pair A, 2 pair B) |
+// group<<13 (pair) | phase (segment index from A's start; reversed B already
+// runs from A's start) and ports 0xd8000000|end-port (authored path END) or
+// 0xd0000000|site. One PAIR_NODE per exact (domain, owner, pair group), in a
+// disjoint identity family (7; foot contacts use 6), counts both rails:
+// second = nA | nB<<16, maxX/maxY = highest phase of A/B, degree bits 1/2/4/8
+// = A head-end, A tail-end, B head-end, B tail-end present, 16 = a segment cut
+// by the near plane, 0x80000000 = reserved; minX = the reserved point base.
+// A COMPLETE pair (every segment of both rails present once, both ends of
+// each rail present, no near-plane cut, nA == nB so phases align) reserves ONE
+// run (roundReserve) holding both rails in phase order; its relations then
+// neither link nor assemble per edge. Any other case keeps the incumbent.
+const AUTHORED_PAIR_FLAG=0x1000000u;
+const AUTHORED_PAIR_FAMILY=7u;
+const AUTHORED_PAIR_PHASE_FAMILY=8u;
+const AUTHORED_PAIR_INVALID=0x20u;
+const AUTHORED_PAIR_ATTEMPTED=0x40u;
+fn authoredPaired(r:Relation)->bool{
+ let role=(r.key.w>>26u)&3u;return kind(r)==0u&&(r.key.w&0xf0000000u)==0xb0000000u&&(role==1u||role==2u);
+}
+fn authoredPairKey(r:Relation)->SourceKey{
+ return SourceKey(vec4u(r.key.x,r.key.y,(r.key.z&0x80000000u)|AUTHORED_PAIR_FAMILY,(r.key.w>>13u)&8191u),0u,vec3u(0u));
+}
+// Every phase gets its own node in the existing source-node arena.  The pair
+// node remains the aggregate; phase nodes carry the exact two ports for one
+// rail/phase, so adjacent phases can validate their source chain without a
+// pair-wide scan or a second storage binding.
+fn authoredPairPhaseKey(r:Relation,role:u32,phase:u32)->SourceKey{
+ let group=(r.key.w>>13u)&8191u;
+ return SourceKey(vec4u(r.key.x,r.key.y,(r.key.z&0x80000000u)|AUTHORED_PAIR_PHASE_FAMILY,(group<<16u)|(role<<14u)|phase),0u,vec3u(0u));
+}
+fn authoredPairPhaseKeyEqual(a:SourceKey,b:SourceKey)->bool{
+ return a.identity[0]==b.identity[0]&&a.identity[1]==b.identity[1]&&a.identity[2]==b.identity[2]&&a.identity[3]==b.identity[3]&&a.parameter==b.parameter&&a.contact[0]==b.contact[0]&&a.contact[1]==b.contact[1]&&a.contact[2]==b.contact[2];
+}
+fn authoredPairPhaseLookup(r:Relation,role:u32,phase:u32)->u32{
+ if(phase>8191u){return NONE;}
+ let wanted=authoredPairPhaseKey(r,role,phase);var at=hash(wanted);let tag=PAIR_NODE<<30u;
+ for(var probe=0u;probe<min(p.extent.z,256u);probe++){
+  let old=atomicLoad(&nodes[at].first);
+  if(old==0u){return NONE;}
+  if((old&0xc0000000u)==tag){let prior=relations[((old&0x3fffffffu)-1u)/2u];if(authoredPairPhaseKeyEqual(authoredPairPhaseKey(prior,(prior.key.w>>26u)&3u,prior.key.w&8191u),wanted)){return at;}}
+  at=(at+1u)&(p.extent.z-1u);
+ }
+ return NONE;
+}
+fn authoredPairPhaseNode(id:u32,r:Relation)->u32{
+ let wanted=authoredPairPhaseKey(r,(r.key.w>>26u)&3u,r.key.w&8191u);var at=hash(wanted);let tag=PAIR_NODE<<30u;
+ for(var probe=0u;probe<min(p.extent.z,256u);probe++){
+  let old=atomicCompareExchangeWeak(&nodes[at].first,0u,(id*2u+1u)|tag);
+  if(old.exchanged){return at;}
+  if(old.old_value==0u){continue;}
+  if((old.old_value&0xc0000000u)==tag){let prior=relations[((old.old_value&0x3fffffffu)-1u)/2u];if(authoredPairPhaseKeyEqual(authoredPairPhaseKey(prior,(prior.key.w>>26u)&3u,prior.key.w&8191u),wanted)){return at;}}
+  at=(at+1u)&(p.extent.z-1u);
+ }
+ return NONE;
+}
+fn authoredPairInvalid(id:u32){let pair=nodeFor(id*2u,PAIR_NODE);if(pair!=NONE){atomicOr(&nodes[pair].degree,AUTHORED_PAIR_INVALID);}}
+fn authoredPairPhaseReady(node:u32)->bool{return node!=NONE&&atomicLoad(&nodes[node].maxX)==1;}
+fn authoredPairPhaseEnd(port:u32)->bool{return (port&0xf8000000u)==0xd8000000u;}
+fn authoredPairPhaseCheck(id:u32,r:Relation,node:u32){
+ let role=(r.key.w>>26u)&3u;let phase=r.key.w&8191u;
+ if((phase==0u)!=authoredPairPhaseEnd(r.ports.x)){authoredPairInvalid(id);}
+ if(phase!=0u&&authoredPairPhaseEnd(r.ports.x)){authoredPairInvalid(id);}
+ if(role!=1u&&role!=2u){authoredPairInvalid(id);return;}
+ if(phase>0u){let previous=authoredPairPhaseLookup(r,role,phase-1u);if(authoredPairPhaseReady(previous)){
+   let previousTail=atomicLoad(&nodes[previous].degree)-1u;
+   if(previousTail!=r.ports.x||authoredPairPhaseEnd(previousTail)||authoredPairPhaseEnd(r.ports.x)){authoredPairInvalid(id);}
+  }}
+ if(phase<8191u){let next=authoredPairPhaseLookup(r,role,phase+1u);if(authoredPairPhaseReady(next)){
+   let nextHead=atomicLoad(&nodes[next].second)-1u;
+   if(r.ports.y!=nextHead||authoredPairPhaseEnd(r.ports.y)||authoredPairPhaseEnd(nextHead)){authoredPairInvalid(id);}
+  }}
+}
+fn authoredPairCount(id:u32,r:Relation){
+ let node=nodeFor(id*2u,PAIR_NODE);if(node==NONE){return;}
+ let role=(r.key.w>>26u)&3u;let phase=i32(r.key.w&8191u);
+ let old=atomicAdd(&nodes[node].second,select(1u,0x10000u,role==2u));
+ if(select(old&0xffffu,(old>>16u)&0xffffu,role==2u)==0xffffu){atomicOr(&nodes[node].degree,AUTHORED_PAIR_INVALID);}
+ if(role==1u){atomicMax(&nodes[node].maxX,phase);}else{atomicMax(&nodes[node].maxY,phase);}
+ var bits=0u;
+ if((r.ports.x&0xf8000000u)==0xd8000000u){bits|=select(1u,4u,role==2u);}
+ if((r.ports.y&0xf8000000u)==0xd8000000u){bits|=select(2u,8u,role==2u);}
+ if(r.a.w<.00001||r.b.w<.00001){bits|=16u;}
+ atomicOr(&nodes[node].degree,bits);junctionRepresentative(node,id*2u);
+ let phaseNode=authoredPairPhaseNode(id,r);if(phaseNode==NONE){atomicOr(&nodes[node].degree,AUTHORED_PAIR_INVALID);return;}
+ let phaseClaim=(id*2u+1u)|(PAIR_NODE<<30u);if(atomicLoad(&nodes[phaseNode].first)!=phaseClaim){atomicOr(&nodes[node].degree,AUTHORED_PAIR_INVALID);return;}
+ if(atomicLoad(&nodes[phaseNode].second)!=0u||atomicLoad(&nodes[phaseNode].maxX)!=bitcast<i32>(0x80000000u)){atomicOr(&nodes[node].degree,AUTHORED_PAIR_INVALID);return;}
+ atomicStore(&nodes[phaseNode].second,r.ports.x+1u);atomicStore(&nodes[phaseNode].degree,r.ports.y+1u);atomicStore(&nodes[phaseNode].maxX,1);
+}
+fn authoredPairComplete(node:u32)->bool{
+ let d=atomicLoad(&nodes[node].degree);let counts=atomicLoad(&nodes[node].second);let a=counts&0xffffu;let b=counts>>16u;
+ if((d&(31u|AUTHORED_PAIR_INVALID))!=15u||a==0u||a!=b||i32(a)!=atomicLoad(&nodes[node].maxX)+1||i32(b)!=atomicLoad(&nodes[node].maxY)+1){return false;}
+ let endpoint=(atomicLoad(&nodes[node].first)&0x3fffffffu)-1u;let r=relations[endpoint/2u];
+ let firstA=authoredPairPhaseLookup(r,1u,0u);let firstB=authoredPairPhaseLookup(r,2u,0u);let lastA=authoredPairPhaseLookup(r,1u,u32(atomicLoad(&nodes[node].maxX)));let lastB=authoredPairPhaseLookup(r,2u,u32(atomicLoad(&nodes[node].maxY)));
+ if(!authoredPairPhaseReady(firstA)||!authoredPairPhaseReady(firstB)||!authoredPairPhaseReady(lastA)||!authoredPairPhaseReady(lastB)){return false;}
+ return authoredPairPhaseEnd(atomicLoad(&nodes[lastA].degree)-1u)&&authoredPairPhaseEnd(atomicLoad(&nodes[lastB].degree)-1u);
+}
+// The relation at this endpoint belongs to a complete authored pair (decided
+// once incidence has counted every relation).
+fn authoredPairOwned(endpoint:u32)->bool{
+ if(!authoredPaired(relations[endpoint/2u])){return false;}
+ let node=nodeFor(endpoint,PAIR_NODE);return node!=NONE&&(atomicLoad(&nodes[node].degree)&0x80000000u)!=0u&&authoredPairComplete(node);
+}
+fn authoredPairReserve(id:u32,r:Relation){
+ let node=nodeFor(id*2u,PAIR_NODE);
+ if(node==NONE||atomicLoad(&nodes[node].least)!=id*2u||!authoredPairComplete(node)){return;}
+ let claimed=atomicOr(&nodes[node].degree,AUTHORED_PAIR_ATTEMPTED);if((claimed&AUTHORED_PAIR_ATTEMPTED)!=0u){return;}
+ let n=atomicLoad(&nodes[node].second)&0xffffu;let total=4u*n;
+ let base=atomicAdd(&nodes[p.extent.z].first,total);let slot=atomicAdd(&nodes[p.extent.z].second,1u);
+ if(base+total>p.extent.y){atomicOr(&nodes[p.extent.z].degree,2u);}
+ if(slot>=p.sourceExtent.z){atomicOr(&nodes[p.extent.z].degree,4u);}
+ if(base+total>p.extent.y||slot>=p.sourceExtent.z){return;}
+ var size=1u;let owner=work[linkAt(id)+6u];
+ if(owner!=NONE){let rows=real(atomicLoad(&nodes[owner].maxY))-real(atomicLoad(&nodes[owner].minY));if(rows>=0.0){size=select(select(2u,1u,rows<119.0),0u,rows<51.0);}}
+ let group=(r.key.w>>13u)&8191u;
+ let identity=(r.key.x*0x9e3779b9u)^(r.key.y*0x85ebca6bu)^(group*0xc2b2ae35u)^0x50000000u;
+ runs[slot]=Run(vec4u(base,total,AUTHORED_PAIR_FLAG,size),vec4u(identity,r.key.x|(r.key.z&0x80000000u),r.key.y,identity),vec4u(0u),vec4u(0u),vec4u(0u));
+ atomicStore(&nodes[node].minX,bitcast<i32>(base));atomicOr(&nodes[node].degree,0x80000000u);
+}
+// Fill the reserved run: rail A segment s at base+2s, rail B segment s at
+// base+2n+2s; each segment writes its two ORIGINAL endpoints (ports, feature
+// address, projected position, parameter = source phase + t).
+fn authoredPairFill(r:Relation,node:u32){
+ let base=bitcast<u32>(atomicLoad(&nodes[node].minX));let n=atomicLoad(&nodes[node].second)&0xffffu;
+ let role=(r.key.w>>26u)&3u;let phase=r.key.w&8191u;
+ let at=base+select(2u*n,0u,role==1u)+2u*phase;
+ points[at]=sourcePoint(r,0.0,f32(phase),true);points[at+1u]=sourcePoint(r,1.0,f32(phase)+1.0,false);
+}
+// Incidence only publishes phase-node records. Validation is a separate
+// dispatch so every phase node's ports are visible before a neighbor check;
+// no relaxed cross-workgroup read is used as a readiness protocol.
+@compute @workgroup_size(64) fn authoredPairValidate(@builtin(global_invocation_id) gid:vec3u){
+ let id=gid.x+gid.y*p.table.z*64u;if(id>=count()||sourceStatus[1]!=0u){return;}
+ let r=relations[id];if(!authoredPaired(r)){return;}
+ let node=authoredPairPhaseLookup(r,(r.key.w>>26u)&3u,r.key.w&8191u);if(authoredPairPhaseReady(node)){authoredPairPhaseCheck(id,r,node);}
+}
+// Reservation is deliberately before connect. Valid pairs suppress the
+// incumbent only after their whole run has actually been reserved; capacity
+// overflow leaves ATTEMPTED without the reserved bit, so connect and assemble
+// retain the complete per-edge fallback.
+@compute @workgroup_size(64) fn authoredPairReserveStage(@builtin(global_invocation_id) gid:vec3u){
+ let id=gid.x+gid.y*p.table.z*64u;if(id>=count()||sourceStatus[1]!=0u){return;}
+ let at=linkAt(id);if(work[at+7u]==0u){return;}let r=relations[id];if(authoredPaired(r)){authoredPairReserve(id,r);}
+}
 @compute @workgroup_size(64) fn initialize(@builtin(global_invocation_id) gid:vec3u){
  let id=gid.x+gid.y*p.table.z*64u;
  if(id<p.extent.z){atomicStore(&nodes[id].first,0u);atomicStore(&nodes[id].second,0u);atomicStore(&nodes[id].degree,0u);atomicStore(&nodes[id].least,NONE);atomicStore(&nodes[id].minX,0x7fffffff);atomicStore(&nodes[id].minY,0x7fffffff);atomicStore(&nodes[id].maxX,bitcast<i32>(0x80000000u));atomicStore(&nodes[id].maxY,bitcast<i32>(0x80000000u));}
@@ -559,6 +723,8 @@ fn junctionRepresentative(node:u32,endpoint:u32){
  // half of a source edge. Original ports/parameters remain unchanged.
  if(r.a.w<.00001&&r.b.w<.00001){return;}
  work[at+7u]=1u;
+
+ if(authoredPaired(r)){authoredPairCount(id,r);}
  let owner=nodeFor(id*2u,OWNER_NODE);work[at+6u]=owner;
  if(owner!=NONE){
   // Terrain line nodes join across source owners. Reserve one source-context
@@ -583,20 +749,22 @@ fn junctionRepresentative(node:u32,endpoint:u32){
   // A face-owned edge counts as one box edge (faceEdge); a compiled-out one
   // counts nothing.
   let faceWord=faceEdge(r);let faced=faceWord!=0u;
-  if(!faceHidden(faceWord)&&((form==2u&&k==0u)||(form==1u&&(k==0u||k==2u))||faced)){
+
+  // never into the owner's round/box/face packet.
+  if(!authoredPaired(r)&&!faceHidden(faceWord)&&((form==2u&&k==0u)||(form==1u&&(k==0u||k==2u))||faced)){
    var n=0u;var visible=false;var part=partitions[id*2u];
    loop{if(part==0u){break;}let interval=intervals[part-1u];if(finiteInterval(r,interval)){n+=2u;visible=visible||(interval.cause&3u)==0u;}part=partitions[p.extent.x*2u+(part-1u)*2u];}
-   if(form==1u&&n>0u&&!faced){n=2u;}
-   // A face edge is one whole source packet: one non-drawable descriptor pair
-   // (original homogeneous endpoints/ports) plus one finite draw-span pair.
-   // Its visibility intervals remain in the partition list and are consumed as
-   // occlusion annotations later.
-   if(faced){visible=faceVisible(id,r);n=select(0u,4u,visible);}
+   // A box edge is a source construction even when its current projected
+   // visibility is zero or only a sliver. Reserve the complete original
+   // packet; visibility is carried by point flags and clips emitted units
+   // later. A face packet has its descriptor pair plus one draw pair.
+   if(faced){visible=faceVisible(id,r);n=4u;}
+   else if(form==1u){n=2u;}
    // The owner's representative is the least endpoint by SOURCE CONTENT
    // (choose, as a junction's), never the lowest relation index: the index is
    // the order this frame's relations were appended, so fusing or reordering
    // the relation dispatches changed which relation reserved the whole-form run.
-   if(n>0u){atomicAdd(&nodes[owner].second,n);junctionRepresentative(owner,id*2u);if(visible){atomicOr(&nodes[owner].degree,1u);}}
+   if(n>0u){atomicAdd(&nodes[owner].second,n);junctionRepresentative(owner,id*2u);if(visible||form==1u){atomicOr(&nodes[owner].degree,1u);}}
   }
  }
  // The foot of a standing form: the VISIBLE extent of every contact segment
@@ -725,6 +893,9 @@ fn straightMate(e:u32,node:u32)->u32{
   // A face-owned edge is one edge of its owner's face construction: it
   // continues into nothing, and nothing continues into it (faceEdge).
   if(continuation!=NONE&&(faceEdge(r)!=0u||faceEdge(relations[continuation/2u])!=0u)){continuation=NONE;}
+
+  // segments neither continue into, nor receive, any per-edge line.
+  if(continuation!=NONE&&(authoredPairOwned(endpoint)||authoredPairOwned(continuation))){continuation=NONE;}
   work[at+end]=continuation;
   work[at+2u+end]=select(continuation^1u,endpoint,continuation==NONE);
   work[at+4u+end]=endpoint;
@@ -899,6 +1070,164 @@ fn ownerNodeOf(source:vec2u)->u32{
  }
  return NONE;
 }
+
+// The fork producer's junction side table (compiled-construction-topology.ts
+// TOPOLOGY_PART_JUNCTION_*) is resident in this source's topology words right
+// after the part packet's canonical table; its offsets are relative to the
+// packet start. A missing, foreign or malformed table is NONE, and the anchor
+// keeps its incumbent decision.
+fn junctionPacket(header:u32)->u32{
+ let total=arrayLength(&work);
+ if(header==NONE||header+${TOPOLOGY_PART_MAGIC_WORD+1}u>=total||work[header+${TOPOLOGY_PART_MAGIC_WORD}u]!=${TOPOLOGY_PART_MAGIC}u){return NONE;}
+ let offset=work[header+${TOPOLOGY_PART_MAGIC_WORD+1}u];if(offset<5u||header+offset+5u>total){return NONE;}
+ let packet=header+offset-5u;if(work[packet]!=${TOPOLOGY_PART_PACKET_MAGIC}u){return NONE;}
+ return packet;
+}
+fn junctionTable(packet:u32)->u32{
+ if(packet==NONE){return NONE;}
+ let total=arrayLength(&work);let side=packet+work[packet+3u]+work[packet+4u];if(side+16u>total){return NONE;}
+ var at=side;
+ if(work[side]==${TOPOLOGY_PART_CANONICAL_MAGIC}u&&work[side+1u]==${TOPOLOGY_PART_CANONICAL_VERSION}u){at=packet+work[side+4u]+work[side+5u];}
+ if(at+16u>total||work[at]!=${TOPOLOGY_PART_JUNCTION_MAGIC}u||work[at+1u]!=${TOPOLOGY_PART_JUNCTION_VERSION}u){return NONE;}
+ return at;
+}
+fn junctionArmBit(armAt:u32,arms:u32,label:u32)->u32{
+ for(var i=0u;i<arms;i++){if(work[armAt+i*${TOPOLOGY_PART_JUNCTION_ARM_WORDS}u]==label){return 1u<<i;}}
+ return 0u;
+}
+// A record the consumer may use: COMPLETE, no missing arm, 2..32 arms each
+// COMPLETE, its arm and edge ranges inside the words.
+fn junctionUsable(packet:u32,row:u32)->bool{
+ let total=arrayLength(&work);if(row+${TOPOLOGY_PART_JUNCTION_RECORD_WORDS}u>total){return false;}
+ let flags=work[row+2u];if((flags&${TOPOLOGY_PART_JUNCTION_FLAG_COMPLETE}u)==0u||(flags&${TOPOLOGY_PART_JUNCTION_FLAG_MISSING_ARM}u)!=0u){return false;}
+ let arms=work[row+4u];let armAt=packet+work[row+3u];if(arms<2u||arms>${SOURCE_JUNCTION_ARM_LIMIT}u||armAt+arms*${TOPOLOGY_PART_JUNCTION_ARM_WORDS}u>total){return false;}
+ for(var i=0u;i<arms;i++){if((work[armAt+i*${TOPOLOGY_PART_JUNCTION_ARM_WORDS}u+1u]&${TOPOLOGY_PART_JUNCTION_ARM_COMPLETE}u)==0u){return false;}}
+ return packet+work[row+5u]+work[row+6u]*${TOPOLOGY_PART_JUNCTION_EDGE_WORDS}u<=total;
+}
+// Does every arm section of this record meet at packet vertex v (its own label
+// plus the labels across its band edges)? Packet-internal: no relation port.
+fn junctionMeets(packet:u32,row:u32,v:u32)->bool{
+ let arms=work[row+4u];let armAt=packet+work[row+3u];let edges=work[row+6u];let edgeAt=packet+work[row+5u];
+ var met=0u;
+ for(var e=0u;e<edges;e++){
+  let at=edgeAt+e*${TOPOLOGY_PART_JUNCTION_EDGE_WORDS}u;if(work[at+3u]!=v&&work[at+4u]!=v){continue;}
+  met|=junctionArmBit(armAt,arms,work[at+5u])|junctionArmBit(armAt,arms,work[at+6u]);
+ }
+ return met==select(0xffffffffu,(1u<<arms)-1u,arms<32u);
+}
+// The packet vertices of relation r's endpoint (end) and of its far end, with
+// the far and own labels: (vertex, far vertex, far label, own label), or NONE
+// in x. The SOURCE-PORT NAMESPACE problem is avoided entirely: a band relation
+// (kind 0/2) carries its index edge's id in key.w (sourceEdge(id).x, the
+// lowest incidence halfedge, surface-relations) with its ports ordered by that
+// halfedge, and every packet edge names that same index edge id plus its own
+// halfedge. The packet's representative ids are compared only with packet ids.
+fn forkEnd(packet:u32,row:u32,r:Relation,end:u32)->vec4u{
+ let k=kind(r);if(k!=0u&&k!=2u){return vec4u(NONE);}let edge=r.key.w;if((edge&0x80000000u)!=0u){return vec4u(NONE);}
+ let edges=work[row+6u];let edgeAt=packet+work[row+5u];var other=NONE;var others=0u;
+ for(var e=0u;e<edges;e++){
+  let at=edgeAt+e*${TOPOLOGY_PART_JUNCTION_EDGE_WORDS}u;if(work[at]!=edge){continue;}
+  // The relation's own halfedge: end 0 is its from (packet a).
+  if(work[at+1u]==edge){return select(vec4u(work[at+3u],work[at+4u],work[at+6u],work[at+5u]),vec4u(work[at+4u],work[at+3u],work[at+5u],work[at+6u]),end==1u);}
+  other=at;others++;
+ }
+ // Only the opposite incidence lies in the band (a band boundary edge): its
+ // from is the relation's to. Two or more foreign incidences are ambiguous.
+ if(others!=1u){return vec4u(NONE);}
+ return select(vec4u(work[other+4u],work[other+3u],work[other+5u],work[other+6u]),vec4u(work[other+3u],work[other+4u],work[other+6u],work[other+5u]),end==1u);
+}
+fn junctionDirection(origin:vec4f,away:vec4f)->u32{return direction(away.xy-origin.xy);}
+// The arm an endpoint at the joint reaches, by source ownership: the far end's
+// arm when the far end carries one (the edge leads into that arm), else the
+// joint's own arm when this edge is owned by it, else none (interior).
+fn forkArm(armAt:u32,arms:u32,e:vec4u)->u32{
+ if(junctionArmBit(armAt,arms,e.z)!=0u){return e.z;}
+ if(junctionArmBit(armAt,arms,e.w)!=0u){return e.w;}
+ return NONE;
+}
+const FORK_UNION=4u;
+
+// source JOINT when it maps (forkEnd) to a packet vertex at which every arm of
+// a usable fork record meets. Every usable record meeting at that joint takes
+// part (their union, in table order, at most FORK_UNION; a larger union keeps
+// the incumbent), and EVERY arm of every one of them must be reached by an
+// incident relation (the first in stable source order per arm, forkArm) and
+// be visible at the joint. In each record the last arm (an upper section) is
+// the trunk and every other arm, in record order, one continued branch: one
+// retained branch_entry whole part (role 2) per branch, entering from the
+// trunk. A k-arm fork is k-1 cooperating retained parts at ONE source anchor,
+// each keyed by (fork record, branch section), so neither table nor incident
+// order changes any part's identity; every incident run keeps playing its own
+// arm passage up to that anchor. Every part of the union is legal (retained
+// entry present, fits the owner) before any is emitted; otherwise false and
+// the caller's incumbent decision runs unchanged, so nothing is replaced
+// partially.
+fn junctionSourceFork(r:Relation,end:u32,node:u32,size:u32,owner:u32,low:f32,high:f32)->bool{
+ let packet=junctionPacket(topologyHeader(r));let table=junctionTable(packet);if(table==NONE){return false;}
+ let records=min(work[table+3u],${SOURCE_JUNCTION_RECORD_LIMIT}u);let recordAt=packet+work[table+2u];
+ var joint=NONE;
+ for(var k=0u;k<records;k++){
+  let row=recordAt+k*${TOPOLOGY_PART_JUNCTION_RECORD_WORDS}u;if(!junctionUsable(packet,row)){continue;}
+  let e=forkEnd(packet,row,r,end);if(e.x!=NONE&&junctionMeets(packet,row,e.x)){joint=e.x;break;}
+ }
+ if(joint==NONE){return false;}
+ var forks:array<u32,FORK_UNION>;var count=0u;
+ for(var k=0u;k<records;k++){
+  let row=recordAt+k*${TOPOLOGY_PART_JUNCTION_RECORD_WORDS}u;if(!junctionUsable(packet,row)||!junctionMeets(packet,row,joint)){continue;}
+  if(count==FORK_UNION){return false;}forks[count]=row;count++;
+ }
+ var armEnd:array<u32,${SOURCE_JUNCTION_ARM_LIMIT*4}>;for(var i=0u;i<${SOURCE_JUNCTION_ARM_LIMIT*4}u;i++){armEnd[i]=NONE;}
+ var visible=false;var member=atomicLoad(&nodes[node].second);
+ loop{if(member==0u){break;}let endpoint=member-1u;member=work[linkAt(endpoint/2u)+12u+(endpoint&1u)];
+  let x=relations[endpoint/2u];var reached=false;
+  for(var c=0u;c<count;c++){
+   let row=forks[c];let e=forkEnd(packet,row,x,endpoint&1u);if(e.x!=joint){continue;}
+   let arms=work[row+4u];let armAt=packet+work[row+3u];let arm=forkArm(armAt,arms,e);if(arm==NONE){continue;}
+   for(var i=0u;i<arms;i++){let slot=c*${SOURCE_JUNCTION_ARM_LIMIT}u+i;if(work[armAt+i*${TOPOLOGY_PART_JUNCTION_ARM_WORDS}u]==arm&&(armEnd[slot]==NONE||choose(armEnd[slot],endpoint)==endpoint)){armEnd[slot]=endpoint;}}
+   reached=true;
+  }
+  if(!reached){continue;}
+  var interval=partitions[(endpoint/2u)*2u];
+  loop{if(interval==0u){break;}let item=intervals[interval-1u];let t=f32(endpoint&1u);visible=visible||((item.cause&3u)==0u&&item.lo<=t&&item.hi>=t);interval=partitions[p.extent.x*2u+(interval-1u)*2u];}
+ }
+ if(!visible){return false;}
+ let q=page(select(r.a,r.b,end==1u));
+ let rows=u32(max(1.0,ceil((high-low)/17.0)));let width=real(atomicLoad(&nodes[owner].maxX))-real(atomicLoad(&nodes[owner].minX));
+ var parts=0u;
+ for(var c=0u;c<count;c++){
+  let arms=work[forks[c]+4u];
+  for(var i=0u;i<arms;i++){if(armEnd[c*${SOURCE_JUNCTION_ARM_LIMIT}u+i]==NONE){return false;}}
+  let trunk=armEnd[c*${SOURCE_JUNCTION_ARM_LIMIT}u+arms-1u];let t=relations[trunk/2u];let incoming=junctionDirection(q,page(select(t.b,t.a,(trunk&1u)==1u)));
+  for(var i=0u;i+1u<arms;i++){
+   let branch=armEnd[c*${SOURCE_JUNCTION_ARM_LIMIT}u+i];let b=relations[branch/2u];let outgoing=junctionDirection(q,page(select(b.b,b.a,(branch&1u)==1u)));
+   let program=p.table.w+((2u*3u+size)*64u+incoming*8u+outgoing)*8u;
+   if(work[program+1u]==0u||work[program+6u]>rows||f32(work[program+7u])>max(11.0,ceil(width/11.0)*11.0)){return false;}
+   parts++;
+  }
+ }
+ // All parts or none: one reservation for the whole union.
+ let base=atomicAdd(&nodes[p.extent.z].first,parts);let slot=atomicAdd(&nodes[p.extent.z].second,parts);
+ if(base+parts>p.extent.y){atomicOr(&nodes[p.extent.z].degree,2u);}
+ if(slot+parts>p.sourceExtent.z){atomicOr(&nodes[p.extent.z].degree,4u);}
+ if(base+parts>p.extent.y||slot+parts>p.sourceExtent.z){return true;}
+ let group=topologyGroup(r,r.ports[end]);var at=0u;
+ for(var c=0u;c<count;c++){
+  let row=forks[c];let arms=work[row+4u];let armAt=packet+work[row+3u];let fork=work[row+1u];
+  let trunk=armEnd[c*${SOURCE_JUNCTION_ARM_LIMIT}u+arms-1u];let t=relations[trunk/2u];let incoming=junctionDirection(q,page(select(t.b,t.a,(trunk&1u)==1u)));
+  for(var i=0u;i+1u<arms;i++){
+   let branch=armEnd[c*${SOURCE_JUNCTION_ARM_LIMIT}u+i];let b=relations[branch/2u];let outgoing=junctionDirection(q,page(select(b.b,b.a,(branch&1u)==1u)));
+   let program=p.table.w+((2u*3u+size)*64u+incoming*8u+outgoing)*8u;let section=work[armAt+i*${TOPOLOGY_PART_JUNCTION_ARM_WORDS}u];
+   points[base+at]=sourcePoint(r,f32(end),0.0,true);
+   // The joint's source key, the fork record and the branch SECTION: a stable
+   // identity across frames, cuts, table order and incident-relation order.
+   let identity=(r.key.x*0x9e3779b9u)^(r.key.y*0x85ebca6bu)^r.ports[end]^0x10000000u^(fork*0x85ebca6bu)^(section*0x27d4eb2fu);
+   let flags=2u|0x10000u|(incoming<<20u)|(outgoing<<23u);
+   runs[slot+at]=Run(vec4u(base+at,1,flags,size),vec4u(identity,r.key.x|(r.key.z&0x80000000u),r.key.y,identity^group),vec4u(work[program],work[program+1u],work[program+2u],work[program+3u]),vec4u(work[program+4u],work[program+5u],r.ports[end],0x10000000u),vec4u(0u));
+   at++;
+  }
+ }
+ return true;
+}
 const CONTACT_PART_LEAST=.4;
 const CONTACT_PART_MOST=1.0;
 fn contactAnchor(id:u32,r:Relation){
@@ -943,6 +1272,8 @@ fn contactAnchor(id:u32,r:Relation){
  let id=gid.x+gid.y*p.table.z*64u;if(id>=count()||sourceStatus[1]!=0u){return;}
  let r=relations[id];let at=linkAt(id);if(work[at+7u]==0u){return;}
  if(kind(r)==4u){contactAnchor(id,r);return;}
+
+ if(authoredPaired(r)){let pair=nodeFor(id*2u,PAIR_NODE);if(pair!=NONE&&(atomicLoad(&nodes[pair].degree)&0x80000000u)!=0u){return;}}
  if(shape(r)!=0u){return;}
  let owner=work[at+6u];if(owner==NONE){return;}
  let low=real(atomicLoad(&nodes[owner].minY));let high=real(atomicLoad(&nodes[owner].maxY));
@@ -950,6 +1281,9 @@ fn contactAnchor(id:u32,r:Relation){
  for(var end=0u;end<2u;end++){
   let criticalKind=critical(r,end);if(criticalKind==0u||select(r.a.w,r.b.w,end==1u)<.00001){continue;}
   let node=nodeFor(id*2u+end,JUNCTION_NODE);if(node==NONE||atomicLoad(&nodes[node].least)!=id*2u+end){continue;}
+
+  // source arms (junctionSourceFork); anything else keeps the incumbent below.
+  if(junctionSourceFork(r,end,node,size,owner,low,high)){continue;}
   let degree=atomicLoad(&nodes[node].degree);let fork=(criticalKind&2u)!=0u&&degree>=3u;let cap=degree==1u;
   if(!fork&&!cap){continue;}
   let q=page(select(r.a,r.b,end==1u));
@@ -1000,6 +1334,8 @@ fn contactAnchor(id:u32,r:Relation){
 @compute @workgroup_size(64) fn roundReserve(@builtin(global_invocation_id) gid:vec3u){
  let id=gid.x+gid.y*p.table.z*64u;if(id>=count()||sourceStatus[1]!=0u){return;}
  let at=linkAt(id);if(work[at+7u]==0u){return;}let r=relations[id];
+
+ if(authoredPaired(r)){let pair=nodeFor(id*2u,PAIR_NODE);if(pair!=NONE&&(atomicLoad(&nodes[pair].degree)&AUTHORED_PAIR_ATTEMPTED)!=0u){return;}authoredPairReserve(id,r);return;}
  if(shape(r)==3u&&kind(r)!=4u){
   let owner=work[at+6u];if(owner==NONE||atomicLoad(&nodes[owner].least)!=id*2u){return;}
   let slot=atomicAdd(&nodes[p.extent.z].second,1u);
@@ -1012,7 +1348,7 @@ fn contactAnchor(id:u32,r:Relation){
  let faceWord=faceEdge(r);let face=faceWord!=0u&&!faceHidden(faceWord);
  if(!round&&!box&&!face){return;}
  let owner=work[at+6u];if(owner==NONE||atomicLoad(&nodes[owner].least)!=id*2u){return;}
- let total=atomicLoad(&nodes[owner].second);if(total==0u||(atomicLoad(&nodes[owner].degree)&1u)==0u){return;}
+ let total=atomicLoad(&nodes[owner].second);if(total==0u||((atomicLoad(&nodes[owner].degree)&1u)==0u&&!(box||face))){return;}
  let low=real(atomicLoad(&nodes[owner].minY));let high=real(atomicLoad(&nodes[owner].maxY));let height=high-low;
  // Every planar VOLUME at every size is ONE edge construction: a cube, a
  // pedestal, a room, a building block. The class is the compiled topology
@@ -1096,11 +1432,16 @@ fn pairBefore(a:u32,b:u32)->bool{
 @compute @workgroup_size(64) fn assemble(@builtin(global_invocation_id) gid:vec3u){
  let id=gid.x+gid.y*p.table.z*64u;if(id>=count()||sourceStatus[1]!=0u){return;}
  let at=linkAt(id);if(work[at+7u]==0u){return;}let r=relations[id];let form=shape(r);
+
+ // and nothing else; an unreserved one falls through to per-edge assembly
+ // (never into an owner round/box/face packet, which it was not counted in).
+ let authored=authoredPaired(r);
+ if(authored){let pair=nodeFor(id*2u,PAIR_NODE);if(pair!=NONE&&(atomicLoad(&nodes[pair].degree)&0x80000000u)!=0u){authoredPairFill(r,pair);return;}}
  // A face-owned edge fills its owner's reserved face construction as a box
  // edge; a compiled-out face edge is drawn by nothing (slice 1b).
  let faceWord=faceEdge(r);if(faceHidden(faceWord)){return;}
  let round=form==2u&&kind(r)==0u;let box=(form==1u&&(kind(r)==0u||kind(r)==2u))||faceWord!=0u;
- let reserved=round||box;let owner0=work[at+6u];
+ let reserved=(round||box)&&!authored;let owner0=work[at+6u];
  if(reserved&&(owner0==NONE||(atomicLoad(&nodes[owner0].degree)&0x80000000u)!=0u)){
   // Fill the owner's reserved whole-form run. The parameter is the ORIGINAL
   // source edge address, stable across frames and independent of which
@@ -1110,9 +1451,9 @@ fn pairBefore(a:u32,b:u32)->bool{
   loop{if(part==0u){break;}let interval=intervals[part-1u];if(finiteInterval(r,interval)){n+=2u;}part=partitions[p.extent.x*2u+(part-1u)*2u];}
   // A face edge reserves one descriptor pair and one draw pair for its whole
   // source passage. The partition list is visibility data, not an endpoint
-  // stream.
-  var faceHasVisible=false;if(faceWord!=0u){faceHasVisible=faceVisible(id,r);n=select(0u,4u,faceHasVisible);}
-  else if(box&&n>0u){n=2u;}
+  // stream. A volume edge always reserves its original endpoint pair too.
+  var faceHasVisible=false;if(faceWord!=0u){faceHasVisible=faceVisible(id,r);n=4u;}
+  else if(box){n=2u;}
   if(n==0u){return;}
   var output=atomicLoad(&nodes[owner].least)+atomicAdd(&nodes[owner].second,n);
   if(box){
@@ -1123,18 +1464,20 @@ fn pairBefore(a:u32,b:u32)->bool{
    // visibility per intact glyph, not by replacing the construction graph
    // with the hull of its visible intervals. An edge on a crease or ground is
    // cut by the depth test into slivers; those slivers are not corners,
-   // lids or depth edges. An edge less than 12% visible is hidden; a
-   // visible crease keeps more than that, a back edge's slivers less.
-   let end=output+n;let span=front(r);let length=max(.000001,span.y-span.x);
-   var lo=2.0;var hi=-1.0;var covered=0.0;part=partitions[id*2u];
+   // lids or depth edges.
+   let end=output+n;let span=front(r);
+   var edgeHasVisible=false;part=partitions[id*2u];
    loop{if(part==0u){break;}let interval=intervals[part-1u];
-    if(finiteInterval(r,interval)&&(interval.cause&3u)==0u){let l=max(interval.lo,span.x);let h=min(interval.hi,span.y);lo=min(lo,l);hi=max(hi,h);covered+=max(0.0,h-l);}
+    if(finiteInterval(r,interval)&&(interval.cause&3u)==0u){edgeHasVisible=true;}
     part=partitions[p.extent.x*2u+(part-1u)*2u];}
    // A face packet is retained for ANY real visible interval. Its whole-edge
    // passage is then filtered per native scalar by the face consumer; a
    // fragment-size cutoff would turn visibility into a producer-side drop.
-   if((faceWord!=0u&&faceHasVisible)||(faceWord==0u&&hi>lo&&covered>=.12*length)){
-    let ordinal=f32(r.key.w&0xffffu);
+   // The 12% source-drop rule is intentionally gone. The complete original
+   // box edge remains in the packet at 0%, 11%, 13% and 100% visibility;
+   // only the point visibility flags and downstream native-unit visibility
+   // decide whether ink is emitted.
+   let ordinal=f32(r.key.w&0xffffu);
     if(faceWord!=0u){
      // Keep the original homogeneous endpoints/ports once, then the finite
      // display span. The original feature address stays in visible.w and the
@@ -1142,14 +1485,13 @@ fn pairBefore(a:u32,b:u32)->bool{
      // visibility cut is never a corner; sourcePoint marks ports only for
      // t==0/1. This is one packet per source feature, not
      // (edgeOrdinal+t)/65536 as its identity.
+     points[output]=wholeEdgeDescriptorPoint(r,0u);points[output+1u]=wholeEdgeDescriptorPoint(r,1u);output+=2u;
      if(faceHasVisible){
-      points[output]=wholeEdgeDescriptorPoint(r,0u);points[output+1u]=wholeEdgeDescriptorPoint(r,1u);
-      points[output+2u]=sourcePoint(r,span.x,span.x,true);points[output+3u]=sourcePoint(r,span.y,span.y,false);output+=4u;
+      points[output]=sourcePoint(r,span.x,span.x,true);points[output+1u]=sourcePoint(r,span.y,span.y,false);output+=2u;
      }
     }else{
-     points[output]=sourcePoint(r,span.x,(ordinal+span.x)/65536.0,true);points[output+1u]=sourcePoint(r,span.y,(ordinal+span.y)/65536.0,false);output+=2u;
+     points[output]=sourcePoint(r,span.x,(ordinal+span.x)/65536.0,edgeHasVisible);points[output+1u]=sourcePoint(r,span.y,(ordinal+span.y)/65536.0,false);output+=2u;
     }
-   }
    for(;output<end;output++){points[output]=Point(vec4f(0.0),vec4u(0u));}
    return;
   }
@@ -1160,7 +1502,7 @@ fn pairBefore(a:u32,b:u32)->bool{
  // An unreserved rounded boundary (no visible interval) draws nothing. An
  // unreserved planar owner is a surface (a field, a chunk: many planes or
  // many edges), whose ranked creases are the per-edge runs below.
- if(round){return;}
+ if(round&&!authored){return;}
  // The root is chosen by ORIGINAL source address, not atomic emission order.
  var start=choose(work[at+4u],work[at+5u]);
  if(start/2u!=id){return;}
@@ -1181,7 +1523,12 @@ fn pairBefore(a:u32,b:u32)->bool{
   loop{if(part==0u){break;}let interval=intervals[part-1u];if(finiteInterval(q,interval)){pointCount+=2u;anyVisible=anyVisible||(interval.cause&3u)==0u;}part=partitions[p.extent.x*2u+(part-1u)*2u];}
   let next=work[linkAt(edge)+(1u-(endpoint&1u))];if(next==NONE||next==start){break;}endpoint=next;
  }
- if(!anyVisible||pointCount==0u){return;}
+
+ // standing form the far strip takes whole (standingRetained) is still that
+ // owner's source: reserve it with every point hidden, so the kind-3 profile
+ // reads the owner's complete outline before foreground visibility, never the
+ // walks that happen to survive it. Any other unseen walk is not reserved.
+ if(pointCount==0u||(!anyVisible&&!standingRetained(r,low,high))){return;}
  let base=atomicAdd(&nodes[p.extent.z].first,pointCount);let slot=atomicAdd(&nodes[p.extent.z].second,1u);
  if(base+pointCount>p.extent.y){atomicOr(&nodes[p.extent.z].degree,2u);}
  if(slot>=p.sourceExtent.z){atomicOr(&nodes[p.extent.z].degree,4u);}
@@ -1240,7 +1587,7 @@ fn pairBefore(a:u32,b:u32)->bool{
  // A run that is not a contact carries its owner's page rows (top, bottom,
  // each + 16384 in 16 bits) so articulation can tell which part of the form
  // each row of the run lies on. A contact keeps its two ports here.
- let rows=u32(clamp(low.y+16384.0,0.0,65535.0))|(u32(clamp(high.y+16384.0,0.0,65535.0))<<16u);
+ let rows=ownerRows(low,high);
  var contact=select(vec4u(0u,0u,rows,0u),vec4u(r.ports.zw,u32(r.coordinates.z),r.ports.x),kind(r)==4u);
  // A source vertex where exactly two hard edges of one source and one feature
  // family end unjoined is ONE junction, not two colliding run ends. Each run
@@ -1297,7 +1644,10 @@ fn pairBefore(a:u32,b:u32)->bool{
  // size in bits 0..1 and carries the selected source feature/role in the
  // high bits. Articulation reads it once for the whole run; absent/legacy
  // records leave the incumbent role path unchanged.
- let sourceProgram=sourcePartProgram(r);var programmedSize=size;var correspondence=vec4u(0u);
+
+ // interval) joins no whole-part group and no limb pair: it can lead no
+ // part and pair no tube, exactly as when it was not reserved at all.
+ var sourceProgram=vec4u(0u);if(anyVisible){sourceProgram=sourcePartProgram(r);}var programmedSize=size;var correspondence=vec4u(0u);
  if(sourceProgram.x!=0u&&sourceProgram.x<=0x07ffffffu){
   let authored=sourceProgram.y;
   // The compact feature token is a collision-free source-program ordinal.
@@ -1319,7 +1669,7 @@ fn pairBefore(a:u32,b:u32)->bool{
  // edge from a limb onto a fork, a cap or another chain (or onto a vertex
  // with no limb word) carries 0: its run keeps the incumbent pairing rather
  // than taking whichever endpoint happened to answer first.
- if(kind(r)<=1u&&shape(r)==0u){let a=limbVertex(r,r.ports.x);let b=limbVertex(r,r.ports.y);contact.w=select(0u,a,a!=0u&&a==b);}
+ if(anyVisible&&kind(r)<=1u&&shape(r)==0u){let a=limbVertex(r,r.ports.x);let b=limbVertex(r,r.ports.y);contact.w=select(0u,a,a!=0u&&a==b);}
  runs[slot]=Run(vec4u(base,output-base,flags,programmedSize),vec4u(identity,r.key.x|(r.key.z&0x80000000u),r.key.y,identity),vec4u(r.key.w,r.key.z,joins,teeWords.x),contact,correspondence);
 }
 `;
@@ -1344,7 +1694,7 @@ export const CONSTRUCTION_RUN_WORDS=20;
 function sourceRunPipelinePlan(device:GPUDevice){
  const layout=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:'uniform'}},...[1,2,3,4].map(binding=>({binding,visibility:GPUShaderStage.COMPUTE,buffer:{type:'read-only-storage' as const}})),...[5,6,7,8].map(binding=>({binding,visibility:GPUShaderStage.COMPUTE,buffer:{type:'storage' as const}}))]});
  const module=(entryPoint:string)=>device.createShaderModule({label:'MAIN retained source construction runs '+entryPoint,code:isolateComputeEntry(GPU_CONSTRUCTION_RUNS_SHADER,entryPoint)}),pipeline=device.createPipelineLayout({bindGroupLayouts:[layout]});
- return {layout,plans:new Map(['initialize','incidence','connect','jump','finishJumps','roundReserve','anchors','assemble','canonPackets'].map(entryPoint=>[entryPoint,()=>({layout:pipeline,compute:{module:module(entryPoint),entryPoint}})]))};
+ return {layout,plans:new Map(['initialize','incidence','authoredPairValidate','authoredPairReserveStage','connect','jump','finishJumps','roundReserve','anchors','assemble','canonPackets'].map(entryPoint=>[entryPoint,()=>({layout:pipeline,compute:{module:module(entryPoint),entryPoint}})]))};
 }
 function indexedRunPipelinePlan(device:GPUDevice){
  const layout=device.createBindGroupLayout({entries:[0,1,2,3,4,5].map(binding=>({binding,visibility:GPUShaderStage.COMPUTE,buffer:{type:binding===0?'uniform':binding===4?'storage':'read-only-storage'} as const}))});
@@ -1353,6 +1703,14 @@ function indexedRunPipelinePlan(device:GPUDevice){
 }
 interface PreparedRunFamily {readonly layout:GPUBindGroupLayout;readonly pipelines:ReadonlyMap<string,GPUComputePipeline>}
 interface PreparedSourceRunPipelines extends PreparedRunFamily {readonly indexed:PreparedRunFamily}
+// Only immutable programs/layouts have device lifetime. Each instance still
+// owns its topology arena, empty-plane buffer, pending work and disposal.
+const sourceRunPrograms=new DeviceComputePrograms((device:GPUDevice)=>{
+ const {layout,plans}=sourceRunPipelinePlan(device);return {resources:layout,plans};
+});
+const indexedRunPrograms=new DeviceComputePrograms((device:GPUDevice)=>{
+ const {layout,plans}=indexedRunPipelinePlan(device);return {resources:layout,plans};
+});
 /** Owns GPU source topology scratch, never native output/publication. */
 export class GpuConstructionRuns {
  private runExtent=65536;private pointExtent=262144;private hashExtent=0;
@@ -1507,18 +1865,22 @@ export class GpuConstructionRuns {
   const heap=this.arena!.heap;
   Object.assign(constructionArena,{sources:this.slots.size,arenaBytes:heap.capacity*4,usedBytes:(heap.capacity-heap.freeWords)*4,freeBytes:heap.freeWords*4});
  }
- static async create(device:GPUDevice,anchorContexts:Uint32Array,progress?:(fraction:number)=>void):Promise<GpuConstructionRuns>{
-  const {layout,plans}=sourceRunPipelinePlan(device),pipelines=await prepareComputePipelines(device,plans,p=>progress?.(p*2/3));
-  const indexed=indexedRunPipelinePlan(device),indexedPipelines=await prepareComputePipelines(device,indexed.plans,p=>progress?.(2/3+p/3));
-  return new GpuConstructionRuns(device,anchorContexts,{layout,pipelines,indexed:{layout:indexed.layout,pipelines:indexedPipelines}});
+ static async create(device:GPUDevice,anchorContexts:Uint32Array,progress?:ComputePipelineProgress):Promise<GpuConstructionRuns>{
+  const sourceProgress=progress===undefined?undefined:(p:number,stage?:string)=>progress(p*2/3,stage);
+  const indexedProgress=progress===undefined?undefined:(p:number,stage?:string)=>progress(2/3+p/3,stage);
+  const source=await sourceRunPrograms.prepare(device,sourceProgress);
+  const indexed=await indexedRunPrograms.prepare(device,indexedProgress);
+  return new GpuConstructionRuns(device,anchorContexts,{layout:source.resources,pipelines:source.pipelines,indexed:{layout:indexed.resources,pipelines:indexed.pipelines}});
  }
  constructor(private readonly device:GPUDevice,private readonly anchorContexts:Uint32Array,prepared?:PreparedSourceRunPipelines){
-  const indexed=prepared?.indexed??(()=>{const {layout,plans}=indexedRunPipelinePlan(device);return {layout,pipelines:compileComputePipelines(device,plans)};})();
+  // Resolve BOTH banks before allocating instance state. A failed source
+  // bank must not trigger synchronous indexed compilation or leak a buffer.
+  const source=prepared??(()=>{const {resources:layout,pipelines}=sourceRunPrograms.get(device);return {layout,pipelines};})();
+  const indexed=prepared?.indexed??(()=>{const {resources:layout,pipelines}=indexedRunPrograms.get(device);return {layout,pipelines};})();
+  this.layout=source.layout;this.pipelines=source.pipelines;
   this.gpuIndexedLayout=indexed.layout;this.gpuIndexedClearPipeline=indexed.pipelines.get('clear')!;this.gpuIndexedUnionPipeline=indexed.pipelines.get('unionBoundaryPass')!;
   this.gpuIndexedFinalizePipeline=indexed.pipelines.get('finalizeBoundary')!;this.gpuIndexedClassifyPipeline=indexed.pipelines.get('classify')!;
   this.gpuIndexedEmptyPlaneFaces=device.createBuffer({label:'MAIN GPU indexed source empty plane table',size:4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});device.queue.writeBuffer(this.gpuIndexedEmptyPlaneFaces,0,new Uint32Array([0xffffffff]));
-  if(prepared){this.layout=prepared.layout;this.pipelines=prepared.pipelines;}
-  else{const {layout,plans}=sourceRunPipelinePlan(device);this.layout=layout;this.pipelines=compileComputePipelines(device,plans);}
  }
  private encodeGpuIndexed(pass:GPUComputePassEncoder,item:GpuIndexedSourceConstructionClass,slot:number,initialize:boolean):void{
    const input=item.gpuIndexed;if(!input)return;const compact=gpuIndexedQuadContext(input),p=this.device.createBuffer({label:'MAIN GPU indexed source construction params',size:64,usage:GPUBufferUsage.UNIFORM,mappedAtCreation:true});
@@ -1584,7 +1946,7 @@ export class GpuConstructionRuns {
    const pipeline=this.pipelines.get(name)!,group=this.device.createBindGroup({layout:this.layout,entries:list.map((buffer,binding)=>({binding,resource:{buffer}}))});
    const pass=encoder.beginComputePass({label:`MAIN GPU construction ${name}`});pass.setPipeline(pipeline);pass.setBindGroup(0,group);pass.dispatchWorkgroups(Math.min(columns,Math.ceil(amount/64)),Math.ceil(Math.ceil(amount/64)/columns));pass.end();
   };
-  dispatch('initialize',linkA,linkB,Math.max(hashCapacity,runCapacity));dispatch('incidence',linkA,linkB,capacity);dispatch('connect',linkA,linkB,capacity);
+  dispatch('initialize',linkA,linkB,Math.max(hashCapacity,runCapacity));dispatch('incidence',linkA,linkB,capacity);dispatch('authoredPairValidate',linkA,linkB,capacity);dispatch('authoredPairReserveStage',linkA,linkB,capacity);dispatch('connect',linkA,linkB,capacity);
 
 
 

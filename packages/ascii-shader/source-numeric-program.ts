@@ -1,5 +1,6 @@
 
 import {TOPOLOGY_HEADER_WORDS,PACKED_RUN_CONTEXT,TOPOLOGY_LIMB_MAGIC,TOPOLOGY_LIMB_MAGIC_WORD,TOPOLOGY_PART_MAGIC,TOPOLOGY_PART_MAGIC_WORD,TOPOLOGY_PART_PACKET_MAGIC,TOPOLOGY_PART_PROGRAM_WORDS} from './compiled-construction-topology.ts';
+import {SOURCE_PUBLISHED_AUTHORITY_MAGIC,SOURCE_PUBLISHED_AUTHORITY_VERSION,SOURCE_PUBLISHED_AUTHORITY_HEADER_WORDS,SOURCE_SEMANTIC_VERSION} from './source-semantic-residual.ts';
 
 /** Registration kernels, never displayed-frame work. Hashes identify exact
  * keys; canonical labels are minimum original IDs. Lists are sorted before
@@ -73,6 +74,19 @@ fn contactCanonical(e:u32)->u32{
  for(var probe=0u;probe<=p.facts.z;probe++){let found=atomicLoad(&scratch[at]);if(found!=0u&&sameEdge(contactKey(found-1u),key)){return found-1u;}at=(at+1u)&p.facts.z;}
  atomicOr(&packet[15u],2u);return e;
 }
+// Versioned semantic suffix for published P0. The suffix is accepted only
+// when every packed array is inside the semantic asset and its extents match
+// the source header; otherwise the CPU admission keeps the incumbent path.
+fn publishedAuthorityAt()->u32{
+ if(arrayLength(&semantic)<50u||semantic[1u]!=${SOURCE_SEMANTIC_VERSION}u){return 0u;}
+ let at=semantic[48u];let words=semantic[49u];let length=arrayLength(&semantic);
+ if(at<50u||words<${SOURCE_PUBLISHED_AUTHORITY_HEADER_WORDS}u||at>length||words>length-at){return 0u;}
+ if(semantic[at]!=${SOURCE_PUBLISHED_AUTHORITY_MAGIC}u||semantic[at+1u]!=${SOURCE_PUBLISHED_AUTHORITY_VERSION}u||semantic[at+2u]!=words){return 0u;}
+ let v=semantic[at+3u];let e=semantic[at+4u];let c=semantic[at+5u];let m=semantic[at+6u];
+ if(v!=p.dims.x||e!=p.dims.z||c!=p.dims.w||m!=p.facts.x||words!=${SOURCE_PUBLISHED_AUTHORITY_HEADER_WORDS}u+v*3u+c*2u+e+m*2u){return 0u;}
+ if(semantic[at+7u]!=at+${SOURCE_PUBLISHED_AUTHORITY_HEADER_WORDS}u||semantic[at+8u]!=at+${SOURCE_PUBLISHED_AUTHORITY_HEADER_WORDS}u+v||semantic[at+9u]!=at+${SOURCE_PUBLISHED_AUTHORITY_HEADER_WORDS}u+v*2u||semantic[at+10u]!=at+${SOURCE_PUBLISHED_AUTHORITY_HEADER_WORDS}u+v*3u||semantic[at+11u]!=at+${SOURCE_PUBLISHED_AUTHORITY_HEADER_WORDS}u+v*3u+c*2u||semantic[at+12u]!=at+${SOURCE_PUBLISHED_AUTHORITY_HEADER_WORDS}u+v*3u+c*2u+e){return 0u;}
+ return at;
+}
 // Old baked six-word records must never be published under the current
 // twelve-word run-program header. Unavailable metadata keeps incumbent runs;
 // rebuilding the semantic asset supplies the new declared anchors.
@@ -99,6 +113,17 @@ fn currentPartPacket()->bool{
  // Copy the opaque declared payload in parallel. Validate its VERSION only
  // once below (id==0) before publishing any reader pointer, not per edge.
  if(id<semantic[34u]){atomicStore(&program[TOPOLOGY_HEADER+p.dims.y+semantic[15u]+semantic[32u]+id],semantic[semantic[33u]+id]);}
+ let authority=publishedAuthorityAt();
+ if(authority!=0u){
+  let v=semantic[authority+3u];let e=semantic[authority+4u];let c=semantic[authority+5u];let m=semantic[authority+6u];
+  // The authority header stores absolute semantic-array offsets. The resident
+  // graph keeps the existing numeric convention (next+1, zero sentinel), so
+  // translate the source-owned zero-based/0xffffffff table at this seam.
+  let vertexCanon=semantic[authority+7u];let vertexNext=semantic[authority+8u];let vertexCounts=semantic[authority+9u];let contactRecords=semantic[authority+10u];let contactMembers=semantic[authority+12u];
+  if(id<v){let next=semantic[vertexNext+id];store(p.core.w+id,semantic[vertexCanon+id]);store(p.graph.x+id,select(next+1u,0u,next==0xffffffffu));store(p.graph.y+id,semantic[vertexCounts+id]);}
+  if(id<c*2u){let raw=semantic[contactRecords+id];store(p.graph.z+id,select(raw,p.material.x+raw*2u,(id&1u)==0u));}
+  if(id<m*2u){store(p.material.x+id,semantic[contactMembers+id]);}
+ }
  if(p.material.y!=0u&&id<semantic[21u]){store(p.material.y+id,semantic[semantic[20u]+id]);}
  if(id==0u){
   atomicStore(&program[0u],p.facts.w);atomicStore(&program[1u],semantic[6u]);atomicStore(&program[16u],semantic[9u]);
@@ -113,22 +138,40 @@ fn currentPartPacket()->bool{
  let id=(gid.x+gid.y*p.pose.w*64u);if(id>=semantic[19u]/2u){return;}let at=semantic[18u]+id*2u;let h=semantic[at];let context=semantic[at+1u];
  let group=(context&0x60000000u)|((context&0x07ffffffu)<<2u);atomicOr(&program[TOPOLOGY_HEADER+h],group);
 }
-@compute @workgroup_size(64) fn hashVertices(@builtin(global_invocation_id) gid:vec3u){if((gid.x+gid.y*p.pose.w*64u)<p.dims.x){insertVertex((gid.x+gid.y*p.pose.w*64u));}}
+// Published contacts also own run correspondence, not only packet incidence.
+// This dispatch follows seedRuntime and boundary setup. Both the copied CSR
+// table and run classes must be complete before their readers execute; one
+// workgroup cannot provide a global barrier within seedRuntime.
+@compute @workgroup_size(64) fn applyPublishedContacts(@builtin(global_invocation_id) gid:vec3u){
+ let authority=publishedAuthorityAt();if(authority==0u){return;}
+ let contact=gid.x+gid.y*p.pose.w*64u;if(contact>=p.dims.w){return;}
+ let records=semantic[authority+10u];let members=semantic[authority+12u];
+ let first=semantic[records+contact*2u];let count=semantic[records+contact*2u+1u];
+ for(var member=0u;member<count;member++){
+  let h=semantic[members+(first+member)*2u];
+  // CSR edge ordinals need not equal source-complex edge ordinals. Follow
+  // each exact published halfedge through the now-complete cornerEdge map.
+  let edge=csr(csr(6u)+h);store(p.graph.w+edge,contact+1u);
+  let old=atomicLoad(&program[TOPOLOGY_HEADER+h]);
+  atomicStore(&program[TOPOLOGY_HEADER+h],(old&3u)|0x40000000u|(contact<<2u));
+ }
+}
+@compute @workgroup_size(64) fn hashVertices(@builtin(global_invocation_id) gid:vec3u){if(publishedAuthorityAt()!=0u){return;}if((gid.x+gid.y*p.pose.w*64u)<p.dims.x){insertVertex((gid.x+gid.y*p.pose.w*64u));}}
 @compute @workgroup_size(64) fn resolveVertices(@builtin(global_invocation_id) gid:vec3u){
- let v=(gid.x+gid.y*p.pose.w*64u);if(v<p.dims.x){store(p.core.w+v,findVertex(v));}
+ if(publishedAuthorityAt()!=0u){return;}let v=(gid.x+gid.y*p.pose.w*64u);if(v<p.dims.x){store(p.core.w+v,findVertex(v));}
 }
 @compute @workgroup_size(64) fn linkVertices(@builtin(global_invocation_id) gid:vec3u){
- let v=(gid.x+gid.y*p.pose.w*64u);if(v>=p.dims.x){return;}let root=load(p.core.w+v);
+ if(publishedAuthorityAt()!=0u){return;}let v=(gid.x+gid.y*p.pose.w*64u);if(v>=p.dims.x){return;}let root=load(p.core.w+v);
  let old=atomicExchange(&scratch[p.scratch.x+root],v+1u);atomicStore(&scratch[p.scratch.y+v],old);
  atomicAdd(&packet[p.graph.y+root],1u);
 }
 @compute @workgroup_size(64) fn sortVertices(@builtin(global_invocation_id) gid:vec3u){
- let v=(gid.x+gid.y*p.pose.w*64u);if(v>=p.dims.x){return;}let root=load(p.core.w+v);var cursor=atomicLoad(&scratch[p.scratch.x+root]);var next=0xffffffffu;
+ if(publishedAuthorityAt()!=0u){return;}let v=(gid.x+gid.y*p.pose.w*64u);if(v>=p.dims.x){return;}let root=load(p.core.w+v);var cursor=atomicLoad(&scratch[p.scratch.x+root]);var next=0xffffffffu;
  loop{if(cursor==0u){break;}let other=cursor-1u;if(other>v){next=min(next,other);}cursor=atomicLoad(&scratch[p.scratch.y+other]);}
  store(p.graph.x+v,select(next+1u,0u,next==0xffffffffu));
 }
 @compute @workgroup_size(64) fn hashContactEdges(@builtin(global_invocation_id) gid:vec3u){
- let e=(gid.x+gid.y*p.pose.w*64u);if(e>=p.dims.z||edgeDegree(e)!=1u){return;}let key=contactKey(e);var at=contactHash(key);
+ if(publishedAuthorityAt()!=0u){return;}let e=(gid.x+gid.y*p.pose.w*64u);if(e>=p.dims.z||edgeDegree(e)!=1u){return;}let key=contactKey(e);var at=contactHash(key);
  for(var probe=0u;probe<=p.facts.z;probe++){
   var found=atomicLoad(&scratch[at]);loop{if(found!=0u){break;}let claim=atomicCompareExchangeWeak(&scratch[at],0u,e+1u);found=claim.old_value;if(claim.exchanged){return;}}
   if(sameEdge(contactKey(found-1u),key)){atomicMin(&scratch[at],e+1u);return;}at=(at+1u)&p.facts.z;
@@ -136,13 +179,14 @@ fn currentPartPacket()->bool{
  atomicOr(&packet[15u],2u);
 }
 @compute @workgroup_size(64) fn resolveContactEdges(@builtin(global_invocation_id) gid:vec3u){
- let e=(gid.x+gid.y*p.pose.w*64u);if(e<p.dims.z){if(edgeDegree(e)==1u){store(p.graph.w+e,contactCanonical(e)+1u);}else{store(p.graph.w+e,0u);}}
+ if(publishedAuthorityAt()!=0u){return;}let e=(gid.x+gid.y*p.pose.w*64u);if(e<p.dims.z){if(edgeDegree(e)==1u){store(p.graph.w+e,contactCanonical(e)+1u);}else{store(p.graph.w+e,0u);}}
 }
 @compute @workgroup_size(64) fn linkContactEdges(@builtin(global_invocation_id) gid:vec3u){
- let e=(gid.x+gid.y*p.pose.w*64u);if(e>=p.dims.z){return;}let stored=load(p.graph.w+e);if(stored==0u){return;}let root=stored-1u;
+ if(publishedAuthorityAt()!=0u){return;}let e=(gid.x+gid.y*p.pose.w*64u);if(e>=p.dims.z){return;}let stored=load(p.graph.w+e);if(stored==0u){return;}let root=stored-1u;
  let old=atomicExchange(&scratch[p.scratch.x+root],e+1u);atomicStore(&scratch[p.scratch.y+e],old);atomicAdd(&scratch[p.scratch.z+root],1u);
 }
 @compute @workgroup_size(1) fn prefixContacts(){
+ if(publishedAuthorityAt()!=0u){return;}
  var group=0u;var member=0u;
  for(var e=0u;e<p.dims.z;e++){
   let count=atomicLoad(&scratch[p.scratch.z+e]);if(load(p.graph.w+e)!=e+1u||count<2u){continue;}
@@ -154,7 +198,7 @@ fn currentPartPacket()->bool{
  if(group!=p.dims.w||member!=p.facts.x){atomicOr(&packet[15u],4u);}
 }
 @compute @workgroup_size(64) fn assembleContacts(@builtin(global_invocation_id) gid:vec3u){
- let e=(gid.x+gid.y*p.pose.w*64u);if(e>=p.dims.z){return;}let stored=load(p.graph.w+e);if(stored==0u){return;}let root=stored-1u;
+ if(publishedAuthorityAt()!=0u){return;}let e=(gid.x+gid.y*p.pose.w*64u);if(e>=p.dims.z){return;}let stored=load(p.graph.w+e);if(stored==0u){return;}let root=stored-1u;
  let group=atomicLoad(&scratch[p.scratch.w+root]);if(group==0u){store(p.graph.w+e,0u);return;}
  if(load(15u)!=0u){return;}var rank=0u;var cursor=atomicLoad(&scratch[p.scratch.x+root]);
  loop{if(cursor==0u){break;}let other=cursor-1u;if(other<e){rank++;}cursor=atomicLoad(&scratch[p.scratch.y+other]);}

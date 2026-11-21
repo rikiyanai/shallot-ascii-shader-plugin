@@ -16,8 +16,10 @@ class Parts {
         const key=point.map(n=>Math.round(n*1e5)).join(',');let id=this.ports.get(key);
         if(id===undefined){id=this.ports.size;this.ports.set(key,id);}return id;
     }
-    private path(sites:SourcePathSite[],rank:number):SourcePathFeature{
-        const path={id:this.paths.length,sites,ports:[this.port(sites[0]!),this.port(sites.at(-1)!)] as [number,number],rank};this.paths.push(path);return path;
+    /** `faces`: the ORIGINAL face ranges this path's construction owns (its
+     * own ribbon strip); every other face keeps its native drawing. */
+    private path(sites:SourcePathSite[],rank:number,faces?:readonly (readonly [number,number])[]):SourcePathFeature{
+        const path={id:this.paths.length,sites,ports:[this.port(sites[0]!),this.port(sites.at(-1)!)] as [number,number],rank,...(faces?.length?{faces}:{})};this.paths.push(path);return path;
     }
     pair(a:SourcePathFeature,b:SourcePathFeature,gap:SourcePathSite[]):void{
         this.pairs.push({id:this.pairs.length,paths:[a.id,b.id],endPorts:[[a.ports[0],b.ports[0]],[a.ports[1],b.ports[1]]],gap});
@@ -34,7 +36,7 @@ class Parts {
         if(g.construction?.paths){
             const site=(s:SourcePathSite):SourcePathSite=>s.kind==='vertex'?{kind:'vertex',vertex:s.vertex+base}:{...s,face:s.face+face};
             const byId=new Map<number,SourcePathFeature>();
-            for(const path of g.construction.paths)byId.set(path.id,this.path(path.sites.map(site),path.rank));
+            for(const path of g.construction.paths)byId.set(path.id,this.path(path.sites.map(site),path.rank,path.faces?.map(([first,count])=>[first+face,count] as const)));
             for(const pair of g.construction.pathPairs??[])this.pair(byId.get(pair.paths[0])!,byId.get(pair.paths[1])!,pair.gap.map(site));
         }
     }
@@ -60,7 +62,8 @@ class Parts {
         const sites:SourcePathSite[]=points.map((_,i)=>i===points.length-1?
             {kind:'face',face:firstFace+(i-1)*2,barycentric:[0,.5,.5]}:
             {kind:'face',face:firstFace+i*2+1,barycentric:[.5,0,.5]});
-        return {path:this.path(sites,rank),edges:[points.map((_,i)=>({kind:'vertex',vertex:base+i*2})),points.map((_,i)=>({kind:'vertex',vertex:base+i*2+1}))]};
+        // The ribbon's own strip (two triangles per segment) is the path's face range.
+        return {path:this.path(sites,rank,[[firstFace,(points.length-1)*2]]),edges:[points.map((_,i)=>({kind:'vertex',vertex:base+i*2})),points.map((_,i)=>({kind:'vertex',vertex:base+i*2+1}))]};
     }
     finish():Geometry {return {vertices:new Float32Array(this.vertices),indices:new Uint32Array(this.indices),...(this.paths.length?{construction:{schema:'shallot.source-construction.v1' as const,role:'solid' as const,components:[],paths:this.paths,pathPairs:this.pairs}}:{})};}
 }

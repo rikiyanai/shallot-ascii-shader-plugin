@@ -1,7 +1,9 @@
 import {GpuSourceIncidence,indexedIncidenceLayout,INDEXED_INCIDENCE_MAGIC,INDEXED_INCIDENCE_VERSION,INDEXED_QUAD_INCIDENCE_VERSION,type IndexedIncidenceLayout} from './gpu-source-incidence.ts';
 import type {MeshSource,MeshSourceComplex} from './source-complex.ts';
 import {SourceStorage,type SourceStorageRange} from './source-storage.ts';
-import {OUTLINE_HULL_MAGIC,OUTLINE_HULL_WORDS,PRINCIPAL_CHAIN_MAGIC,PRINCIPAL_CHAIN_WORDS} from './compiled-construction-topology.ts';
+import type {ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
+import {OUTLINE_HULL_MAGIC,OUTLINE_HULL_WORDS,PRINCIPAL_CHAIN_MAGIC,PRINCIPAL_CHAIN_WORDS,PANEL_JOIN_MAGIC,PANEL_JOIN_WORDS,PANEL_MEMBER_MAGIC,PANEL_MEMBER_WORDS,PLANAR_OUTLINE_MAGIC,PLANAR_OUTLINE_HEADER,PLANAR_OUTLINE_WORDS,PLANAR_CONTACT_MAGIC,PLANAR_CONTACT_WORDS,PLANAR_SPAN_MAGIC,PLANAR_SPAN_VERSION,PLANAR_SPAN_HEADER,PLANAR_SPAN_WORDS,
+ SOURCE_PATH_MAGIC,SOURCE_PATH_VERSION,SOURCE_PATH_HEADER,SOURCE_PATH_WORDS,SOURCE_PATH_SITE_WORDS,SOURCE_PATH_PAIR_WORDS,SOURCE_PATH_PORT_WORDS,SOURCE_PATH_COVER_WORDS} from './compiled-construction-topology.ts';
 
 /** V2 remains the legacy adapter. V3 has explicit CSR readers, not an
  * interpretation of V2's old halfedge/position offsets. */
@@ -23,7 +25,7 @@ export interface UploadedSourceIncidence {
 export class GpuRelationSourceCompiler {
  private readonly indexed:GpuSourceIncidence;private disposed=false;
  private readonly pending=new Set<Promise<UploadedSourceIncidence>>();
- static async create(device:GPUDevice,storage:SourceStorage,progress?:(fraction:number)=>void):Promise<GpuRelationSourceCompiler>{
+ static async create(device:GPUDevice,storage:SourceStorage,progress?:ComputePipelineProgress):Promise<GpuRelationSourceCompiler>{
   const indexed=await GpuSourceIncidence.create(device,storage,8*1024*1024,progress);
   return new GpuRelationSourceCompiler(device,storage,indexed);
  }
@@ -141,6 +143,104 @@ fn sourceChainAt()->u32{
 fn sourceChainCount()->u32{let base=sourceChainAt();if(base==0u){return 0u;}return $source[base+1u];}
 // [a, b, face0, face1, first member halfedge].
 fn sourceChain(k:u32)->array<u32,5>{let at=sourceChainAt()+2u+k*${PRINCIPAL_CHAIN_WORDS}u;return array<u32,5>($source[at],$source[at+1u],$source[at+2u],$source[at+3u],$source[at+4u]);}
+
+// chain section (its header is written with count 0 when joins follow).
+fn sourcePanelJoinAt()->u32{
+ let chain=sourceChainAt();if(chain==0u){return 0u;}let base=chain+2u+$source[chain+1u]*${PRINCIPAL_CHAIN_WORDS}u;
+ if($source[base]!=${PANEL_JOIN_MAGIC}u){return 0u;}return base;
+}
+fn sourcePanelJoinCount()->u32{let base=sourcePanelJoinAt();if(base==0u){return 0u;}return $source[base+1u];}
+// [a, b, faceA, faceB, first member halfedge A, first member halfedge B].
+fn sourcePanelJoin(k:u32)->array<u32,6>{let at=sourcePanelJoinAt()+2u+k*${PANEL_JOIN_WORDS}u;return array<u32,6>($source[at],$source[at+1u],$source[at+2u],$source[at+3u],$source[at+4u],$source[at+5u]);}
+
+// [halfedge, outline run|NONE, join|NONE, coverage u16 lo | u16 hi<<16].
+fn sourcePanelMemberAt()->u32{
+ let join=sourcePanelJoinAt();if(join==0u){return 0u;}let base=join+2u+$source[join+1u]*${PANEL_JOIN_WORDS}u;
+ if($source[base]!=${PANEL_MEMBER_MAGIC}u){return 0u;}return base;
+}
+fn sourcePanelMemberCount()->u32{let base=sourcePanelMemberAt();if(base==0u){return 0u;}return $source[base+1u];}
+fn sourcePanelMember(k:u32)->vec4u{let at=sourcePanelMemberAt()+2u+k*${PANEL_MEMBER_WORDS}u;return vec4u($source[at],$source[at+1u],$source[at+2u],$source[at+3u]);}
+// First member record of halfedge h (binary search), or NONE. Its records are
+// consecutive; each names one joined span (or join NONE: keep the edge).
+fn sourcePanelMemberFirst(h:u32)->u32{
+ let base=sourcePanelMemberAt();if(base==0u){return 0xffffffffu;}let count=$source[base+1u];var lo=0u;var hi=count;
+ while(lo<hi){let mid=(lo+hi)>>1u;if($source[base+2u+mid*${PANEL_MEMBER_WORDS}u]<h){lo=mid+1u;}else{hi=mid;}}
+ if(lo<count&&$source[base+2u+lo*${PANEL_MEMBER_WORDS}u]==h){return lo;}return 0xffffffffu;
+}
+
+// [magic, r, planarComponents, components, complete], then r x
+// [a, b, face, firstMember, component, flags] (1 opening, 2 joined, 4 open walk).
+fn sourcePlanarOutlineAt()->u32{
+ let member=sourcePanelMemberAt();if(member==0u){return 0u;}let base=member+2u+$source[member+1u]*${PANEL_MEMBER_WORDS}u;
+ if($source[base]!=${PLANAR_OUTLINE_MAGIC}u){return 0u;}return base;
+}
+fn sourcePlanarOutlineCount()->u32{let base=sourcePlanarOutlineAt();if(base==0u){return 0u;}return $source[base+1u];}
+fn sourcePlanarComplete()->bool{let base=sourcePlanarOutlineAt();return base!=0u&&$source[base+4u]==1u;}
+fn sourcePlanarOutline(k:u32)->array<u32,6>{let at=sourcePlanarOutlineAt()+${PLANAR_OUTLINE_HEADER}u+k*${PLANAR_OUTLINE_WORDS}u;return array<u32,6>($source[at],$source[at+1u],$source[at+2u],$source[at+3u],$source[at+4u],$source[at+5u]);}
+// PLANAR CONTACTS: every required contact [contact, component, flags]
+// (1 interior seam of one flat panel, 2 cross-component).
+fn sourcePlanarContactAt()->u32{
+ let outline=sourcePlanarOutlineAt();if(outline==0u){return 0u;}let base=outline+${PLANAR_OUTLINE_HEADER}u+$source[outline+1u]*${PLANAR_OUTLINE_WORDS}u;
+ if($source[base]!=${PLANAR_CONTACT_MAGIC}u){return 0u;}return base;
+}
+fn sourcePlanarContactCount()->u32{let base=sourcePlanarContactAt();if(base==0u){return 0u;}return $source[base+1u];}
+fn sourcePlanarContact(k:u32)->vec3u{let at=sourcePlanarContactAt()+2u+k*${PLANAR_CONTACT_WORDS}u;return vec3u($source[at],$source[at+1u],$source[at+2u]);}
+
+// [magic, s, version], then s x [a, b, face, firstMember, component, flags,
+// outlineRun]. Outline runs split only at actual join endpoints; joins are
+// drawn once from their own records. 0 = an older packet without spans.
+fn sourcePlanarSpanAt()->u32{
+ let contact=sourcePlanarContactAt();if(contact==0u){return 0u;}let base=contact+2u+$source[contact+1u]*${PLANAR_CONTACT_WORDS}u;
+ if($source[base]!=${PLANAR_SPAN_MAGIC}u||$source[base+2u]!=${PLANAR_SPAN_VERSION}u){return 0u;}return base;
+}
+fn sourcePlanarSpanCount()->u32{let base=sourcePlanarSpanAt();if(base==0u){return 0u;}return $source[base+1u];}
+fn sourcePlanarSpan(k:u32)->array<u32,6>{let at=sourcePlanarSpanAt()+${PLANAR_SPAN_HEADER}u+k*${PLANAR_SPAN_WORDS}u;return array<u32,6>($source[at],$source[at+1u],$source[at+2u],$source[at+3u],$source[at+4u],$source[at+5u]);}
+fn sourcePlanarSpanRun(k:u32)->u32{return $source[sourcePlanarSpanAt()+${PLANAR_SPAN_HEADER}u+k*${PLANAR_SPAN_WORDS}u+6u];}
+
+// spans: header [magic, P, version, S, R, Q, F, G]; P paths [id, port0, port1,
+// rank f32, firstSite, siteCount, ownerFace, pair, flags (1 pair B, 2 reversed)];
+// S sites [kind 0 vertex|1 face, address, w0, w1, w2 f32]; R pairs [id, pathA,
+// pathB, reverseB, firstGapSite, gapCount]; Q ports [port, path, end] sorted by
+// port; F covered face ranges [firstFace, count, path] sorted by firstFace;
+// G path segments. 0 = no authored paths or an older packet.
+fn sourcePathAt()->u32{
+ let span=sourcePlanarSpanAt();if(span==0u){return 0u;}let base=span+${PLANAR_SPAN_HEADER}u+$source[span+1u]*${PLANAR_SPAN_WORDS}u;
+ if($source[base]!=${SOURCE_PATH_MAGIC}u||$source[base+2u]!=${SOURCE_PATH_VERSION}u){return 0u;}return base;
+}
+fn sourcePathCount()->u32{let base=sourcePathAt();if(base==0u){return 0u;}return $source[base+1u];}
+fn sourcePathSegmentCount()->u32{let base=sourcePathAt();if(base==0u){return 0u;}return $source[base+7u];}
+fn sourcePathSitesAt()->u32{let base=sourcePathAt();return base+${SOURCE_PATH_HEADER}u+$source[base+1u]*${SOURCE_PATH_WORDS}u;}
+fn sourcePathPairsAt()->u32{return sourcePathSitesAt()+$source[sourcePathAt()+3u]*${SOURCE_PATH_SITE_WORDS}u;}
+fn sourcePathPortsAt()->u32{return sourcePathPairsAt()+$source[sourcePathAt()+4u]*${SOURCE_PATH_PAIR_WORDS}u;}
+fn sourcePathCoversAt()->u32{return sourcePathPortsAt()+$source[sourcePathAt()+5u]*${SOURCE_PATH_PORT_WORDS}u;}
+fn sourcePathPairCount()->u32{let base=sourcePathAt();if(base==0u){return 0u;}return $source[base+4u];}
+fn sourcePathPortCount()->u32{let base=sourcePathAt();if(base==0u){return 0u;}return $source[base+5u];}
+fn sourcePathCoverCount()->u32{let base=sourcePathAt();if(base==0u){return 0u;}return $source[base+6u];}
+fn sourcePath(k:u32)->array<u32,9>{let at=sourcePathAt()+${SOURCE_PATH_HEADER}u+k*${SOURCE_PATH_WORDS}u;return array<u32,9>($source[at],$source[at+1u],$source[at+2u],$source[at+3u],$source[at+4u],$source[at+5u],$source[at+6u],$source[at+7u],$source[at+8u]);}
+fn sourcePathSite(k:u32)->array<u32,5>{let at=sourcePathSitesAt()+k*${SOURCE_PATH_SITE_WORDS}u;return array<u32,5>($source[at],$source[at+1u],$source[at+2u],$source[at+3u],$source[at+4u]);}
+fn sourcePathPair(k:u32)->array<u32,6>{let at=sourcePathPairsAt()+k*${SOURCE_PATH_PAIR_WORDS}u;return array<u32,6>($source[at],$source[at+1u],$source[at+2u],$source[at+3u],$source[at+4u],$source[at+5u]);}
+fn sourcePathPort(k:u32)->vec3u{let at=sourcePathPortsAt()+k*${SOURCE_PATH_PORT_WORDS}u;return vec3u($source[at],$source[at+1u],$source[at+2u]);}
+fn sourcePathCover(k:u32)->vec3u{let at=sourcePathCoversAt()+k*${SOURCE_PATH_COVER_WORDS}u;return vec3u($source[at],$source[at+1u],$source[at+2u]);}
+// First port record with this port id (binary search), or NONE.
+fn sourcePathPortFirst(port:u32)->u32{
+ let base=sourcePathAt();if(base==0u){return 0xffffffffu;}let at=sourcePathPortsAt();let count=$source[base+5u];var lo=0u;var hi=count;
+ while(lo<hi){let mid=(lo+hi)>>1u;if($source[at+mid*${SOURCE_PATH_PORT_WORDS}u]<port){lo=mid+1u;}else{hi=mid;}}
+ if(lo<count&&$source[at+lo*${SOURCE_PATH_PORT_WORDS}u]==port){return lo;}return 0xffffffffu;
+}
+// The path owning original face f through an authored covered range, or NONE
+// (binary search over disjoint ranges sorted by first face).
+fn sourcePathCoveredBy(f:u32)->u32{
+ let base=sourcePathAt();if(base==0u){return 0xffffffffu;}let at=sourcePathCoversAt();let count=$source[base+6u];var lo=0u;var hi=count;
+ while(lo<hi){let mid=(lo+hi)>>1u;if($source[at+mid*${SOURCE_PATH_COVER_WORDS}u]<=f){lo=mid+1u;}else{hi=mid;}}
+ if(lo==0u){return 0xffffffffu;}let r=at+(lo-1u)*${SOURCE_PATH_COVER_WORDS}u;
+ if(f<$source[r]+$source[r+1u]){return $source[r+2u];}return 0xffffffffu;
+}
+// The path holding global segment g (path k's segments start at firstSite-k).
+fn sourcePathOfSegment(g:u32)->u32{
+ let base=sourcePathAt();let count=$source[base+1u];var lo=0u;var hi=count;
+ while(lo<hi){let mid=(lo+hi)>>1u;let p=base+${SOURCE_PATH_HEADER}u+mid*${SOURCE_PATH_WORDS}u;if($source[p+4u]-mid<=g){lo=mid+1u;}else{hi=mid;}}
+ return lo-1u;
+}
 fn sourceFaceMaterial(face:u32)->u32{
  if(sourceGpuIndexed()){return 0u;}
  let at=$source[12];if(at==0u){return 0u;}

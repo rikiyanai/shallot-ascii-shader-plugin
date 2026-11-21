@@ -164,3 +164,25 @@ export class SurfaceFields {
   if(this.resident)this.destroy(this.resident);this.resident=undefined;
  }
 }
+
+/**
+ * Drop field owners for views which have left the world.  The plugin owns the
+ * map, so a removed camera otherwise keeps its five field textures and depth
+ * texture until the whole World is disposed.  `pending` is supplied by the
+ * caller from the target queue: while any text job is pending, retain every
+ * map entry so a SAME-pose job can release its field and its submission can
+ * still reach `submitted()` safely.  The next non-pending frame performs the
+ * actual owner destruction.
+ */
+export function pruneInactiveSurfaceFields(
+ fields:Map<number,SurfaceFields>,
+ active:ReadonlySet<number>,
+ pending:boolean,
+):void{
+ if(pending)return;
+ for(const [eid,owner] of fields){
+  if(active.has(eid))continue;
+  fields.delete(eid);
+  owner.dispose();
+ }
+}

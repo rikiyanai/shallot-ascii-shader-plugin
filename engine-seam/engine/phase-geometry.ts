@@ -28,6 +28,19 @@ export const PhaseGeometryCapture={create:()=>({enabled:false,includeStandard:fa
   isPrimary:undefined as undefined|(()=>boolean),
   primary:undefined as undefined|((world:World,view:View,eid:number)=>(()=>void)|undefined)})};
 
+
+
+
+
+
+
+
+
+export function primaryOwnsView(world:World,view:Pick<View,'canvas'|'context'>|undefined):boolean{
+  const capture=world.resource(PhaseGeometryCapture);
+  return capture.enabled&&capture.isPrimary?.()===true&&!!view?.canvas&&!!view.context;
+}
+
 export function captureGeometryPass(world:World,view:View,native:GPURenderPassEncoder|undefined):{
   pass:GPURenderPassEncoder;
   source:(renderer:PhaseRenderer,stage:PhaseGeometryDraw['stage'],stableId?:number,stablePart?:number)=>void;

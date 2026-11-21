@@ -1,4 +1,4 @@
-import {DeviceComputePrograms} from './gpu-pipeline-preparation.ts';
+import {DeviceComputePrograms,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
 import type {SurfaceField} from './surface-fields.ts';
 import {FORM_LOD_STATE_WORDS,conservativeFormLodScope,formLodScopeKey,validateFormLodScope} from './form-lod-state.ts';
@@ -49,6 +49,13 @@ import type {FormLodScope} from './form-lod-state.ts';
 
 export const FORM_DEPTH_SLOTS=65536,FORM_DEPTH_COLUMNS=256,FORM_DEPTH_PROBES=32,FORM_SLOT_WORDS=16;
 export const FORM_DEPTH_HEADER_ROW=FORM_DEPTH_SLOTS*FORM_SLOT_WORDS/4/FORM_DEPTH_COLUMNS;
+
+
+
+
+
+export const FORM_SOURCE_ROW=FORM_DEPTH_HEADER_ROW+1,FORM_SOURCE_TEXELS=2;
+export const FORM_DEPTH_ROWS=FORM_SOURCE_ROW+FORM_DEPTH_SLOTS*FORM_SOURCE_TEXELS/FORM_DEPTH_COLUMNS;
 /** The table's final word is written after reduction, never by pixel reduce. */
 export const FORM_LOD_WORD=15;
 /** Writer-only state; readers still bind only the existing form texture. */
@@ -145,6 +152,46 @@ fn formParentSelected(owner:vec2u)->bool{
  }
  return false;
 }
+
+// result, the writer resolved this owner's held level from its COMPLETE posed
+// source bound (resolveSource/resolveLod), not from its surviving pixels; bit 1,
+// that source is cut by the page or spans depth (its level is then 0 and its
+// lines keep their own local part scale). Every reader of the level (relation
+// selection, native articulation, tone) takes the held level of such an owner
+// as is, with no visible-extent gate. 0: the incumbent visible read.
+fn formSourceFlags(owner:vec2u)->u32{
+ if((owner.x&0xdfffffffu)==0u){return 0u;}
+ let key=formDepthKey(owner);let h=formDepthHash(key);
+ for(var probe=0u;probe<${FORM_DEPTH_PROBES}u;probe++){
+  let texel=((h+probe)&${FORM_DEPTH_SLOTS-1}u)*${FORM_SLOT_WORDS/4}u;
+  let a=textureLoad(formDepths,vec2i(i32(texel%${FORM_DEPTH_COLUMNS}u),i32(texel/${FORM_DEPTH_COLUMNS}u)),0);
+  if(a.x==0u){return 0u;}
+  if(a.x==key.x&&a.y==key.y){return (textureLoad(formDepths,vec2i(i32((texel+3u)%${FORM_DEPTH_COLUMNS}u),i32((texel+3u)/${FORM_DEPTH_COLUMNS}u)),0).z>>2u)&3u;}
+ }
+ return 0u;
+}
+
+// header row), in formExtent's form: field-pixel box and reverse-Z depth range.
+// found=false: no complete source bound (every reader keeps its visible read).
+fn formSourceExtent(owner:vec2u)->FormExtent{
+ let none=FormExtent(false,0.0,0.0,0.0,0.0,vec4f(0.0));
+ if((owner.x&0xdfffffffu)==0u){return none;}
+ let key=formDepthKey(owner);let h=formDepthHash(key);
+ for(var probe=0u;probe<${FORM_DEPTH_PROBES}u;probe++){
+  let slot=(h+probe)&${FORM_DEPTH_SLOTS-1}u;let texel=slot*${FORM_SLOT_WORDS/4}u;
+  let a=textureLoad(formDepths,vec2i(i32(texel%${FORM_DEPTH_COLUMNS}u),i32(texel/${FORM_DEPTH_COLUMNS}u)),0);
+  if(a.x==0u){return none;}
+  if(a.x==key.x&&a.y==key.y){
+   let at=${FORM_SOURCE_ROW*FORM_DEPTH_COLUMNS}u+slot*${FORM_SOURCE_TEXELS}u;
+   let b=textureLoad(formDepths,vec2i(i32(at%${FORM_DEPTH_COLUMNS}u),i32(at/${FORM_DEPTH_COLUMNS}u)),0);
+   let d=textureLoad(formDepths,vec2i(i32((at+1u)%${FORM_DEPTH_COLUMNS}u),i32((at+1u)/${FORM_DEPTH_COLUMNS}u)),0);
+   if(d.z!=1u){return none;}
+   let box=bitcast<vec4f>(b);
+   return FormExtent(true,bitcast<f32>(d.x),bitcast<f32>(d.y),box.x,box.y,box);
+  }
+ }
+ return none;
+}
 // The held level is metadata in the same per-form texture, not a second
 // reader binding.  eligible is supplied by the existing producer's class
 // checks: false for unknown/cut/spanning/terrain/interior/orthographic forms
@@ -178,6 +225,64 @@ const FORM_LOD_NEAR_ENTER=NEAR_FROM_ROWS*0.8;
 const FORM_LOD_NEAR_LEAVE=NEAR_FROM_ROWS/0.8;
 const FORM_LOD_FAR_ENTER=FAR_STRIP_BELOW_ROWS*0.8;
 const FORM_LOD_FAR_LEAVE=FAR_STRIP_BELOW_ROWS/0.8;
+export const FORM_SOURCE_BOUND_MAGIC=0x53524342;
+
+
+
+
+export interface FormSourceBound {readonly owner:readonly [number,number];readonly low:readonly [number,number,number];readonly high:readonly [number,number,number]}
+/** The form table's exact key of an owner pair (formDepthKey). */
+export function formDepthKeyOf(x:number,y:number):[number,number]{return [(((x>>>0)&0xdfffffff)|(((y>>>0)>>>31)<<29))>>>0,(((y>>>0)<<1)|1)>>>0];}
+function invert4(m:ArrayLike<number>):Float64Array|undefined{
+ const a=Float64Array.from({length:16},(_,i)=>m[i]!),inv=new Float64Array(16);
+ inv[0]=a[5]!*a[10]!*a[15]!-a[5]!*a[11]!*a[14]!-a[9]!*a[6]!*a[15]!+a[9]!*a[7]!*a[14]!+a[13]!*a[6]!*a[11]!-a[13]!*a[7]!*a[10]!;
+ inv[4]=-a[4]!*a[10]!*a[15]!+a[4]!*a[11]!*a[14]!+a[8]!*a[6]!*a[15]!-a[8]!*a[7]!*a[14]!-a[12]!*a[6]!*a[11]!+a[12]!*a[7]!*a[10]!;
+ inv[8]=a[4]!*a[9]!*a[15]!-a[4]!*a[11]!*a[13]!-a[8]!*a[5]!*a[15]!+a[8]!*a[7]!*a[13]!+a[12]!*a[5]!*a[11]!-a[12]!*a[7]!*a[9]!;
+ inv[12]=-a[4]!*a[9]!*a[14]!+a[4]!*a[10]!*a[13]!+a[8]!*a[5]!*a[14]!-a[8]!*a[6]!*a[13]!-a[12]!*a[5]!*a[10]!+a[12]!*a[6]!*a[9]!;
+ inv[1]=-a[1]!*a[10]!*a[15]!+a[1]!*a[11]!*a[14]!+a[9]!*a[2]!*a[15]!-a[9]!*a[3]!*a[14]!-a[13]!*a[2]!*a[11]!+a[13]!*a[3]!*a[10]!;
+ inv[5]=a[0]!*a[10]!*a[15]!-a[0]!*a[11]!*a[14]!-a[8]!*a[2]!*a[15]!+a[8]!*a[3]!*a[14]!+a[12]!*a[2]!*a[11]!-a[12]!*a[3]!*a[10]!;
+ inv[9]=-a[0]!*a[9]!*a[15]!+a[0]!*a[11]!*a[13]!+a[8]!*a[1]!*a[15]!-a[8]!*a[3]!*a[13]!-a[12]!*a[1]!*a[11]!+a[12]!*a[3]!*a[9]!;
+ inv[13]=a[0]!*a[9]!*a[14]!-a[0]!*a[10]!*a[13]!-a[8]!*a[1]!*a[14]!+a[8]!*a[2]!*a[13]!+a[12]!*a[1]!*a[10]!-a[12]!*a[2]!*a[9]!;
+ inv[2]=a[1]!*a[6]!*a[15]!-a[1]!*a[7]!*a[14]!-a[5]!*a[2]!*a[15]!+a[5]!*a[3]!*a[14]!+a[13]!*a[2]!*a[7]!-a[13]!*a[3]!*a[6]!;
+ inv[6]=-a[0]!*a[6]!*a[15]!+a[0]!*a[7]!*a[14]!+a[4]!*a[2]!*a[15]!-a[4]!*a[3]!*a[14]!-a[12]!*a[2]!*a[7]!+a[12]!*a[3]!*a[6]!;
+ inv[10]=a[0]!*a[5]!*a[15]!-a[0]!*a[7]!*a[13]!-a[4]!*a[1]!*a[15]!+a[4]!*a[3]!*a[13]!+a[12]!*a[1]!*a[7]!-a[12]!*a[3]!*a[5]!;
+ inv[14]=-a[0]!*a[5]!*a[14]!+a[0]!*a[6]!*a[13]!+a[4]!*a[1]!*a[14]!-a[4]!*a[2]!*a[13]!-a[12]!*a[1]!*a[6]!+a[12]!*a[2]!*a[5]!;
+ inv[3]=-a[1]!*a[6]!*a[11]!+a[1]!*a[7]!*a[10]!+a[5]!*a[2]!*a[11]!-a[5]!*a[3]!*a[10]!-a[9]!*a[2]!*a[7]!+a[9]!*a[3]!*a[6]!;
+ inv[7]=a[0]!*a[6]!*a[11]!-a[0]!*a[7]!*a[10]!-a[4]!*a[2]!*a[11]!+a[4]!*a[3]!*a[10]!+a[8]!*a[2]!*a[7]!-a[8]!*a[3]!*a[6]!;
+ inv[11]=-a[0]!*a[5]!*a[11]!+a[0]!*a[7]!*a[9]!+a[4]!*a[1]!*a[11]!-a[4]!*a[3]!*a[9]!-a[8]!*a[1]!*a[7]!+a[8]!*a[3]!*a[5]!;
+ inv[15]=a[0]!*a[5]!*a[10]!-a[0]!*a[6]!*a[9]!-a[4]!*a[1]!*a[10]!+a[4]!*a[2]!*a[9]!+a[8]!*a[1]!*a[6]!-a[8]!*a[2]!*a[5]!;
+ const det=a[0]!*inv[0]!+a[1]!*inv[4]!+a[2]!*inv[8]!+a[3]!*inv[12]!;if(!Number.isFinite(det)||Math.abs(det)<1e-30)return;
+ for(let i=0;i<16;i++)inv[i]=inv[i]!/det;return inv;
+}
+const sourceBits=new Float32Array(1),sourceWords=new Uint32Array(sourceBits.buffer);
+const f32Bits=(value:number)=>{sourceBits[0]=value;return sourceWords[0]!;};
+/** Project each complete posed bound over all EIGHT corners with the field's
+ * own clip matrix (the inverse of its worldFromClip) into the field-pixel box
+ * and reverse-Z depth range resolveLod measures. A corner behind the eye or
+ * outside the depth range makes the bound unusable for that owner (it keeps
+ * the incumbent visible read): a clipped bound never supplies a falsely small
+ * form. The f64 box is padded by the native f32/raster roundoff, as the source
+ * LOD selector does. Several bounds of one owner are joined. Sorted by key. */
+export function packFormSourceBounds(bounds:readonly FormSourceBound[],worldFromClip:ArrayLike<number>,width:number,height:number):Uint32Array{
+ const clip=bounds.length?invert4(worldFromClip):undefined;const owners=new Map<string,{key:[number,number];box:number[];valid:boolean}>();
+ for(const bound of bounds){
+  const key=formDepthKeyOf(bound.owner[0],bound.owner[1]);if(key[0]===0)continue;const id=`${key[0]}/${key[1]}`;
+  let owner=owners.get(id);if(!owner){owner={key,box:[Infinity,-Infinity,Infinity,-Infinity,-Infinity,Infinity],valid:true};owners.set(id,owner);}
+  if(!clip){owner.valid=false;continue;}
+  for(let corner=0;corner<8;corner++){
+   const x=corner&1?bound.high[0]:bound.low[0],y=corner&2?bound.high[1]:bound.low[1],z=corner&4?bound.high[2]:bound.low[2];
+   const w=clip[3]!*x+clip[7]!*y+clip[11]!*z+clip[15]!,depth=clip[2]!*x+clip[6]!*y+clip[10]!*z+clip[14]!;
+   if(!(w>1e-5)||!(depth>=0&&depth<=w)){owner.valid=false;break;}
+   const px=((clip[0]!*x+clip[4]!*y+clip[8]!*z+clip[12]!)/w*.5+.5)*width,py=(.5-(clip[1]!*x+clip[5]!*y+clip[9]!*z+clip[13]!)/w*.5)*height,d=depth/w;
+   const b=owner.box;b[0]=Math.min(b[0]!,py);b[1]=Math.max(b[1]!,py);b[2]=Math.min(b[2]!,px);b[3]=Math.max(b[3]!,px);b[4]=Math.max(b[4]!,d);b[5]=Math.min(b[5]!,d);
+  }
+ }
+ const entries=[...owners.values()].filter(owner=>owner.valid&&owner.box.every(Number.isFinite)).sort((a,b)=>a.key[0]-b.key[0]||a.key[1]-b.key[1]);
+ const out=new Uint32Array(4+entries.length*8);out[0]=entries.length;out[3]=FORM_SOURCE_BOUND_MAGIC;
+ entries.forEach((owner,i)=>{const b=owner.box,pad=(v:number,sign:number)=>v+sign*(1+1e-5*Math.abs(v)),at=4+i*8;
+  out.set([owner.key[0],owner.key[1],f32Bits(pad(b[0]!,-1)),f32Bits(pad(b[1]!,1)),f32Bits(pad(b[2]!,-1)),f32Bits(pad(b[3]!,1)),f32Bits(b[4]!),f32Bits(b[5]!)],at);});
+ return out;
+}
 export const FORM_DEPTH_SHADER=/* wgsl */`
 @group(0) @binding(0) var depthField:texture_2d<f32>;
 @group(0) @binding(1) var ownerField:texture_2d<u32>;
@@ -191,6 +296,22 @@ struct FormDepthParams {worldFromClip:mat4x4f,scope:vec4u,options:vec4u}
 // then group [offset,count] ranges and exact owner.x/owner.y pairs.
 @group(0) @binding(5) var<storage,read> parentGroups:array<u32>;
 const PARENT_GROUP_HEADER=4u;const PARENT_GROUP_WORDS=2u;const PARENT_GROUP_MAGIC=0x50475250u;
+
+// (sorted by key) [key.x, key.y, top, bottom, left, right, near, far]: the
+// field-pixel box and reverse-Z depth range of its complete current posed
+// bound, projected on the host over all eight corners (packFormSourceBounds).
+@group(0) @binding(6) var<storage,read> sourceBounds:array<u32>;
+const SOURCE_BOUND_HEADER=4u;const SOURCE_BOUND_WORDS=8u;const SOURCE_BOUND_MAGIC=${FORM_SOURCE_BOUND_MAGIC}u;
+fn sourceBoundCount()->u32{if(sourceBounds[3u]!=SOURCE_BOUND_MAGIC){return 0u;}return sourceBounds[0];}
+fn sourceBoundKeyLess(at:u32,key:vec2u)->bool{let x=sourceBounds[at];return x<key.x||(x==key.x&&sourceBounds[at+1u]<key.y);}
+// The owner's source bound entry (word address), 0xffffffff when it has none.
+fn sourceBoundOf(key:vec2u)->u32{
+ var lo=0u;var hi=sourceBoundCount();
+ loop{if(lo>=hi){break;}let mid=(lo+hi)/2u;if(sourceBoundKeyLess(SOURCE_BOUND_HEADER+mid*SOURCE_BOUND_WORDS,key)){lo=mid+1u;}else{hi=mid;}}
+ let at=SOURCE_BOUND_HEADER+lo*SOURCE_BOUND_WORDS;
+ if(lo<sourceBoundCount()&&sourceBounds[at]==key.x&&sourceBounds[at+1u]==key.y){return at;}
+ return 0xffffffffu;
+}
 ${FORM_DEPTH_KEY}
 fn raise(i:u32,v:u32){if(atomicLoad(&table[i])<v){atomicMax(&table[i],v);}}
 // The owner's slot in the table (claimed if free), or 0xffffffff when its
@@ -277,6 +398,20 @@ fn parentMemberEligible(key:vec2u)->bool{
  let near=bitcast<f32>(atomicLoad(&table[at+2u]));let far=bitcast<f32>(~atomicLoad(&table[at+3u]));
  return !formSpansDepth(near,far,extent,depthParams.worldFromClip);
 }
+
+// with a complete source bound holds a slot (claimed here when no pixel of it
+// survives the foreground: its visible words stay empty, so formExtent still
+// reports it absent) and is marked source-sized (word 14 bit 2).
+@compute @workgroup_size(64) fn resolveSource(@builtin(global_invocation_id) id:vec3u){
+ if(id.x>=sourceBoundCount()){return;}
+ let entry=SOURCE_BOUND_HEADER+id.x*SOURCE_BOUND_WORDS;
+ let at=slotOf(vec2u(sourceBounds[entry],sourceBounds[entry+1u]));if(at==0xffffffffu){return;}
+ atomicOr(&table[at+14u],4u);
+
+ let region=${FORM_SOURCE_ROW*FORM_DEPTH_COLUMNS*4}u+(at/${FORM_SLOT_WORDS}u)*${FORM_SOURCE_TEXELS*4}u;
+ for(var k=0u;k<6u;k++){atomicStore(&table[region+k],sourceBounds[entry+2u+k]);}
+ atomicStore(&table[region+6u],1u);
+}
 // One invocation per reduced form slot. It resolves the held level before the
 // table is copied to the reader texture; no readback or frame search occurs.
 @compute @workgroup_size(256) fn resolveLod(@builtin(global_invocation_id) id:vec3u){
@@ -293,13 +428,24 @@ fn parentMemberEligible(key:vec2u)->bool{
  let flags=depthParams.options.y;let rowPixels=bitcast<f32>(depthParams.options.x);
  var level=0u;
   if((flags&1u)!=0u&&rowPixels>0.0&&writerRecedes()&&writerOpen()){
-  let top=f32(~atomicLoad(&table[at+4u]));let bottom=f32(atomicLoad(&table[at+5u]));
-  let left=f32(~atomicLoad(&table[at+6u]));let right=f32(atomicLoad(&table[at+7u]));
+  var top=f32(~atomicLoad(&table[at+4u]));var bottom=f32(atomicLoad(&table[at+5u]));
+  var left=f32(~atomicLoad(&table[at+6u]));var right=f32(atomicLoad(&table[at+7u]));
   let extent=vec2f(f32(depthParams.options.z),f32(depthParams.options.w));
+  var near=bitcast<f32>(atomicLoad(&table[at+2u]));
+  var far=bitcast<f32>(~atomicLoad(&table[at+3u]));
+
+  // source bound, never by the pixels that survive the foreground; the same
+  // camera/world/epoch history holds its level.
+  let source=sourceBoundOf(key);
+  if(source!=0xffffffffu){
+   top=bitcast<f32>(sourceBounds[source+2u]);bottom=bitcast<f32>(sourceBounds[source+3u]);
+   left=bitcast<f32>(sourceBounds[source+4u]);right=bitcast<f32>(sourceBounds[source+5u]);
+   near=bitcast<f32>(sourceBounds[source+6u]);far=bitcast<f32>(sourceBounds[source+7u]);
+  }
   let box=vec4f(top,bottom,left,right);
-  let near=bitcast<f32>(atomicLoad(&table[at+2u]));
-  let far=bitcast<f32>(~atomicLoad(&table[at+3u]));
-  if(extent.x>0.0&&extent.y>0.0&&!formCut(box,extent)&&!formSpansDepth(near,far,extent,depthParams.worldFromClip)){
+  let compact=extent.x>0.0&&extent.y>0.0&&!formCut(box,extent)&&!formSpansDepth(near,far,extent,depthParams.worldFromClip);
+  if(source!=0xffffffffu&&!compact){atomicOr(&table[at+14u],8u);}
+  if(compact){
    let rows=(bottom-top)/rowPixels;let scope=depthParams.scope.xyz;let stateAt=lodStateSlot(scope,key);
    var held=0u;var hasHeld=false;
    if(stateAt!=0xffffffffu){let encoded=atomicLoad(&lodState[stateAt+6u]);if(encoded>=1u&&encoded<=3u){held=encoded-1u;hasHeld=true;}}
@@ -408,6 +554,7 @@ export interface FormParentGroup {
 interface FormDepthTable {
  buffer:GPUBuffer;params:GPUBuffer;texture:GPUTexture;view:GPUTextureView;group?:GPUBindGroup;history?:FormLodHistory;
  parentBuffer:GPUBuffer;parentBytes:number;retiredParents:GPUBuffer[];boundParent?:GPUBuffer;
+ sourceBuffer:GPUBuffer;sourceBytes:number;boundSource?:GPUBuffer;
 }
 const PARENT_GROUP_MAGIC=0x50475250;
 function parentWord(value:number,label:string):number{
@@ -443,23 +590,27 @@ const formPrograms=new DeviceComputePrograms(device=>{
    {binding:2,visibility:GPUShaderStage.COMPUTE,buffer:{type:'storage'}},
    {binding:3,visibility:GPUShaderStage.COMPUTE,buffer:{type:'uniform'}},
    {binding:4,visibility:GPUShaderStage.COMPUTE,buffer:{type:'storage'}},
-   {binding:5,visibility:GPUShaderStage.COMPUTE,buffer:{type:'read-only-storage'}}]});
+   {binding:5,visibility:GPUShaderStage.COMPUTE,buffer:{type:'read-only-storage'}},
+   {binding:6,visibility:GPUShaderStage.COMPUTE,buffer:{type:'read-only-storage'}}]});
  const pipeline=device.createPipelineLayout({bindGroupLayouts:[layout]});
  return {resources:layout,plans:new Map([
   ['reduce',()=>{const module=device.createShaderModule({label:'MAIN form table',code:isolateComputeEntry(FORM_DEPTH_SHADER,'reduce')});
    return {label:'MAIN form table reduce',layout:pipeline,compute:{module,entryPoint:'reduce'}};}],
+  ['resolveSource',()=>{const module=device.createShaderModule({label:'MAIN form source bounds',code:isolateComputeEntry(FORM_DEPTH_SHADER,'resolveSource')});
+   return {label:'MAIN form source bounds',layout:pipeline,compute:{module,entryPoint:'resolveSource'}};}],
   ['resolveLod',()=>{const module=device.createShaderModule({label:'MAIN form held LOD',code:isolateComputeEntry(FORM_DEPTH_SHADER,'resolveLod')});
    return {label:'MAIN form held LOD',layout:pipeline,compute:{module,entryPoint:'resolveLod'}}; }],
   ['resolveParents',()=>{const module=device.createShaderModule({label:'MAIN form parent groups',code:isolateComputeEntry(FORM_DEPTH_SHADER,'resolveParents')});
    return {label:'MAIN form parent groups',layout:pipeline,compute:{module,entryPoint:'resolveParents'}};}]
  ])};
 });
-export async function prepareFormDepthPrograms(device:GPUDevice,progress?:(fraction:number)=>void):Promise<void>{await formPrograms.prepare(device,progress);}
+export async function prepareFormDepthPrograms(device:GPUDevice,progress?:ComputePipelineProgress):Promise<void>{await formPrograms.prepare(device,progress);}
 
 export class FormDepths {
  private readonly reduce:GPUComputePipeline;
  private readonly resolveLod:GPUComputePipeline;
  private readonly resolveParents:GPUComputePipeline;
+ private readonly resolveSource:GPUComputePipeline;
  private readonly layout:GPUBindGroupLayout;
  // Keyed by the field's channel set: the table is reused for as long as those
  // textures are, across frames, and never shared between two live fields.
@@ -467,6 +618,7 @@ export class FormDepths {
  private readonly histories=new Map<string,FormLodHistory>();
  constructor(private readonly device:GPUDevice){
   const ready=formPrograms.get(device);this.layout=ready.resources;this.reduce=ready.pipelines.get('reduce')!;this.resolveLod=ready.pipelines.get('resolveLod')!;this.resolveParents=ready.pipelines.get('resolveParents')!;
+  this.resolveSource=ready.pipelines.get('resolveSource')!;
  }
  private historyFor(scope:FormLodScope,encoder:GPUCommandEncoder):FormLodHistory{
   const key=formLodScopeKey(scope);let history=this.histories.get(key);
@@ -487,29 +639,39 @@ export class FormDepths {
   if(history.refs===0&&this.histories.get(history.key)===history){history.state.destroy();this.histories.delete(history.key);}
  }
  private bind(table:FormDepthTable,field:SurfaceField,history:FormLodHistory):void{
-  if(table.history===history&&table.boundParent===table.parentBuffer)return;
+  if(table.history===history&&table.boundParent===table.parentBuffer&&table.boundSource===table.sourceBuffer)return;
   if(table.history!==history){if(table.history)this.unrefHistory(table.history);table.history=history;history.refs++;}
   table.group=this.device.createBindGroup({layout:this.layout,entries:[
    {binding:0,resource:field.textures[0]!.createView()},{binding:1,resource:field.textures[3]!.createView()},
    {binding:2,resource:{buffer:table.buffer}},{binding:3,resource:{buffer:table.params}},{binding:4,resource:{buffer:history.state}},{binding:5,resource:{buffer:table.parentBuffer}},
+   {binding:6,resource:{buffer:table.sourceBuffer}},
   ]});
-  table.boundParent=table.parentBuffer;
+  table.boundParent=table.parentBuffer;table.boundSource=table.sourceBuffer;
  }
- /** Reduce this field's owner and depth channels into its table, then the
-  * reference length. Call once, after the field's last draw and before any
-  * reader's pass. */
- encode(encoder:GPUCommandEncoder,field:SurfaceField,scope?:FormLodScope,parentGroups:readonly FormParentGroup[]=[]):void{
+
+
+
+
+
+ encode(encoder:GPUCommandEncoder,field:SurfaceField,scope?:FormLodScope,parentGroups:readonly FormParentGroup[]=[],sourceBounds:readonly FormSourceBound[]=[]):void{
   const active=validateFormLodScope(scope??conservativeFormLodScope());
   const packedParents=packFormParentGroups(parentGroups);
+  const packedSource=packFormSourceBounds(sourceBounds,field.worldFromClip,field.width,field.height);
   let table=this.tables.get(field.textures);
-  const rows=FORM_DEPTH_HEADER_ROW+1;
+  const rows=FORM_DEPTH_ROWS;
   if(!table){
    const buffer=this.device.createBuffer({label:'MAIN form table slots',size:rows*FORM_DEPTH_COLUMNS*16,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
    const params=this.device.createBuffer({label:'MAIN form table matrix and LOD scope',size:96,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
    const texture=this.device.createTexture({label:'MAIN form table',size:[FORM_DEPTH_COLUMNS,rows],format:'rgba32uint',usage:GPUTextureUsage.COPY_DST|GPUTextureUsage.TEXTURE_BINDING});
    const parentBuffer=this.device.createBuffer({label:'MAIN form parent groups',size:Math.max(16,packedParents.byteLength),usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
-   table={buffer,params,texture,view:texture.createView(),parentBuffer,parentBytes:parentBuffer.size,retiredParents:[]};this.tables.set(field.textures,table);
+   const sourceBuffer=this.device.createBuffer({label:'MAIN form source bounds',size:Math.max(16,packedSource.byteLength),usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+   table={buffer,params,texture,view:texture.createView(),parentBuffer,parentBytes:parentBuffer.size,retiredParents:[],sourceBuffer,sourceBytes:sourceBuffer.size};this.tables.set(field.textures,table);
   }
+  if(packedSource.byteLength>table.sourceBytes){
+   const next=this.device.createBuffer({label:'MAIN form source bounds',size:packedSource.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+   table.retiredParents.push(table.sourceBuffer);table.sourceBuffer=next;table.sourceBytes=next.size;table.group=undefined;table.boundSource=undefined;
+  }
+  this.device.queue.writeBuffer(table.sourceBuffer,0,packedSource);
   if(packedParents.byteLength>table.parentBytes){
    const next=this.device.createBuffer({label:'MAIN form parent groups',size:packedParents.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
    table.retiredParents.push(table.parentBuffer);table.parentBuffer=next;table.parentBytes=next.size;table.group=undefined;table.boundParent=undefined;
@@ -524,6 +686,7 @@ export class FormDepths {
   encoder.clearBuffer(table.buffer);
   const pass=encoder.beginComputePass({label:'MAIN form table'});pass.setBindGroup(0,table.group!);
   pass.setPipeline(this.reduce);pass.dispatchWorkgroups(Math.ceil(field.width/16),Math.ceil(field.height/16));
+  if(packedSource[0]!>0){pass.setPipeline(this.resolveSource);pass.dispatchWorkgroups(Math.ceil(packedSource[0]!/64));}
   pass.setPipeline(this.resolveLod);pass.dispatchWorkgroups(Math.ceil(FORM_DEPTH_SLOTS/256));
   if(packedParents[0]!>0){pass.setPipeline(this.resolveParents);pass.dispatchWorkgroups(Math.ceil(packedParents[0]!/64));}
   pass.end();
@@ -544,7 +707,7 @@ export class FormDepths {
  release(textures:readonly GPUTexture[]):void{
   const table=this.tables.get(textures);if(!table)return;
   table.buffer.destroy();table.params.destroy();table.texture.destroy();
-  table.parentBuffer.destroy();for(const buffer of table.retiredParents)buffer.destroy();
+  table.parentBuffer.destroy();table.sourceBuffer.destroy();for(const buffer of table.retiredParents)buffer.destroy();
   const history=table.history;if(history){this.unrefHistory(history);}
   this.tables.delete(textures);
  }

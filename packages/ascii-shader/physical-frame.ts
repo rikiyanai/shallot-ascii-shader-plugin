@@ -6,26 +6,38 @@ import {NativePublication} from './publication.ts';
 import {constructionSupports} from './construction-support.ts';
 import {FieldReadback,ResidentConstructionField,type ConstructionFieldReadback,type DrawingFieldView} from './field-readback.ts';
 import type {SurfaceField,SurfaceAttachment} from './surface-fields.ts';
-import {formDepths,type FormParentGroup} from './form-depths.ts';
+import {formDepths,type FormParentGroup,type FormSourceBound} from './form-depths.ts';
 import {FormLodLifetimes} from './form-lod-lifetimes.ts';
 import type {NativeLabel} from './semantic-text.ts';
 import type {PresentationMode} from './text/text-frame.ts';
 import {PhysicalSourceTransport,type PhysicalSourceInstance,type PhysicalResidentBatch} from './physical-source.ts';
 import {preparePhysicalGpuServices,type PhysicalGpuServices} from './gpu-startup.ts';
-import {SurfaceRelations,posedBatchIdentity,type SurfaceGraphView,type SourcePartAnchorTable} from './surface-relations.ts';
+import type {ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
+import {SurfaceRelations,posedBatchIdentity,type SurfaceGraphView,type SourcePartAnchorTable,type PartAnchorDemand,type PartAnchorDemandReadback} from './surface-relations.ts';
 import {RELATION_WORDS} from './source-coordinates.ts';
 import {GpuArticulation,type ArticulationResult,type ArticulationLiteral,type ArticulationLiteralFeed} from './gpu-articulation.ts';
 import type {SourceConstructionClass} from './gpu-construction-runs.ts';
 import {toneField,TONE_ROW,type ToneReadback,type ToneMember,type TonedFieldView,type GpuToneMembers,type ToneSunShadow} from './tone-field.ts';
 import {RelationVisibility,type ProjectedRelationReadback} from './relation-visibility.ts';
 import {decodePosedGraph,type PosedGraph} from './posed-graph.ts';
-import {Underdrawing} from './underdrawing.ts';
+import {TextureBlit} from './texture-blit.ts';
+import {ConstructionMask} from './construction-mask.ts';
 import {compileSourceFaceMaterialClasses} from './source-material.ts';
 import type {MeshSourceComplex} from './source-complex.ts';
 import {sourceResidencyEdgeCount} from './source-transfer.ts';
 import {exportResidentFrame,type ResidentFrameState,type ResidentNativeSnapshot,residentFrameState} from './resident-native-frame.ts';
 import {ParentGroupCache,ParentHolds,remapSourceWholeConstruction,type SourceLodSelection} from './source-lod.ts';
 import type {SourceFarForms} from './gpu-source-far-forms.ts';
+import {discardPartAnchorAttempt} from './part-anchor-replay.ts';
+
+/** Retain this exact pose for deferred/relabelled native playback. The
+ * direct snapshot pack reads the retained table as storage, not a copy-only
+ * staging buffer. The job remains the buffer's lifetime owner. */
+export function retainPhysicalPartAnchors(device:GPUDevice,encoder:GPUCommandEncoder,anchors:SourcePartAnchorTable):SourcePartAnchorTable{
+ const buffer=device.createBuffer({label:'MAIN physical pose declared anchors',size:anchors.buffer.size,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+ encoder.copyBufferToBuffer(anchors.buffer,0,buffer,0,buffer.size);
+ return {...anchors,buffer};
+}
 
 export interface PhysicalGeometry extends CompositionGeometry {
  /** Source-revision bounds supplied at asset registration; camera admission
@@ -34,6 +46,21 @@ export interface PhysicalGeometry extends CompositionGeometry {
  /** Visibility flags only: source triangles and lineage remain complete. */
  readonly cameraCleared?:Uint8Array;
  readonly albedo?:readonly [number,number,number];
+}
+
+
+
+
+export function formSourceBoundOf(geometry:PhysicalGeometry,owner:readonly [number,number]):FormSourceBound[]{
+ const b=geometry.sourceBounds,m=geometry.worldFromSource;
+ if(!b||!m||m.length<16||geometry.poseAuthority!=='source-model')return [];
+ const low=[Infinity,Infinity,Infinity],high=[-Infinity,-Infinity,-Infinity];
+ for(let corner=0;corner<8;corner++){
+  const x=corner&1?b[3]:b[0],y=corner&2?b[4]:b[1],z=corner&4?b[5]:b[2];
+  for(let axis=0;axis<3;axis++){const v=m[axis]!*x+m[4+axis]!*y+m[8+axis]!*z+m[12+axis]!;low[axis]=Math.min(low[axis]!,v);high[axis]=Math.max(high[axis]!,v);}
+ }
+ if(![...low,...high].every(Number.isFinite))return [];
+ return [{owner,low:[low[0]!,low[1]!,low[2]!],high:[high[0]!,high[1]!,high[2]!]}];
 }
 export interface PhysicalFrameInput {
  readonly encoder:GPUCommandEncoder;readonly target?:GPUTextureView;
@@ -63,7 +90,7 @@ export type PhysicalPresentationInput=Omit<PhysicalFrameInput,'encoder'|'target'
 export interface PhysicalTextFrame extends PresentedNativeFrame {
  readonly construction:{readonly sourceLines:number;readonly omitted:readonly string[];readonly pending?:readonly string[];readonly metrics:ConstructionMetrics};
 }
-interface Targets {width:number;height:number;field:GPUTexture[];depth:GPUTexture;comparison?:GPUTexture;underdrawing:GPUTexture;inspection?:GPUTexture}
+interface Targets {width:number;height:number;field:GPUTexture[];depth:GPUTexture;comparison?:GPUTexture;mask:GPUTexture;inspection?:GPUTexture}
 
 // MATRIX RESOLUTION THE RESOLUTION?"). Every field consumer reads it through
 // the field extent (tone toField, articulation fieldPoint, visibility and the
@@ -89,9 +116,10 @@ interface Job {
  sourceView:SurfaceGraphView;sourceField:SurfaceField;
  /** Same-pose anchor table retained with tone for label-only publication. */
  partAnchorTable?:SourcePartAnchorTable;
+ partAnchorDemand?:PartAnchorDemandReadback;
  sources:readonly PhysicalResidentBatch[];inView:ReadonlySet<PhysicalResidentBatch>;
  capacity:number;intervalCapacity:number;field?:DrawingFieldView['field'];
- retry?:{relations:number;intervals:number;triangles?:number};
+ retry?:{relations:number;intervals:number;triangles?:number;anchor?:PartAnchorDemand;standingOwnerDemand?:number};
  /** The full-resolution inspection field and D10 image, while an inspection view is on. */
  inspection?:{field:SurfaceField;target:GPUTexture};
  /** This job's field slot (and inspection slot): read by its own same-pose
@@ -110,6 +138,12 @@ interface Job {
 interface DisplayedResident {snapshot:ResidentNativeSnapshot;targets:Targets;}
 interface DisplayedFrame {frame?:PhysicalTextFrame;resident?:DisplayedResident;targets:Targets;}
 interface RetirementBatch {buffers:GPUBuffer[];targets:Targets[];snapshots:ResidentNativeSnapshot[];fields:FieldSet[];outputs:GPUTexture[]}
+/** Original-scene pixels are an explicit inspection/presentation choice.
+ * MAIN's normal ASCII page must not fall back to the host beauty image while
+ * text is pending or when a previous inspection pair is still retained. */
+export function originalScenePresentationRequested(flags:Pick<PhysicalFrame['controller'],'ascii'|'underlay'|'overlay'>):boolean{
+ return !flags.ascii||flags.underlay||flags.overlay;
+}
 // Field channels: depth, oct normal, UV, owner, colour. The physical source
 // shader writes UV as 0 and no reader samples it (the attachment keeps the
 // field layout's indices): one byte, not eight (memory, 2026-11-12).
@@ -182,7 +216,7 @@ export class PhysicalFrame {
  private readonly pipeline:GPURenderPipeline;private readonly blit:GPURenderPipeline;
  private readonly fieldLayout:GPUBindGroupLayout;
  private fieldUniforms?:{buffer:GPUBuffer;memory:Float32Array;words:Uint32Array};
- private readonly underdrawing:Underdrawing;
+ private readonly textureBlit:TextureBlit;private readonly mask:ConstructionMask;
  private readonly transport:PhysicalSourceTransport;private readonly relations:SurfaceRelations;private readonly visibility:RelationVisibility;
  private readonly sources=new Map<string,SourceBuffers>();
  private readonly resources=new Set<Targets>();private readonly waiting=new Set<{resolve:(frame:PhysicalTextFrame)=>void;reject:(error:Error)=>void}>();
@@ -243,7 +277,7 @@ export class PhysicalFrame {
   geometry:{source:PhysicalGeometry;world?:Float32Array;cleared?:Uint8Array;albedo?:readonly number[]}[];
   pending:readonly CompositionGeometry[]};
  private startKey(input:PhysicalFrameInput,light:readonly [number,number,number]|undefined,pending:readonly CompositionGeometry[]=[]):NonNullable<PhysicalFrame['started']>{
-  return {pending,clip:input.clipFromWorld.slice(),eye:[...input.pose.eye],forward:[...input.pose.forward],focal:input.pose.focalPixels,perspective:input.pose.perspective,exterior:input.exterior,width:input.width,height:input.height,targetWidth:input.targetWidth,targetHeight:input.targetHeight,rows:(this.controller as {rows?:unknown}).rows,inspect:!this.controller.ascii||this.controller.underlay||this.controller.overlay,mode:input.mode,
+  return {pending,clip:input.clipFromWorld.slice(),eye:[...input.pose.eye],forward:[...input.pose.forward],focal:input.pose.focalPixels,perspective:input.pose.perspective,exterior:input.exterior,width:input.width,height:input.height,targetWidth:input.targetWidth,targetHeight:input.targetHeight,rows:(this.controller as {rows?:unknown}).rows,inspect:originalScenePresentationRequested(this.controller),mode:input.mode,
    light,labels:JSON.stringify(input.labels??[]),appearance:input.appearance,
    geometry:input.geometry.map(source=>({source,world:source.worldFromSource?.slice(),cleared:source.cameraCleared?.slice(),albedo:source.albedo&&[...source.albedo]}))};
  }
@@ -252,7 +286,7 @@ export class PhysicalFrame {
   // A source the displayed page reports pending joins once it is ready.
   if(last.pending.some(source=>this.transport.isReady(source)))return false;
   if(this.holdLight(input.light)!==last.light)return false;
-  if(last.width!==input.width||last.height!==input.height||last.targetWidth!==input.targetWidth||last.targetHeight!==input.targetHeight||last.rows!==(this.controller as {rows?:unknown}).rows||last.inspect!==(!this.controller.ascii||this.controller.underlay||this.controller.overlay)||last.mode!==input.mode||last.appearance!==input.appearance||last.perspective!==input.pose.perspective||last.exterior!==input.exterior||last.focal!==input.pose.focalPixels)return false;
+  if(last.width!==input.width||last.height!==input.height||last.targetWidth!==input.targetWidth||last.targetHeight!==input.targetHeight||last.rows!==(this.controller as {rows?:unknown}).rows||last.inspect!==originalScenePresentationRequested(this.controller)||last.mode!==input.mode||last.appearance!==input.appearance||last.perspective!==input.pose.perspective||last.exterior!==input.exterior||last.focal!==input.pose.focalPixels)return false;
   const same=(a:ArrayLike<number>|undefined,b:ArrayLike<number>|undefined)=>{if(a===b)return true;if(!a||!b||a.length!==b.length)return false;for(let i=0;i<a.length;i++)if(a[i]!==b[i])return false;return true;};
   if(!same(last.clip,input.clipFromWorld)||!same(last.eye,input.pose.eye)||!same(last.forward,input.pose.forward))return false;
   if(last.geometry.length!==input.geometry.length)return false;
@@ -262,6 +296,12 @@ export class PhysicalFrame {
    if(!same(g.worldFromSource,k.world)||!same(g.cameraCleared,k.cleared)||!same(g.albedo,k.albedo))return false;
   }
   return ignoreLabels||JSON.stringify(input.labels??[])===last.labels;
+ }
+ /** The host supplies build-time source decisions; registration still owns
+  * demand, revision identity, numeric readiness and the dynamic producer. */
+ setSourceSemanticResolver(resolver:Parameters<PhysicalSourceTransport['setSemanticResolver']>[0]):void{
+  if(this.disposed)throw Error('MAIN physical renderer is disposed');
+  this.transport.setSemanticResolver(resolver);
  }
  /** Decide the engine ticket before BeginFrame can acquire a canvas target.
   * A ready tape that is not the currently presented pair is still a reason to
@@ -291,11 +331,11 @@ export class PhysicalFrame {
  // consumes the epoch it captured, never a request made for the next frame.
  private presentationRequestEpoch=0;
  private presentationConsumedEpoch=0;
- static async create(device:GPUDevice,format:GPUTextureFormat,progress?:(fraction:number)=>void):Promise<PhysicalFrame>{
+ static async create(device:GPUDevice,format:GPUTextureFormat,progress?:ComputePipelineProgress):Promise<PhysicalFrame>{
   const compiled=typeof location!=='undefined'&&new URL(location.href).searchParams.get('grammar')!=='legacy';
-  const playback=compiled?await GpuArticulation.create(device,nativeFont.glyphs,'preformatted',8192,p=>progress?.(p*2/3)):undefined;
+  const playback=compiled?await GpuArticulation.create(device,nativeFont.glyphs,'preformatted',8192,(p,stage)=>progress?.(p*2/3,stage)):undefined;
   let services:PhysicalGpuServices|undefined;
-  try{services=await preparePhysicalGpuServices(device,compiled,p=>progress?.((compiled?2/3:0)+p*(compiled?1/3:1)));return new PhysicalFrame(device,format,{playback,services});}
+  try{services=await preparePhysicalGpuServices(device,compiled,(p,stage)=>progress?.((compiled?2/3:0)+p*(compiled?1/3:1),stage));return new PhysicalFrame(device,format,{playback,services});}
   catch(error){services?.dispose();playback?.dispose();throw error;}
  }
  constructor(private readonly device:GPUDevice,private readonly format:GPUTextureFormat,prepared?:{readonly playback?:GpuArticulation;readonly services?:PhysicalGpuServices}){
@@ -303,7 +343,8 @@ export class PhysicalFrame {
   else if(typeof location!=='undefined'&&new URL(location.href).searchParams.get('grammar')!=='legacy')throw Error('Compiled PhysicalFrame requires await PhysicalFrame.create()');
   // MEASUREMENT ONLY (T2(a) sizing, 2026-11-12): called by a review tool, never per frame.
   Object.assign(this.controller,{instanceCensus:()=>this.instanceCensus()});
-  Object.defineProperty(this.controller,'pending',{enumerable:true,get:()=>this.inflight.length>0||!!this.registration});
+  Object.defineProperty(this.controller,'pending',{enumerable:true,get:()=>!this.disposed&&((this.controller.ascii&&!this.presented)||this.inflight.length>0||!!this.registration)});
+  Object.defineProperty(this.controller,'pendingStage',{enumerable:true,get:()=>this.registration?'Compiling visible sources':this.inflight.length?'Building text frame':!this.presented?'Waiting for first text frame':undefined});
   this.controller.pause=paused=>{this.controller.paused=paused;};
   this.gpuServices=prepared?.services;
   this.transport=this.gpuServices?.transport??new PhysicalSourceTransport(device,'gpu-csr',this.playback?'summary':'full');this.relations=this.gpuServices?.relations??new SurfaceRelations(device,32768,!!this.playback);this.visibility=this.gpuServices?.visibility??new RelationVisibility(device,32768,131072,false);
@@ -315,7 +356,8 @@ export class PhysicalFrame {
   const image=device.createShaderModule({label:'MAIN native presentation magnification',code:BLIT});
   this.blit=device.createRenderPipeline({layout:'auto',vertex:{module:image,entryPoint:'vertex'},fragment:{module:image,entryPoint:'fragment',targets:[{format}]}});
   this.publication=new NativePublication(device,nativeFont.glyphs);
-  this.underdrawing=this.gpuServices?.underdrawing??new Underdrawing(device);
+  this.textureBlit=new TextureBlit(device);
+  this.mask=this.gpuServices?.mask??new ConstructionMask(device);
  }
  // ONE FIELD SLOT PER IN-FLIGHT JOB (memory 2026-11-12, speed 2026-11-17). A
  // text job writes and reads its field (depth, normal, UV, owner, colour and
@@ -370,7 +412,7 @@ export class PhysicalFrame {
   if(now>=0){const [target]=this.retiredTargets.splice(now,1);target!.field=field;target!.depth=depth;return target!;}
   const spare=this.spareTargets;this.spareTargets=undefined;
   if(spare){if(spare.width===width&&spare.height===height){spare.field=field;spare.depth=depth;return spare;}this.destroy(spare);}
-  const result:Targets={width,height,field,depth,underdrawing:this.texture(fieldWidth,fieldHeight,'rgba8unorm')};
+  const result:Targets={width,height,field,depth,mask:this.texture(fieldWidth,fieldHeight,'rgba8unorm')};
   this.resources.add(result);return result;
  }
  /** A presentation pair only: the shared field set is retired by fields(). */
@@ -381,7 +423,7 @@ export class PhysicalFrame {
    const white=new Uint8Array([255,255,255,255]);this.device.queue.writeTexture({texture:this.paperTexture},white,{bytesPerRow:4},[1,1]);}
   return this.paperTexture;
  }
- private destroy(target:Targets):void{target.comparison?.destroy();target.underdrawing.destroy();target.inspection?.destroy();this.resources.delete(target);}
+ private destroy(target:Targets):void{target.comparison?.destroy();target.mask.destroy();target.inspection?.destroy();this.resources.delete(target);}
  // The full-resolution inspection field (only while an inspection view is on),
  // one slot per in-flight job like the cell field.
  private inspectionFields(width:number,height:number):FieldSet{return this.slot(this.inspectionRing,new Set(this.inflight.map(job=>job.inspectionSet)),width,height);}
@@ -523,23 +565,25 @@ export class PhysicalFrame {
   // the host (surface-relations.ts HOST-SIZED STAGE SETS).
   const extent=(source:PhysicalResidentBatch)=>({indices:source.source.geometry.indices.length,instances:source.batch.source.instanceCapacity!});
   this.relations.reservePartAnchors(seen);
+  // Final same-pose parent admission compacts each source frontier before
+  // contacts are packed. Rejected candidates leave their incumbent children
+  // in place; all later relation/anchor/interior consumers reuse this list.
+  this.relations.admitFrontiers(encoder,seen);
   this.relations.appendContactsAll(encoder,seen.map(source=>({...source,extent:extent(source)})));
   if(seen.length){const pass=encoder.beginComputePass({label:'MAIN source relations'});try{for(const source of seen)this.relations.append(encoder,source.batch,source.source,job.sourceView,source.domain,undefined,pass,extent(source));}finally{pass.end();}}
-  this.relations.finish(encoder);
+  job.partAnchorDemand=this.relations.finish(encoder);
   // Relabeling reuses this job's pose after later relation jobs may have
   // overwritten the shared table. Retain it with the already-kept tone data.
   if(job.partAnchorTable)this.retiredBuffers.push(job.partAnchorTable.buffer);
   const anchors=this.relations.partAnchorTable;
   job.partAnchorTable=undefined;
   if(anchors){
-   const buffer=this.device.createBuffer({label:'MAIN physical pose declared anchors',size:anchors.buffer.size,usage:GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
-   encoder.copyBufferToBuffer(anchors.buffer,0,buffer,0,buffer.size);
-   job.partAnchorTable={...anchors,buffer};
+   job.partAnchorTable=retainPhysicalPartAnchors(this.device,encoder,anchors);
   }
   const {width,height}=job.targets;
   this.visibility.encode(encoder,this.relations,job.targets.depth.createView(),job.sourceView.clipFromWorld,width,height,job.sourceField);
-  this.underdrawing.encode(encoder,this.visibility,job.targets.underdrawing,width,height,job.view.rect,true,job.sourceField,job.view.light);
-  if(job.inspection)this.underdrawing.encode(encoder,this.visibility,job.inspection.target,width,height,job.view.rect,true,job.inspection.field,job.view.light);
+
+  this.mask.encode(encoder,this.visibility,job.targets.mask,width,height,job.view.rect,true,job.sourceField,job.view.light);
   // D6 consumes THIS retained pose's D10 boundaries. Encode after the mask,
   // not against an uninitialized/stale target before relation extraction.
   const classes=this.sourceClasses(job);
@@ -550,7 +594,7 @@ export class PhysicalFrame {
   // The host's sun caster map, when it has one, with THIS job's pose (the
   // cascade split reads the eye and forward the fields were drawn from).
   const sun=job.sunShadow&&{...job.sunShadow,eye:job.sourceView.eye,forward:job.sourceView.direction};
-  if(this.playback&&!job.tone)job.tone=toneField(this.device).encode(encoder,job.sourceField,job.sourceView.clipFromWorld,job.view.rect,width,height,job.view.light,job.targets.comparison,true,sun,job.targets.underdrawing,classes as unknown as Parameters<ReturnType<typeof toneField>['encode']>[11],job.view.fog);
+  if(this.playback&&!job.tone)job.tone=toneField(this.device).encode(encoder,job.sourceField,job.sourceView.clipFromWorld,job.view.rect,width,height,job.view.light,job.targets.comparison,true,sun,job.targets.mask,classes as unknown as Parameters<ReturnType<typeof toneField>['encode']>[11],job.view.fog);
   job.capacity=this.visibility.capacity;job.intervalCapacity=this.visibility.intervalCapacity;
   // Retain the current-view GPU runs before any later source extraction.
   // Compact tone then joins the SAME fixed-priority native placement; no
@@ -636,6 +680,7 @@ export class PhysicalFrame {
   job.tone=undefined;
   job.read.dispose();
   job.relationReadback?.dispose();job.relationReadback=undefined;
+  job.partAnchorDemand?.dispose();job.partAnchorDemand=undefined;
   if(job.staging){if(job.staging.mapState==='mapped')job.staging.unmap();job.staging.destroy();job.staging=undefined;}
   // The source-pose buffers survive ALL allocation stages of this one job.
   // Only the terminal source fence releases them, never a new live tick.
@@ -666,6 +711,8 @@ export class PhysicalFrame {
   for(const retained of this.inflight.filter(other=>other.retry)){
    const extent=retained.retry!;retained.retry=undefined;
    try{
+    if(extent.anchor)this.relations.ensurePartAnchorDemand(extent.anchor);
+    if(extent.standingOwnerDemand!==undefined)this.playback?.ensureStandingOwnerCapacity(extent.standingOwnerDemand);
     this.relations.ensureCapacity(extent.relations);
     if(extent.triangles)this.relations.ensureContactCapacity(extent.triangles);
     this.visibility.ensureCapacity(this.relations.lineCapacity,extent.intervals);
@@ -746,7 +793,7 @@ export class PhysicalFrame {
    // ASCII off or a mesh/underdrawing view on, the same draws are replayed into a
    // full-resolution field for them (encodeRelations draws its D10 image). With
    // no inspection view the comparison is the cell field's colour, enlarged.
-   const inspect=!this.controller.ascii||this.controller.underlay||this.controller.overlay;
+   const inspect=originalScenePresentationRequested(this.controller);
    let full:FieldSet|undefined;
    if(inspect){
     const inspectWidth=Math.ceil(input.width/2),inspectHeight=Math.ceil(input.height/2);
@@ -759,10 +806,12 @@ export class PhysicalFrame {
     this.retireInspection();
     if(targets.inspection){this.retiredOutputs.push(targets.inspection);targets.inspection=undefined;}
    }
-   // THE COMPARISON IMAGE ONLY WHEN IT CAN BE SHOWN: an inspection view, ASCII
-   // off, or no publication yet (the mesh stands in until the first text).
-   // Otherwise no page-size image is made (2.8 ms and 4 B/px per pair at 3488).
-   if(inspect||!this.displayed){targets.comparison??=this.texture(input.width,input.height,this.format);this.copy(input.encoder,(full??targets).field[4]!,targets.comparison.createView(),input.width,input.height,uniforms);}
+   // THE COMPARISON IMAGE ONLY WHEN EXPLICITLY REQUESTED: ASCII-off, mesh /
+   // underdrawing, or overlay. A normal ASCII page never allocates or copies
+   // the original scene, including before its first text publication; its
+   // pending presentation is paper. Tone still consumes the source field and
+   // the required D10 construction mask above.
+   if(inspect){targets.comparison??=this.texture(input.width,input.height,this.format);this.copy(input.encoder,(full??targets).field[4]!,targets.comparison.createView(),input.width,input.height,uniforms);}
    else if(targets.comparison){this.retiredOutputs.push(targets.comparison);targets.comparison=undefined;}
    // Source presentation must survive a failed text job. This pair has NO
    // character record and is labelled NO FRAME/ERROR by the front door; it
@@ -788,8 +837,12 @@ export class PhysicalFrame {
    // remains present for mixed or rejected groups and is filtered by the
    // shared form-depth parent flag.
    const lodScope=this.lodLifetimes.scope('camera-0',this,0,false);
+   // The physical adapter must use the same resident packed-bank admission as
+   // the examples adapter. Keep the bound transport call intact: its spatial
+   // index is the owner of the selector's `this` state.
+   const nativePart=this.playback?.wholePartAvailable.bind(this.playback);
    const lod=this.playback?this.transport.selectLod(input.clipFromWorld,input.width,input.height,input.width,input.height,input.exterior===true,input.pose.perspective,this.parentHolds.get(lodScope),this.parentGroups,
-    (parent,rows,width)=>this.playback!.smallConstructionAvailable(parent,rows,width),this.parentHolds.getSmall(lodScope)):undefined;
+    (parent,rows,width)=>this.playback!.smallConstructionAvailable(parent,rows,width),this.parentHolds.getSmall(lodScope),nativePart):undefined;
    if(lod)this.parentHolds.set(lodScope,lod.heldParents??new Set(),lod.heldSmall??new Set());
    // The field is complete: reduce its one per-form nearest-depth table after
    // the representation frontier is known, so resolveParents receives the
@@ -800,7 +853,11 @@ export class PhysicalFrame {
     (parentDomains.has(member.mesh)?((member.mesh|0x80000000)>>>0):member.mesh),member.eid
    ] as const)}));
    const formScope=this.playback?this.lodLifetimes.scope('camera-0',this,TONE_ROW*source.height/input.height):undefined;
-   formDepths(this.device).encode(input.encoder,source,formScope,parentGroups);
+
+   // source-revision bound under its certified source/model pose (all eight
+   // corners), the same bound camera admission uses. No bound: incumbent.
+   const sourceBounds:FormSourceBound[]=this.playback?instances.flatMap(({geometry,domain,owner})=>formSourceBoundOf(geometry,[(domain|0x80000000)>>>0,owner])):[];
+   formDepths(this.device).encode(input.encoder,source,formScope,parentGroups,sourceBounds);
    if(!this.playback)for(const posed of instanceBatches){
     if(!posed.source.complex)throw Error('Legacy CPU inspection requires full source topology');
     components.set(posed.domain,posed.source.complex);
@@ -832,14 +889,10 @@ export class PhysicalFrame {
    const overlay=this.controller.ascii&&(this.controller.underlay||this.controller.overlay);
    const output=input.target?this.outputFor(shown.targets.width,shown.targets.height):undefined,last=this.presented,snapshot=shown.resident?.snapshot;
    if(input.target&&output&&(!last||last.targets!==shown.targets||last.snapshot!==snapshot||last.frame!==shown.frame||last.ascii!==this.controller.ascii||last.overlay!==overlay)){
-    // PAPER WASH (publication.ts paperWash): in text mode the paper takes the
-    // shown field's own surface colour (field 4, the lit material colour).
-    const wash=this.controller.ascii&&!overlay&&!shown.targets.comparison&&!!shown.targets.field?.[4];
-    const appearance=wash?shown.targets.field[4]!:shown.targets.comparison??this.paper();
-    if(overlay)this.underdrawing.composite(input.encoder,appearance,shown.targets.inspection??shown.targets.underdrawing,output.createView(),this.format);
+    const appearance=originalScenePresentationRequested(this.controller)?shown.targets.comparison??this.paper():this.paper();
     if(shown.resident){
      const tapes=shown.resident.snapshot.results.flatMap(result=>result.resident?[result.resident.tape]:[]);
-     this.publication.encodeGpu(input.encoder,tapes,appearance.createView(),output.createView(),this.format,shown.targets.width,shown.targets.height,this.controller.ascii,false,overlay,wash);
+     this.publication.encodeGpu(input.encoder,tapes,appearance.createView(),output.createView(),this.format,shown.targets.width,shown.targets.height,this.controller.ascii,false,overlay);
     }else if(shown.frame){
      if(this.publication.frame!==shown.frame)this.publication.publish(shown.frame);
      this.publication.encode(input.encoder,appearance.createView(),output.createView(),this.format,shown.targets.width,shown.targets.height,this.controller.ascii,false,overlay);
@@ -849,8 +902,9 @@ export class PhysicalFrame {
    if(input.target&&output)this.copy(input.encoder,output,input.target,input.targetWidth,input.targetHeight,uniforms,stale(shown.targets));
   }else if(this.meshOnly){
    const mesh=this.meshOnly;nextPresented=undefined;
-   if(input.target&&this.controller.ascii&&this.controller.underlay){const output=this.outputFor(mesh.width,mesh.height);this.underdrawing.composite(input.encoder,mesh.comparison??this.paper(),mesh.inspection??mesh.underdrawing,output.createView(),this.format);this.copy(input.encoder,output,input.target,input.targetWidth,input.targetHeight,uniforms,stale(mesh));}
-   else if(input.target)this.copy(input.encoder,mesh.comparison??this.paper(),input.target,input.targetWidth,input.targetHeight,uniforms,stale(mesh));
+   const inspect=originalScenePresentationRequested(this.controller);
+   if(input.target&&this.controller.ascii&&(this.controller.underlay||this.controller.overlay)){const output=this.outputFor(mesh.width,mesh.height);this.textureBlit.snapshot(input.encoder,mesh.comparison??this.paper(),output.createView(),this.format);this.copy(input.encoder,output,input.target,input.targetWidth,input.targetHeight,uniforms,stale(mesh));}
+   else if(input.target)this.copy(input.encoder,inspect?mesh.comparison??this.paper():this.paper(),input.target,input.targetWidth,input.targetHeight,uniforms,stale(mesh));
   }
   else if(input.target){const pass=input.encoder.beginRenderPass({colorAttachments:[{view:input.target,loadOp:'clear',storeOp:'store',clearValue:{r:1,g:1,b:1,a:1}}]});pass.end();}
   const retiredBuffers=this.retiredBuffers.splice(0),retiredTargets=this.retiredTargets.splice(0),retiredSnapshots=this.retiredSnapshots.splice(0),retiredFields=this.retiredFields.splice(0),retiredOutputs=this.retiredOutputs.splice(0);
@@ -900,7 +954,7 @@ export class PhysicalFrame {
     this.visibility.submitted();
     toneField(this.device).submitted();
     this.retireBatch(retirement,!this.disposed);this.publication.submitted();
-    if(jobs.length){this.relations.submitted();this.underdrawing.submitted();}
+    if(jobs.length){this.relations.submitted();this.mask.submitted();}
    }).then(()=>{for(const encoded of jobs)void this.collect(encoded).catch(error=>failed(encoded,error));},error=>{
     this.retireBatch(retirement,false);
     if(!jobs.length&&!this.disposed){const message=error instanceof Error?error.message:String(error);if(this.controller.errors.at(-1)!==message)this.controller.errors.push(message);this.controller.onState();}
@@ -967,16 +1021,45 @@ export class PhysicalFrame {
   // GPU region packets remain owned by this source job through articulation
   // and same-pose retries. Only legacy compact CPU packets are collected.
   if(job.tone&&!job.tone.gpu){job.toneMembers=await job.tone.collect();job.tone=undefined;}if(this.disposed)return;
+  let played=job.played;
+  if(job.partAnchorDemand){
+   const demand=await job.partAnchorDemand.collect();job.partAnchorDemand=undefined;
+   if(demand.overflow){
+    // The table was copied only for this exact pose. Grow from the complete
+    // selected demand, then encodeRelations will replay the retained pose
+    // before this job can enter the publication drain.
+    if(!played)throw Error('Part-anchor demand has no retained articulation job');
+    const [discarded]=await discardPartAnchorAttempt([{played,cancel(){job.toneLiterals?.reject(Error('Part-anchor demand retry discarded incomplete physical playback'));job.toneLiterals=undefined;}}]);
+    const discardedResult=discarded?.status==='fulfilled'?discarded.value:undefined;
+    const overflow=discardedResult?.sourceOverflow;
+    if(overflow&&(overflow.flags&~22))throw Error(`GPU physical source failure ${overflow.flags}`);
+    if(discardedResult?.sourceRowDemand!==undefined)this.relations.ensurePartAnchorRowDemand(discardedResult.sourceRowDemand);
+    // Anchor and relation/contact demand belong to the same attempt. Do not
+    // throw the latter away while retiring its incomplete anchor snapshot.
+    job.retry={relations:Math.max(job.capacity,overflow?.relations??0),intervals:Math.max(job.intervalCapacity,overflow?.intervals??0),triangles:overflow?.triangles,anchor:demand};return;
+   }
+  }
   const tone=job.toneMembers;
   const view={...job.view,tone} as TonedFieldView;
   job.toneLiterals?.resolve(this.construction.playbackLiterals(job.labels,[view],[]));
-  let played=job.played;
   if(!played){
    const classes=this.sourceClasses(job);this.pushFarAggregate(classes,job);
    played=playback.enqueueSourceNext(this.visibility,classes,job.sourceField,job.targets.width,job.targets.height,'camera-0',job.view.owners,job.view.rect,this.construction.playbackLiterals(job.labels,[view],[]),job.tone?.gpu,job.partAnchorTable);
   }
   const result=await played;if(this.disposed){result.resident?.release();return;}
-  if(result.sourceOverflow){const overflow=result.sourceOverflow;if(overflow.flags&~22)throw Error(`GPU physical source failure ${overflow.flags}`);job.retry={relations:Math.max(job.capacity,overflow.relations),intervals:Math.max(job.intervalCapacity,overflow.intervals),triangles:overflow.triangles};return;}
+  // The hint proves THIS job used an undersized row table. Another in-flight
+  // job may already have grown the shared reserve; that does not upgrade this
+  // job's immutable layout. A latest stale job still needs a real rebuild.
+  if(result.sourceRowDemand!==undefined){this.relations.ensurePartAnchorRowDemand(result.sourceRowDemand);if(this.lastStartedJob===job)this.started=undefined;}
+  if(result.sourceOverflow){const overflow=result.sourceOverflow;if(overflow.flags&~22)throw Error(`GPU physical source failure ${overflow.flags}`);if(result.standingOwnerDemand!==undefined)this.playback?.ensureStandingOwnerCapacity(result.standingOwnerDemand);job.retry={relations:Math.max(job.capacity,overflow.relations),intervals:Math.max(job.intervalCapacity,overflow.intervals),triangles:overflow.triangles,standingOwnerDemand:result.standingOwnerDemand};return;}
+  if(result.standingOwnerDemand!==undefined){
+   // The missing compact carrier kept the complete incumbent. Publish that
+   // valid tape now; grow and invalidate this particular old layout for the
+   // next job instead of turning a harmless reserve hint into no first frame.
+   if(result.standingOwnerDemand<0)throw Error('Negative standing-owner demand');
+   this.playback?.ensureStandingOwnerCapacity(result.standingOwnerDemand);
+   if(this.lastStartedJob===job)this.started=undefined;
+  }
   const resident=result.resident;if(!resident)throw Error('Compiled physical playback returned no resident GPU tape');
   // The header proved this tape complete and sealed; drain publishes it in
   // serial order (after any earlier job's same-pose retry).
@@ -998,5 +1081,5 @@ export class PhysicalFrame {
   const frame=this.controller.frames.get(0);return frame?Promise.resolve(frame):new Promise((resolve,reject)=>this.waiting.add({resolve,reject}));
  }
  setTextSink(sink:((frame:PhysicalTextFrame)=>void)|null):void{this.sink=sink;}
- dispose():void{this.disposed=true;this.releaseKept();for(const batch of [...this.retirementBatches])this.retireBatch(batch,false);this.displayed?.resident?.snapshot.results.forEach(result=>result.resident?.release());this.playback?.dispose();this.construction.dispose();for(const job of this.inflight.splice(0)){job.snapshot?.results.forEach(result=>result.resident?.release());job.snapshot=undefined;this.finish(job);}this.sources.forEach(source=>this.release(source));this.sources.clear();this.fieldUniforms?.buffer.destroy();this.fieldUniforms=undefined;this.retiredBuffers.forEach(buffer=>buffer.destroy());for(const target of [...this.resources])this.destroy(target);for(const set of [...this.retiredFields.splice(0),...this.fieldRing.splice(0),...this.inspectionRing.splice(0)])this.destroyFields(set);this.paperTexture?.destroy();this.paperTexture=undefined;for(const texture of [...this.retiredOutputs.splice(0),...(this.shownOutput?[this.shownOutput]:[])])texture.destroy();this.shownOutput=undefined;if(this.gpuServices)this.gpuServices.dispose();else{this.transport.dispose();this.relations.dispose();this.visibility.dispose();this.underdrawing.dispose();}this.publication.dispose();for(const request of this.waiting)request.reject(Error('MAIN physical source epoch was retired'));this.waiting.clear();}
+ dispose():void{this.disposed=true;this.releaseKept();for(const batch of [...this.retirementBatches])this.retireBatch(batch,false);this.displayed?.resident?.snapshot.results.forEach(result=>result.resident?.release());this.playback?.dispose();this.construction.dispose();for(const job of this.inflight.splice(0)){job.snapshot?.results.forEach(result=>result.resident?.release());job.snapshot=undefined;this.finish(job);}this.sources.forEach(source=>this.release(source));this.sources.clear();this.fieldUniforms?.buffer.destroy();this.fieldUniforms=undefined;this.retiredBuffers.forEach(buffer=>buffer.destroy());for(const target of [...this.resources])this.destroy(target);for(const set of [...this.retiredFields.splice(0),...this.fieldRing.splice(0),...this.inspectionRing.splice(0)])this.destroyFields(set);this.paperTexture?.destroy();this.paperTexture=undefined;for(const texture of [...this.retiredOutputs.splice(0),...(this.shownOutput?[this.shownOutput]:[])])texture.destroy();this.shownOutput=undefined;if(this.gpuServices)this.gpuServices.dispose();else{this.transport.dispose();this.relations.dispose();this.visibility.dispose();this.mask.dispose();}this.publication.dispose();for(const request of this.waiting)request.reject(Error('MAIN physical source epoch was retired'));this.waiting.clear();}
 }

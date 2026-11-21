@@ -1,4 +1,4 @@
-import {weldSourceVertices} from './source-complex.ts';
+import {weldSourceVertices,SOURCE_WELD_TOLERANCE} from './source-complex.ts';
 
 type Point=readonly [number,number,number];
 /** Part label word, the same layout on a section, a band and a chain:
@@ -88,6 +88,51 @@ function spanIndex(low:Float64Array,high:Float64Array):()=>((lo:number,hi:number
  };
 }
 
+
+
+
+export const PART_BOUNDARY_LINE_SINE=1e-4;
+
+
+
+
+
+
+
+
+function* boundaryLineJoins(samples:readonly PartSample[],triangles:readonly (readonly number[])[],edges:ReadonlyMap<string,{readonly faces:readonly number[]}>,faceRoot:(f:number)=>number,point:(v:number)=>Point,tolerance:number):Generator<void,Uint32Array>{
+ const alias=Uint32Array.from({length:samples.length},(_,i)=>i);
+ const candidates:{id:number;q:Point;d:Point;n:number;component:number}[]=[];
+ for(const [id,sample]of samples.entries()){
+  const edge=edges.get(`${sample.a}/${sample.b}`);if(!edge||edge.faces.length!==1)continue;
+  const a=point(sample.a),b=point(sample.b),d=sub(b,a),n=length(d);if(!(n>0))continue;
+  candidates.push({id,q:[a[0]+d[0]*sample.t,a[1]+d[1]*sample.t,a[2]+d[2]*sample.t],d:[d[0]/n,d[1]/n,d[2]/n],n,component:faceRoot(edge.faces[0]!)});
+  yield;
+ }
+ if(candidates.length<2||!triangles.length)return alias;
+ const size=tolerance*2,cell=(x:number)=>Math.floor(x/size),grid=new Map<string,number[]>();
+ for(const [index,c]of candidates.entries()){const key=`${cell(c.q[0])},${cell(c.q[1])},${cell(c.q[2])}`;const list=grid.get(key);if(list)list.push(index);else grid.set(key,[index]);}
+ const partners=candidates.map(()=>[] as number[]);
+ for(const [index,c]of candidates.entries()){
+  const [x,y,z]=[cell(c.q[0]),cell(c.q[1]),cell(c.q[2])];
+  for(let i=x-1;i<=x+1;i++)for(let j=y-1;j<=y+1;j++)for(let k=z-1;k<=z+1;k++)for(const other of grid.get(`${i},${j},${k}`)??[]){
+   if(other===index)continue;const o=candidates[other]!;if(o.component===c.component)continue;
+   if(Math.abs(o.q[0]-c.q[0])>tolerance||Math.abs(o.q[1]-c.q[1])>tolerance||Math.abs(o.q[2]-c.q[2])>tolerance)continue;
+   // One line: directions agree within the authored-precision sine, widened by
+   // the positional tolerance over the shorter edge (a short float32 edge's
+   // direction is only as exact as its endpoints).
+   if(length(cross(c.d,o.d))>PART_BOUNDARY_LINE_SINE+2*tolerance/Math.min(c.n,o.n))continue;
+   partners[index]!.push(other);
+  }
+  yield;
+ }
+ for(const [index,list]of partners.entries()){
+  if(list.length!==1)continue;const other=list[0]!;if(other<index||partners[other]!.length!==1||partners[other]![0]!==index)continue;
+  const a=candidates[index]!.id,b=candidates[other]!.id;alias[Math.max(a,b)]=Math.min(a,b);
+ }
+ return alias;
+}
+
 /** Source-space section graph, compiled once per immutable geometry revision.
  * Cross-section loops are GUIDES, never a row of circles to publish. Bands
  * retain split/merge incidence, source faces and nested holes, so articulation
@@ -145,6 +190,11 @@ export function* meshPartWork(mesh:PartMesh,sourceWeld?:Uint32Array):Generator<v
  const representatives=Uint32Array.from({length:vertexCount},(_,i)=>root(i)),height=new Float64Array(vertexCount);
  let low=Infinity,high=-Infinity;for(const v of used){height[v]=dot(sub(point(v),origin),axis);low=Math.min(low,height[v]!);high=Math.max(high,height[v]!);yield;}
  const epsilon=Math.max(1,Math.abs(low),Math.abs(high))*Number.EPSILON*64;
+
+ // samples on one authored line agree to a few float32 ulps of the coordinate
+ // magnitude, never coarser than the vertex weld's own tolerance.
+ let magnitude=1;for(const v of used)for(let k=0;k<3;k++)magnitude=Math.max(magnitude,Math.abs(p[v*3+k]!));
+ const lineTolerance=Math.max(SOURCE_WELD_TOLERANCE,magnitude*2**-20);
  const links=new Map<number,{neighbors:Set<number>;edges:[number,number][]}>(),edges=new Map<string,{a:number;b:number;faces:number[]}>();
  const triangles:readonly number[][]=Array.from({length:faceCount},(_,f)=>[representatives[ix[f*3]!]!,representatives[ix[f*3+1]!]!,representatives[ix[f*3+2]!]!]);
  const faceLow=new Float64Array(faceCount),faceHigh=new Float64Array(faceCount);
@@ -182,9 +232,23 @@ export function* meshPartWork(mesh:PartMesh,sourceWeld?:Uint32Array):Generator<v
      const x=Math.min(a,b),y=Math.max(a,b),key=`${x}/${y}`;let id=sampleKeys.get(key);
      if(id===undefined){id=samples.length;sampleKeys.set(key,id);samples.push({a:x,b:y,t:(level-height[x]!)/(height[y]!-height[x]!)});}hits.push(id);
     }
-    if(hits.length===2&&hits[0]!==hits[1]){const id=segments.length;segments.push([hits[0]!,hits[1]!,f]);for(const hit of hits){const list=incidence.get(hit)??[];list.push(id);incidence.set(hit,list);}}
+    if(hits.length===2&&hits[0]!==hits[1])segments.push([hits[0]!,hits[1]!,f]);
    }yield;
   }
+
+  // along a shared line with non-matching vertices (a T-junction: the d8fc
+  // building's 135 flat panels) have no common vertex, so the weld above
+  // cannot join them and every section stopped at each panel's free edge.
+  // The same surface point is the same section point: a sample on a welded
+  // BOUNDARY edge (one face) of one face component that coincides with a
+  // sample on a PARALLEL boundary edge of another component is one sample.
+  // It is source-space equality on coincident boundary lines at an intrinsic
+  // level, not camera proximity, a centre test or a chord. A sample with more
+  // than one such partner joins none, interior edges never join.
+  const alias=yield* boundaryLineJoins(samples,triangles,edges,faceRoot,point,lineTolerance);
+  for(const segment of segments){segment[0]=alias[segment[0]]!;segment[1]=alias[segment[1]]!;}
+  for(let id=segments.length-1;id>=0;id--)if(segments[id]![0]===segments[id]![1])segments.splice(id,1);
+  for(const [id,segment]of segments.entries())for(const hit of segment.slice(0,2)){const list=incidence.get(hit)??[];list.push(id);incidence.set(hit,list);}
   const seen=new Set<number>(),current:PartSection[]=[];
   for(let first=0;first<segments.length;first++){
    if(seen.has(first))continue;

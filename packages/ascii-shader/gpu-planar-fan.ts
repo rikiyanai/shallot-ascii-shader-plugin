@@ -9,31 +9,47 @@ struct NativeFan {
  valid:u32, mirror:f32, origin:vec2i, width:i32, depth:i32, wall:i32,
  vertices:array<Point,7>,
 }
-fn nativeFan(run:Run)->NativeFan{
- var fan:NativeFan;fan.valid=0u;
+
+// search is REMOVED). The fan's incidence is its box packet's ORIGINAL edge
+// descriptors: one whole pair per source edge with the original vertex IDs in
+// visible.z, retained whether or not the edge is occluded (visibility is the
+// head point's flag, separate from the geometry). Every descriptor counts,
+// occluded or visible, so the seven vertices, the coupled width/depth/wall and
+// every repeat count are the same under ANY occlusion. An absent (zeroed) or
+// malformed descriptor means the source graph is incomplete: the complete
+// incumbent keeps the box; no edge is ever inferred. Occlusion clips units
+// only in fanWord, where an occluded edge emits nothing.
+struct FanGraph {vertices:array<Point,7>,adjacency:array<vec3u,7>,degree:array<u32,7>,vertexCount:u32,edgeCount:u32,ok:bool}
+fn nativeFanGraph(run:Run)->FanGraph{
+ var g:FanGraph;g.ok=false;
  var vertices:array<Point,7>;var adjacency:array<vec3u,7>;var degree:array<u32,7>;
  var vertexCount=0u;var edgeCount=0u;
  for(var i=0u;i+1u<run.range.y;i+=2u){
   let a=points[run.range.x+i];let b=points[run.range.x+i+1u];
-  if(!pointVisible(a)){continue;}
-  if(a.visible.z==NONE||b.visible.z==NONE||a.visible.z==b.visible.z){return fan;}
+  // An absent descriptor (no projected geometry) is an incomplete source graph.
+  if(a.visible.y==0u||b.visible.y==0u){return g;}
+  if(a.visible.z==NONE||b.visible.z==NONE||a.visible.z==b.visible.z){return g;}
   var pair=vec2u(0);
   for(var side=0u;side<2u;side++){
    var q=a;if(side==1u){q=b;}
    var found=NONE;
    for(var v=0u;v<vertexCount;v++){if(vertices[v].visible.z==q.visible.z){found=v;}}
-   if(found==NONE){if(vertexCount==7u){return fan;}found=vertexCount;vertices[vertexCount]=q;vertexCount++;}
+   if(found==NONE){if(vertexCount==7u){return g;}found=vertexCount;vertices[vertexCount]=q;vertexCount++;}
    pair[side]=found;
   }
   for(var side=0u;side<2u;side++){
    let v=pair[side];let other=pair[1u-side];
-   if(degree[v]>=3u){return fan;}
-   for(var n=0u;n<degree[v];n++){if(adjacency[v][n]==other){return fan;}}
+   if(degree[v]>=3u){return g;}
+   for(var n=0u;n<degree[v];n++){if(adjacency[v][n]==other){return g;}}
    adjacency[v][degree[v]]=other;degree[v]++;
   }
   edgeCount++;
  }
- if(vertexCount!=7u||edgeCount!=9u){return fan;}
+ g.vertices=vertices;g.adjacency=adjacency;g.degree=degree;g.vertexCount=vertexCount;g.edgeCount=edgeCount;g.ok=true;return g;
+}
+fn nativeFanOf(vertexIn:array<Point,7>,adjacencyIn:array<vec3u,7>,degreeIn:array<u32,7>)->NativeFan{
+ var fan:NativeFan;fan.valid=0u;
+ var vertices=vertexIn;var adjacency=adjacencyIn;var degree=degreeIn;
  // Removing the sole three-way interior corner leaves one exterior cycle.
  // Actual original vertex IDs, not projected proximity, establish adjacency.
  var center=NONE;
@@ -86,12 +102,19 @@ fn nativeFan(run:Run)->NativeFan{
  }
  fan.valid=1u;fan.mirror=mirror;fan.origin=origin;fan.width=width;fan.depth=depth;fan.wall=wall;return fan;
 }
+fn nativeFan(run:Run)->NativeFan{
+ var fan:NativeFan;fan.valid=0u;
+ let g=nativeFanGraph(run);if(!g.ok||g.vertexCount!=7u||g.edgeCount!=9u){return fan;}
+ return nativeFanOf(g.vertices,g.adjacency,g.degree);
+}
 fn fanWord(id:u32,run:Run,fan:NativeFan,start:u32,end:u32,unit:u32,word:u32,x:i32,row:i32,t:f32,priority:u32){
  let fromID=fan.vertices[start].visible.z;let toID=fan.vertices[end].visible.z;
  for(var i=0u;i+1u<run.range.y;i+=2u){
   let a=points[run.range.x+i];let b=points[run.range.x+i+1u];
   let forward=a.visible.z==fromID&&b.visible.z==toID;let backward=b.visible.z==fromID&&a.visible.z==toID;
   if(!forward&&!backward){continue;}
+  // Occlusion clips here, per edge: the construction above never changes.
+  if(!pointVisible(a)){return;}
   let advance=words[word*WS+1u];let q=interpolatePoint(a,b,select(1.0-t,t,forward));
   let pen=select(-fan.origin.x-x-i32(advance),fan.origin.x+x,fan.mirror>0.0);
   sourceWord(id,unit,q,pen,fan.origin.y+row,word,words[word*WS],advance,priority,a,b);return;

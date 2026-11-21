@@ -24,6 +24,9 @@ const gpuPath=resolve(engine,'src/engine/runtime/gpu.ts');
 const runtimeBarrelPath=resolve(engine,'src/engine/runtime/index.ts');
 const physicsRuntimePath=resolve(engine,'src/standard/physics/runtime.ts');
 const physicsBarrelPath=resolve(engine,'src/standard/physics/index.ts');
+const loadingPath=resolve(engine,'src/standard/loading/index.ts');
+const appPath=resolve(engine,'src/engine/app/index.ts');
+const skinningPath=resolve(engine,'src/extras/gltf/skinning.ts');
 let pipelines=await readFile(pipelinePath,'utf8');
 let forward=await readFile(forwardPath,'utf8');
 let preprocess=await readFile(preprocessPath,'utf8');
@@ -40,6 +43,15 @@ let gpu=await readFile(gpuPath,'utf8');
 let runtimeBarrel=await readFile(runtimeBarrelPath,'utf8');
 let physicsRuntime=await readFile(physicsRuntimePath,'utf8');
 let physicsBarrel=await readFile(physicsBarrelPath,'utf8');
+let loading=await readFile(loadingPath,'utf8');
+let app=await readFile(appPath,'utf8');
+let skinning=await readFile(skinningPath,'utf8');
+const {transformLoadingDiagnostics,transformLoadingErrorPriority,transformPluginHookCause}=await import('./loading-diagnostics.mjs');
+// Validate and prepare the diagnostics seam before any other patch writes.
+// The final writes stay with the rest of this script's declared write phase.
+loading=transformLoadingDiagnostics(loading);
+loading=transformLoadingErrorPriority(loading);
+app=transformPluginHookCause(app);
 const phaseSource=await readFile(resolve(project,'tools/patches/shallot-main/engine/phase-geometry.ts'),'utf8');
 const presentationTicketSource=await readFile(resolve(project,'tools/patches/shallot-main/engine/presentation-ticket.ts'),'utf8');
 const presentationTargetsSource=await readFile(resolve(project,'tools/patches/shallot-main/engine/presentation-targets.ts'),'utf8');
@@ -341,6 +353,19 @@ if(!phases.includes(primaryMarker)){
  phases=phases.replace("import { captureGeometryPass } from './phase-geometry';","import { captureGeometryPass, PhaseGeometryCapture } from './phase-geometry';");
  phases=phases.replace('readonly geometryAdapter?: "standard-material";','readonly geometryAdapter?: "standard-material" | "screen-effect";');
 }
+
+// post-main original-beauty image pass is scheduled: the MAIN page clears and
+// covers the final target. Tonemapping's camera loop also drives the
+// EffectPasses before/after chain (bloom, effect stack); outline encodes its
+// own passes into the framebuffer. Depth, shadows, SSAO, fog and sky are kept:
+// the replayed field shading (fieldInputs) reads them.
+{
+ const {transformPrimaryImageTonemapping,transformPrimaryImageOutline}=await import('./primary-image.mjs');
+ for(const [relative,transform]of [['src/core/rendering/tonemapping-state.ts',transformPrimaryImageTonemapping],['src/extras/outline/index.ts',transformPrimaryImageOutline]]){
+  const path=resolve(engine,relative),before=await readFile(path,'utf8'),after=transform(before);
+  if(after!==before)await writeFile(path,after);
+ }
+}
 // Fullscreen fog is an image composite, not a one-triangle surface. A small
 // vertex count is not that certificate: a real sheet/line may also have six.
 const fogPath=resolve(engine,'src/extras/fog/index.ts');
@@ -446,6 +471,8 @@ function periodicCircleSample(turn: number): [number, number] {
 // Validate every anchor before writing any file.
 const {transformInstanceCapacity}=await import('./instance-capacity.mjs');
 ({preprocess,forward}=transformInstanceCapacity({preprocess,forward}));
+const {transformNativeInstanceFrontier}=await import('./native-instance-frontier.mjs');
+forward=transformNativeInstanceFrontier(forward);
 // Native spatial work selection observes the same producer rows and cull
 // volumes as the GPU pack. It runs before MAIN registers/extracts sources.
 const spatialMarker='/* TRUEFF_MAIN_SOURCE_WORKSET_0103 */';
@@ -475,6 +502,9 @@ if(!forward.includes(visibleInstanceCapacity)){
 }
 const spatialSource=await readFile(resolve(project,'packages/shallot-main/spatial-index.ts'),'utf8');
 const worksetSource=await readFile(resolve(project,'tools/patches/shallot-main/engine/source-workset.ts'),'utf8');
+const posedBoundSource=await readFile(resolve(project,'tools/patches/shallot-main/engine/posed-bound-producer.ts'),'utf8');
+const {transformGltfPosedBoundProducer}=await import('./posed-bound-material.mjs');
+skinning=transformGltfPosedBoundProducer(skinning);
 if(!barrel.includes('export { sourceViewWorkset } from "./source-workset";'))barrel+='\nexport { sourceViewWorkset } from "./source-workset";\n';
 const meshChangeMarker='/* TRUEFF_MAIN_MESH_CHANGE_STREAM_0103 */';
 if(!mesh.includes(meshChangeMarker)){
@@ -520,9 +550,13 @@ await writeFile(resolve(engine,'src/core/rendering/presentation-ticket.ts'),pres
 await writeFile(resolve(engine,'src/core/rendering/presentation-targets.ts'),presentationTargetsSource);
 await writeFile(resolve(engine,'src/engine/runtime/pipeline-source.ts'),pipelineSource);
 await writeFile(resolve(engine,'src/standard/rendering/main-spatial-index.ts'),spatialSource);
+await writeFile(resolve(engine,'src/standard/rendering/posed-bound-producer.ts'),posedBoundSource);
 await writeFile(resolve(engine,'src/standard/rendering/source-workset.ts'),worksetSource);
 const {applySourceMaterialMetadata}=await import('./material-source.mjs');
 await applySourceMaterialMetadata(engine);
+
+const {applyStaticSourceSemantic}=await import('./static-source-semantic.mjs');
+await applyStaticSourceSemantic(engine);
 const {applyAuthoredConstruction}=await import('./authored-construction.mjs');
 await applyAuthoredConstruction(engine);
 const {applyGpuIndexedSourceProducer}=await import('./gpu-indexed-source-producer.mjs');
@@ -531,4 +565,7 @@ const {applyMaterialRecipes}=await import('./material-recipes.mjs');
 await applyMaterialRecipes(engine);
 const {applyMobileOrbitPatch}=await import('./mobile-orbit.mjs');
 await applyMobileOrbitPatch(engine);
+await writeFile(loadingPath,loading);
+await writeFile(appPath,app);
+await writeFile(skinningPath,skinning);
 console.log(`Applied MAIN live material geometry seam to Shallot ${version}`);

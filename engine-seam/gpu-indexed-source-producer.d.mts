@@ -1,0 +1,11 @@
+export const GPU_INDEXED_SOURCE_PRODUCER_MARKER:string;
+export const GPU_INDEXED_SOURCE_METADATA_TYPE:string;
+export const GPU_INDEXED_SOURCE_VOXEL_MARKER:string;
+export const GPU_INDEXED_SOURCE_MESHER_MARKER:string;
+export const GPU_INDEXED_SOURCE_POOL_MARKER:string;
+export function transformGpuIndexedSourceSources(input:{mesh:string;forward:string}):{mesh:string;forward:string};
+export function transformVoxelTerrainSource(source:string,options?:{importSpecifier?:string}):string;
+export function transformVoxelMesherSource(source:string):string;
+export function transformVoxelPoolSource(source:string):string;
+export function gpuIndexedSourceVoxelVitePlugin(options?:{sourcePath?:string;importSpecifier?:string}):{name:string;enforce:string;transform(code:string,id:string):{code:string;map:null}|null};
+export function applyGpuIndexedSourceProducer(engine:string):Promise<{mesh:string;forward:string}>;

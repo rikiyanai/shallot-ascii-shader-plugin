@@ -10,9 +10,12 @@ export function placeBody(instance:GltfSceneInstance,body:Float32Array):void {
 
 /** Asset-space pivot to body-space placement. The unchanged scene clip stays
  * shared; each primitive belongs to exactly one physical assembly. */
-export function bodyPlacement(body:Float32Array,pivot:readonly number[],out:Float32Array):void{
-    composeMat4(body[0]!,body[1]!,body[2]!,body[3]!,body[4]!,body[5]!,body[6]!,1,1,1,out);
+export function bodyPlacement(body:Float32Array,pivot:readonly number[],out:Float32Array,scale:readonly number[]=[1,1,1],groundY=0):void{
+    composeMat4(body[0]!,body[1]!,body[2]!,body[3]!,body[4]!,body[5]!,body[6]!,scale[0]!,scale[1]!,scale[2]!,out);
     for(let row=0;row<3;row++)out[12+row]-=out[row]!*pivot[0]!+out[4+row]!*pivot[1]!+out[8+row]!*pivot[2]!;
+    // Scale around the wheel contact plane, not the asset origin: reducing
+    // height must not lift the wheels off the rails (including when derailed).
+    for(let row=0;row<3;row++)out[12+row]+=out[4+row]!/scale[1]!*groundY*(1-scale[1]!);
 }
 export function primitivePlacement(placement:Float32Array,global:Float32Array,skinned:boolean,out:Float32Array,scratch:Float32Array):void{
     if(skinned)scratch.set(placement);else multiplyMat4(placement,global,scratch);

@@ -5,13 +5,16 @@ import {nativeSpacePlan,type NativeWhitespacePolicy} from './text/native-whitesp
 import type {NativeGlyph} from './native-page.ts';
 import {TONE_PASSAGES} from './compiled-tone-passages.ts';
 import {compileSmallConstructions} from './compiled-small-construction.ts';
+import {compileNativeRowUnits} from './compiled-native-row-units.ts';
+import {packNativeRowPrograms} from './native-row-program-format.ts';
 export {WORD_STRIDE,GRAMMAR_RECORD_WORDS,GRAMMAR_DIRECTIONS,GRAMMAR_PHASES,GRAMMAR_ROLES,
   HARD_SLOPE_PHASES,PAIRED_FLANK_LEANS,TERRAIN_INSTRUCTION_WORDS,FOLIAGE_EDGES_AT,
   JUNCTION_DIRECTIONS,JUNCTION_TWO,JUNCTION_THREE,JUNCTION_RECORDS,
   SMALL_CONSTRUCTION_TABLE_AT,SMALL_CONSTRUCTION_TABLE_VERSION,SMALL_CONSTRUCTION_TABLE_HEADER_WORDS,
   SMALL_CONSTRUCTION_TABLE_RECORD_WORDS,SMALL_CONSTRUCTION_TABLE_WIDTH_LIMIT,SMALL_CONSTRUCTION_TABLE_KIND_COUNT,
   SMALL_CONSTRUCTION_TABLE_ROW_COUNT,SMALL_CONSTRUCTION_TABLE_INDEX_AT,SMALL_CONSTRUCTION_TABLE_INDEX_WORDS,
-  SMALL_CONSTRUCTION_TABLE_RECORDS_AT,SMALL_CONSTRUCTION_TABLE_NONE} from './role-grammar-format.ts';
+  SMALL_CONSTRUCTION_TABLE_RECORDS_AT,SMALL_CONSTRUCTION_TABLE_NONE,WHOLE_GROWTH_TABLE_VERSION,WHOLE_GROWTH_TABLE_HEADER_WORDS,
+  WHOLE_GROWTH_TABLE_MAX_ROWS,WHOLE_GROWTH_TABLE_RECORD_WORDS,WHOLE_GROWTH_CONTINUATION,wholeGrowthTableOffset,wholeGrowthTableRecordWords} from './role-grammar-format.ts';
 export type {GrammarRole,GrammarRoleEntry,CompiledRolePart,PackedRoleGrammar,PackedSmallConstructionRecord,PackedSmallConstructionTable} from './role-grammar-format.ts';
 import {WORD_STRIDE,GRAMMAR_RECORD_WORDS,GRAMMAR_DIRECTIONS,GRAMMAR_PHASES,GRAMMAR_ROLES,
   HARD_SLOPE_PHASES,PAIRED_FLANK_LEANS,TERRAIN_INSTRUCTION_WORDS,FOLIAGE_EDGES_AT,
@@ -26,7 +29,9 @@ import {WORD_STRIDE,GRAMMAR_RECORD_WORDS,GRAMMAR_DIRECTIONS,GRAMMAR_PHASES,GRAMM
   SMALL_CONSTRUCTION_TABLE_AT,SMALL_CONSTRUCTION_TABLE_VERSION,SMALL_CONSTRUCTION_TABLE_HEADER_WORDS,
   SMALL_CONSTRUCTION_TABLE_RECORD_WORDS,SMALL_CONSTRUCTION_TABLE_WIDTH_LIMIT,SMALL_CONSTRUCTION_TABLE_KIND_COUNT,
   SMALL_CONSTRUCTION_TABLE_ROW_COUNT,SMALL_CONSTRUCTION_TABLE_INDEX_AT,SMALL_CONSTRUCTION_TABLE_INDEX_WORDS,
-  SMALL_CONSTRUCTION_TABLE_RECORDS_AT,SMALL_CONSTRUCTION_TABLE_NONE,packSmallConstructionKindAndEnds,smallConstructionIndexOffset,
+  SMALL_CONSTRUCTION_TABLE_RECORDS_AT,SMALL_CONSTRUCTION_TABLE_NONE,WHOLE_GROWTH_TABLE_VERSION,WHOLE_GROWTH_TABLE_HEADER_WORDS,
+  WHOLE_GROWTH_TABLE_MAX_ROWS,WHOLE_GROWTH_CONTINUATION,wholeGrowthTableOffset,wholeGrowthTableRecordWords,
+  packSmallConstructionKindAndEnds,smallConstructionIndexOffset,
   type PackedRoleGrammar, type GrammarRole, type CompiledRolePart} from './role-grammar-format.ts';
 /** Line classes by the row portion's slope |dy|/|dx| (page px). Under
  * TERRAIN_FLAT_SLOPE a terrain line is level ground (one level unit by
@@ -67,8 +72,11 @@ export const HARD_SLOPE_RISING=['￣','´','‐',',','_'] as const,HARD_SLOPE_FA
 
 
 export const HARD_SLOPE_PASSAGES={
- rising:['_,,.-‐´￣','_,.-‐‐´','_,.-‐´','_,.-´','_,‐´'],
- falling:['￣｀‐‐､__','￣｀‐､_','｀ヽ､､.','｀‐､_','｀ヽ_'],
+ rising:['_,,.-‐´￣','_,.-‐‐´','_,,.-‐´','_,.-´','_,‐´'],
+ // A full row needs its upper/lower ports. The former falling bin5
+ // ｀ヽ､､. ends at y13: it leaves >=4px at the next17px row. Keep that
+ // turn vocabulary elsewhere; this straight grade reaches y0..15 whole.
+ falling:['￣｀‐‐､__','￣｀‐､_','￣‐､_','｀‐､_','｀ヽ_'],
 } as const;
 
 /** Compile the native ports and placement of one COMPLETE row passage.
@@ -980,7 +988,82 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
    nextWidth=low;
   }
  }
- const farStrip=new Uint32Array(SMALL_CONSTRUCTION_TABLE_AT+SMALL_CONSTRUCTION_TABLE_RECORDS_AT+packedSmallRecords.length*SMALL_CONSTRUCTION_TABLE_RECORD_WORDS);
+ // Native vertical growth is compiled from the retained row ink.  For each
+ // row, choose the longest-spanning glyph on each side and store the signed
+ // x displacement that continues that glyph into the next native 17px row.
+ // The runtime only multiplies this fixed shift for inserted source rows; it
+ // never searches glyphs or measures a visible fragment.
+ const growthRows=Math.max(WHOLE_GROWTH_TABLE_MAX_ROWS,...parts.map(part=>part.rows));
+ const growthRecordWords=wholeGrowthTableRecordWords(growthRows);
+ const growthRecords=new Uint32Array(parts.length*growthRecordWords);
+ const signed=(value:number)=>(Math.max(-127,Math.min(127,Math.round(value)))>>>0);
+ const continuationShift=(atoms:readonly number[],side:'left'|'right',pivot:number):number=>{
+  let best:number|undefined,bestSpan=-1;
+  for(let at=0;at<atoms.length;at+=4){
+   const glyph=font[atoms[at]!]!,x=atoms[at+1]!;
+   const ink=glyph.points.map(point=>[x+point[0]!,point[1]!] as const);
+   if(!ink.length)continue;
+   const centre=ink.reduce((sum,point)=>sum+point[0],0)/ink.length;
+   if(side==='left'?centre>pivot:centre<pivot)continue;
+   const top=Math.min(...ink.map(point=>point[1])),bottom=Math.max(...ink.map(point=>point[1])),span=bottom-top;
+   if(span<bestSpan)continue;
+   const topInk=ink.filter(point=>point[1]===top),bottomInk=ink.filter(point=>point[1]===bottom);
+   const topX=topInk.reduce((sum,point)=>sum+point[0],0)/topInk.length;
+   const bottomX=bottomInk.reduce((sum,point)=>sum+point[0],0)/bottomInk.length;
+   best=bottomX-topX;bestSpan=span;
+  }
+  return best??0;
+ };
+ for(const [index,part]of parts.entries()){
+  const base=index*growthRecordWords,rows=part.rows;
+  growthRecords[base]=rows;growthRecords[base+1]=0;
+  if(!rows)continue;
+  const atoms=Array.from(partAtoms.slice(part.first*4,(part.first+part.count)*4));
+  for(let row=0;row<rows;row++){
+   const rowAtoms:number[]=[];
+   for(let at=0;at<atoms.length;at+=4)if(atoms[at+2]===row)rowAtoms.push(...atoms.slice(at,at+4));
+   const points=rowAtoms.flatMap((atom,at)=>{if(at%4!==1)return[];const glyph=font[rowAtoms[at-1]!]!;return glyph.points.map(point=>[rowAtoms[at]!+point[0]!,point[1]!] as const);});
+   const min=points.length?Math.min(...points.map(point=>point[0])):0,max=points.length?Math.max(...points.map(point=>point[0])):0,pivot=Math.round((min+max)/2);
+   const atRow=base+2+row*3;growthRecords[atRow]=pivot>>>0;growthRecords[atRow+1]=signed(continuationShift(rowAtoms,'left',pivot));growthRecords[atRow+2]=signed(continuationShift(rowAtoms,'right',pivot));
+  }
+  if(rows>2){
+   const middleAtoms:number[]=[];
+   for(let at=0;at<atoms.length;at+=4)if(atoms[at+2]===rows-2)middleAtoms.push(...atoms.slice(at,at+4));
+   // A multi-turn/tone row is not a repeatable flank. Its complete authored
+   // construction stays intact until a multi-unit growth program exists.
+   // This certifies existing units; it never elects replacement glyphs.
+   const continuing=(glyph:NativeGlyph):boolean=>{
+    const ys=[...new Set(glyph.points.map(point=>point[1]!))].sort((a,b)=>a-b);
+    if(ys.length<2||ys.at(-1)!-ys[0]!<GRAMMAR_PHASES-3)return false;
+    const xs=ys.map(y=>{const row=glyph.points.filter(point=>point[1]===y);return row.reduce((sum,point)=>sum+point[0]!,0)/row.length;});
+    const delta=xs.at(-1)!-xs[0]!;if(delta===0)return false;
+    return xs.every((x,index)=>index===0||(x-xs[index-1]!)*Math.sign(delta)>=0);
+   };
+   const middleRow=base+2+(rows-2)*3,left=growthRecords[middleRow+1]!|0,right=growthRecords[middleRow+2]!|0;
+   if(middleAtoms.length===8&&left*right<0&&continuing(font[middleAtoms[0]!]!)&&continuing(font[middleAtoms[4]!]!))growthRecords[base+1]=WHOLE_GROWTH_CONTINUATION;
+   // The terminal row is a whole return/cap unit in its OWN coordinates.
+   // Its sides inherit the continuing middle units' translation, but not
+   // their pivot: a one-sided middle can have a pivot far left of the
+   // terminal word and would split that word away from its own branch.
+   const middle=base+2+(rows-2)*3,terminal=base+2+(rows-1)*3;
+   growthRecords[terminal+1]=growthRecords[middle+1]!;
+   growthRecords[terminal+2]=growthRecords[middle+2]!;
+  }
+ }
+ const growthAt=wholeGrowthTableOffset(packedSmallRecords.length);
+ // Compile whole words and their paper once, in the SAME retained-entry order
+ // used by softPartRecord. An authored empty row keeps the complete incumbent
+ // until that programme can represent it; it must not shift later entry IDs.
+ const nativeRows=packNativeRowPrograms(partEntries.map((entry,index)=>{
+  if(entry.native.rows.some(row=>!nativeRoleText(row).trim()))return undefined;
+  return compileNativeRowUnits(font,{
+   role:entry.role,context:{tangentIn:entry.context.tangent_in,tangentOut:entry.context.tangent_out,
+    curvature:entry.context.curvature,inside:entry.context.inside,paper:entry.context.paper},
+   rows:entry.native.rows,rowPenX:entry.native.row_pen_x,
+  },{policy});
+ }));
+ const nativeRowsAt=growthAt+WHOLE_GROWTH_TABLE_HEADER_WORDS+growthRecords.length;
+ const farStrip=new Uint32Array(nativeRowsAt+nativeRows.length);
  farStrip.set(softPartTable,SOFT_PART_TABLE_AT);farStrip.set(softPhaseTable,SOFT_PHASE_TABLE_AT);farStrip.set(softD5Table,SOFT_D5_TABLE_AT);
  for(const [bin,text]of ['、','y','y','人','个','个','个','个'].entries()){
   const stem=bin>=6;
@@ -1066,6 +1149,9 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  farStrip.set(smallIndex,smallSuffixAt+SMALL_CONSTRUCTION_TABLE_INDEX_AT);
  for(const [index,record]of packedSmallRecords.entries())farStrip.set([record.kindAndEnds,record.rows,record.width,record.units,record.firstAtom,record.atomCount,record.firstPaper,record.paperCount],
   smallSuffixAt+SMALL_CONSTRUCTION_TABLE_RECORDS_AT+index*SMALL_CONSTRUCTION_TABLE_RECORD_WORDS);
+  farStrip.set([WHOLE_GROWTH_TABLE_VERSION,growthRecordWords,parts.length,growthRows],growthAt);
+ farStrip.set(growthRecords,growthAt+WHOLE_GROWTH_TABLE_HEADER_WORDS);
+ farStrip.set(nativeRows,nativeRowsAt);
  // The legacy packer's cursor lookup is compiled once at residency, not
  // searched in a displayed frame. NativePage remains the serializer.
  const cursorThreshold=policy==='preformatted'?40:95,side=cursorThreshold*2+1;

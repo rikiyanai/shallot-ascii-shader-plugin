@@ -4,7 +4,7 @@ import library from '../../../assets/grammar/aahub-role-lookup-3493185.v1.json' 
 import roundSupplement from './role-rounds-supplement.json' with {type:'json'};
 import type {CompiledNativeTable,CompiledNativeWord} from './native-table.ts';
 import {nativeSpacePlan} from '../text/native-whitespace.ts';
-import base from '../../../../apps/chapel/dist/glyphs.json' with {type:'json'};
+import base from '../../../assets/grammar/glyphs.json' with {type:'json'};
 import local from './local-glyphs.json' with {type:'json'};
 
 export interface RoleEntry {

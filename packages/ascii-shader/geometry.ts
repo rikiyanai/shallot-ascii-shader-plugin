@@ -32,6 +32,18 @@ export interface MaterialGeometryDraw {
   /** Same original instance rows as the producer draw, not a CPU row census.
    * Parent identity is the authored tuple in the column, never row order. */
   readonly sourceAssembly?:SourceAssemblyColumn;
+  /** Producer-issued ownership certificate.  A source may only enter the
+   * early representation frontier when the engine has identified the owner
+   * domain at the draw boundary; uncertified custom/GPU-indexed draws leave
+   * this absent and retain the complete incumbent. */
+  readonly ownerAuthority?:MaterialGeometryOwnerAuthority;
+  /** Native live membership for this exact view's indirect draw.  The
+   * membership buffer is the engine's packed GPU list and the indirect record
+   * supplies its live count and firstInstance in the same submission.  No
+   * CPU readback or census is implied by this descriptor.  It is kept
+   * under a separate name until the relation consumer joins GPU indirect
+   * membership with the existing CPU-indexed frontier type. */
+  readonly nativeVisibleInstanceFrontier?:MaterialGeometryVisibleInstanceFrontier;
   /** Engine-owned indexed topology. It is mutually exclusive with sourceGeometry. */
   readonly gpuIndexedSource?:GpuIndexedSourceDescriptor;
   readonly indirect:GPUBuffer;
@@ -39,6 +51,18 @@ export interface MaterialGeometryDraw {
   /** Actual resolved eids, meshInstances, material parameters and custom bindings. */
   readonly bindings:Readonly<Record<string,unknown>>;
   readonly material:unknown;
+}
+export type MaterialGeometryOwnerAuthority=
+ | {readonly kind:'standard-entity';readonly mesh:number;readonly identity:'eid';readonly posedBounds?:'engine-deformed-cull-sphere-v1'|'material-source-cull-sphere-v1'}
+ | {readonly kind:'producer-row';readonly namespace:string;readonly records:GPUBufferBinding;readonly stride:24;readonly identity:'row'};
+export interface MaterialGeometryVisibleInstanceFrontier {
+  readonly kind:'native-indirect';
+  readonly members:GPUBuffer;
+  readonly membersStride:16;
+  /** Exact DrawIndexedIndirect record used by this visitor item and slot. */
+  readonly indirect:GPUBuffer;
+  readonly indirectOffset:number;
+  readonly owner:'entity'|'producer-row';
 }
 export interface MaterialGeometryBatch {
   /** Each 16-byte vertex is world.xyz as f32, then the exact u32 source entity.
@@ -67,6 +91,16 @@ function posedContentRevision(draw:MaterialGeometryDraw):number|undefined{
  const source=draw.gpuIndexedSource,certificate=source?.poseContent;
  if(!source||!certificate||certificate.sourceGeneration!==source.generation)return;
  return certificate.revision;
+}
+function validateVisibleInstanceFrontier(draw:MaterialGeometryDraw):void{
+ const frontier=draw.nativeVisibleInstanceFrontier;if(!frontier)return;
+ if(frontier.kind!=='native-indirect'||frontier.membersStride!==16||
+    !Number.isSafeInteger(frontier.indirectOffset)||frontier.indirectOffset<0||
+    frontier.indirect!==draw.indirect||frontier.indirectOffset!==draw.indirectOffset)
+  throw Error('MAIN native instance frontier is not the draw\'s same-submit indirect slice');
+ if(!(frontier.members.usage&GPUBufferUsage.STORAGE))throw Error('MAIN native instance frontier requires a storage membership buffer');
+ if(draw.ownerAuthority?.kind==='producer-row'&&frontier.owner!=='producer-row')throw Error('MAIN producer frontier owner kind mismatch');
+ if(draw.ownerAuthority?.kind==='standard-entity'&&frontier.owner!=='entity')throw Error('MAIN entity frontier owner kind mismatch');
 }
 /** Read-only same-encoder ranges, retained until submission. Separate ranges
  * may share a page; consumers must bind these ranges, never the whole page. */
@@ -293,6 +327,7 @@ export class MaterialGeometryTransport{
     if(!Number.isSafeInteger(draw.vertexCapacity)||draw.vertexCapacity<=0)throw Error('MAIN geometry requires the real vertex stream capacity');
     if(draw.indirectOffset%4||draw.indirectOffset<0||draw.indirectOffset+20>draw.indirect.size)throw Error('MAIN geometry indirect record is out of range');
     if(draw.instanceCapacity!==undefined&&(!Number.isSafeInteger(draw.instanceCapacity)||draw.instanceCapacity<1))throw Error('Invalid declared instance extent');
+    validateVisibleInstanceFrontier(draw);
     const scratch=this.workingSet(draw),{vertices,normals,targets,width,height,capacity}=scratch;
     let pipeline=this.pipelines.get(draw.vertex);
     if(!pipeline){
@@ -340,6 +375,7 @@ export class MaterialGeometryTransport{
       if(!Number.isSafeInteger(draw.vertexCapacity)||draw.vertexCapacity<=0)throw Error('MAIN geometry requires the real vertex stream capacity');
       if(draw.indirectOffset%4||draw.indirectOffset<0||draw.indirectOffset+20>draw.indirect.size)throw Error('MAIN geometry indirect record is out of range');
       if(draw.instanceCapacity!==undefined&&(!Number.isSafeInteger(draw.instanceCapacity)||draw.instanceCapacity<1))throw Error('Invalid declared instance extent');
+      validateVisibleInstanceFrontier(draw);
       const required=draw.instanceCapacity===undefined?Math.max(this.capacity,draw.vertexCapacity):Math.max(draw.vertexCapacity,Math.min(this.capacity,65536,draw.vertexCapacity*draw.instanceCapacity));
       const capacity=Math.min(Math.max(this.capacity,draw.vertexCapacity),2**Math.ceil(Math.log2(required))),perSlice=Math.floor(capacity/draw.vertexCapacity);
       if(!perSlice)throw Error('MAIN source vertex extent needs vertex-range chunks');

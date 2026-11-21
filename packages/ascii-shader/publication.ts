@@ -25,6 +25,7 @@ struct V { @builtin(position) position:vec4f,@location(0) uv:vec2f,@location(1) 
  let xy=vec2f(f32(vertex&1u)*4.0-1.0,f32(vertex>>1u)*4.0-1.0);return vec4f(xy,0,1);
 }
 @fragment fn pageFragment(@builtin(position) p:vec4f)->@location(0) vec4f{
+ if(params.extent.z<0.5&&params.extent.w<0.5){return vec4f(1);}
  let color=textureLoad(appearance,vec2i(p.xy),0);
  if(params.extent.z>0.5){return color;}
  let alpha=select(1.0,color.a,params.extent.w>0.5);
@@ -40,23 +41,6 @@ struct V { @builtin(position) position:vec4f,@location(0) uv:vec2f,@location(1) 
  * the resident atlas-code table so the compiled grammar and publication use
  * exactly the same scalar font order.
  */
-/** PAPER WASH (sea-100; 10-12 runtimes/y8-20261012 render/ff/background-wash.ts
- * BACKGROUND_WASH dayLevel .94 / tint .10 and paint.ts washSample): the page's
- * paper under a surface takes that surface's own material hue, faintly. The
- * hue is the shown field's lit material colour under the page pixel; an
- * achromatic surface or no surface keeps MAIN's white paper (chroma ramp
- * chromaFrom..chromaTo is this stage's own bound, not a 10-12 value). Display
- * only; it chooses no glyph and changes no exported text. */
-export const PAPER_WASH={dayLevel:.94,tint:.10,chromaFrom:.15,chromaTo:.45} as const;
-const PAPER_WASH_WGSL=/* wgsl */`
-fn paperLuma(v:vec3f)->f32{return dot(v,vec3f(.2126,.7152,.0722));}
-fn paperAtLuma(v:vec3f,value:f32)->vec3f{return clamp(v*(value/max(paperLuma(v),1e-4)),vec3f(0.0),vec3f(1.0));}
-fn paperWash(rgb:vec3f)->vec3f{
- let q=max(rgb,vec3f(0.0));let top=max(q.x,max(q.y,q.z));if(top<=1e-3){return vec3f(1.0);}
- let hue=q/top;let w=smoothstep(${PAPER_WASH.chromaFrom},${PAPER_WASH.chromaTo},1.0-min(hue.x,min(hue.y,hue.z)));
- let L=${PAPER_WASH.dayLevel};let wash=paperAtLuma(mix(vec3f(L),paperAtLuma(hue+vec3f(1e-3),L),${PAPER_WASH.tint}),L);
- return mix(vec3f(1.0),wash,w);
-}`;
 const GPU_TAPE_SHADER=/* wgsl */`
 struct Params {extent:vec4f,pageShift:vec4f}
 @group(0) @binding(0) var<uniform> params:Params;
@@ -79,10 +63,8 @@ struct V { @builtin(position) position:vec4f,@location(0) uv:vec2f,@location(1) 
 @vertex fn pageVertex(@builtin(vertex_index) vertex:u32)->@builtin(position) vec4f{
  let xy=vec2f(f32(vertex&1u)*4.0-1.0,f32(vertex>>1u)*4.0-1.0);return vec4f(xy,0,1);
 }
-${PAPER_WASH_WGSL}
 @fragment fn pageFragment(@builtin(position) p:vec4f)->@location(0) vec4f{
- // PAPER WASH: params.pageShift.z set, appearance is the shown field's radiance.
- if(params.pageShift.z>0.5){let d=vec2f(textureDimensions(appearance));let q=vec2i(clamp(floor(p.xy*d/params.extent.xy),vec2f(0.0),d-1.0));return vec4f(paperWash(textureLoad(appearance,q,0).rgb),1.0);}
+ if(params.extent.z<0.5&&params.extent.w<0.5){return vec4f(1);}
  let color=textureLoad(appearance,vec2i(p.xy),0);if(params.extent.z>0.5){return color;}
  let alpha=select(1.0,color.a,params.extent.w>0.5);return vec4f(vec3f(alpha),alpha);
 }
@@ -166,7 +148,8 @@ export class NativePublication<T extends TextFrame=TextFrame> {
     this.count=instances.length/4;this.current=frame;
   }
   get frame():T|undefined{return this.current;}
-  encode(encoder:GPUCommandEncoder,appearance:GPUTextureView,target:GPUTextureView,format:GPUTextureFormat,width:number,height:number,ascii:boolean,stacked:boolean,overlay=false):void{
+  encode(encoder:GPUCommandEncoder,appearance:GPUTextureView|undefined,target:GPUTextureView,format:GPUTextureFormat,width:number,height:number,ascii:boolean,stacked:boolean,overlay=false):void{
+    appearance??=this.atlas.createView(); // Unread binding in opaque ASCII mode.
     let pipelines=this.pipelines.get(format);
     if(!pipelines){
       const layout=this.device.createPipelineLayout({bindGroupLayouts:[this.layout]});
@@ -191,7 +174,8 @@ export class NativePublication<T extends TextFrame=TextFrame> {
    * until the host submission fence retires them; `submitted()` only retires
    * publication-owned transient parameters and never the tape itself.
    */
-  publishGpu(encoder:GPUCommandEncoder,tapes:GpuNativeTape|readonly GpuNativeTape[],appearance:GPUTextureView,target:GPUTextureView,format:GPUTextureFormat,width:number,height:number,ascii:boolean,stacked:boolean,overlay=false,wash=false):void{
+  publishGpu(encoder:GPUCommandEncoder,tapes:GpuNativeTape|readonly GpuNativeTape[],appearance:GPUTextureView|undefined,target:GPUTextureView,format:GPUTextureFormat,width:number,height:number,ascii:boolean,stacked:boolean,overlay=false):void{
+    appearance??=this.atlas.createView(); // Unread binding in opaque ASCII mode.
     const records:readonly GpuNativeTape[]=Array.isArray(tapes)?tapes:[tapes];
     for(const tape of records){
       validateGpuNativeTape(tape);
@@ -211,7 +195,7 @@ export class NativePublication<T extends TextFrame=TextFrame> {
     // Canonical seal pens are already absolute native-page coordinates. A
     // legacy TextFrame page shift would move the GPU tape and break same-tape
     // export parity, so sealed presentation always uses zero shift.
-    new Float32Array(params.getMappedRange()).set([width,height,Number(!ascii||overlay),Number(stacked),0,0,Number(wash&&ascii&&!overlay),0]);params.unmap();this.parameters.push(params);
+    new Float32Array(params.getMappedRange()).set([width,height,Number(!ascii||overlay),Number(stacked),0,0,0,0]);params.unmap();this.parameters.push(params);
     const pageTape=records[0]?.words??this.glyphs;
     const pageGroup=this.device.createBindGroup({layout:this.gpuTapeLayout,entries:[
       {binding:0,resource:{buffer:params}},{binding:1,resource:{buffer:pageTape}},{binding:2,resource:{buffer:this.gpuFontCodes}},
@@ -239,8 +223,8 @@ export class NativePublication<T extends TextFrame=TextFrame> {
   }
   /** Backwards-compatible name for callers that treat publication as an
    * encoder operation. Both names use the same sealed-tape path. */
-  encodeGpu(encoder:GPUCommandEncoder,tapes:GpuNativeTape|readonly GpuNativeTape[],appearance:GPUTextureView,target:GPUTextureView,format:GPUTextureFormat,width:number,height:number,ascii:boolean,stacked:boolean,overlay=false,wash=false):void{
-    this.publishGpu(encoder,tapes,appearance,target,format,width,height,ascii,stacked,overlay,wash);
+  encodeGpu(encoder:GPUCommandEncoder,tapes:GpuNativeTape|readonly GpuNativeTape[],appearance:GPUTextureView|undefined,target:GPUTextureView,format:GPUTextureFormat,width:number,height:number,ascii:boolean,stacked:boolean,overlay=false):void{
+    this.publishGpu(encoder,tapes,appearance,target,format,width,height,ascii,stacked,overlay);
   }
   /** Export the same sealed tape that was displayed. This intentionally
    * schedules a readback and is never part of the display frame. */

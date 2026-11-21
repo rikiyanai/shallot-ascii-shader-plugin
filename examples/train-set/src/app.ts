@@ -51,8 +51,9 @@ function syncTiles(state:State):void {
         if(track){
             const {colliders,...geometry}=trackGeometry(railway,track);
             if(track.kind==='turntable'){
-                const {construction:pendingConstruction,...native}=geometry;
-                bodies.mesh=world.resource(Meshes).add({name:'Turntable',...native});
+                // Authored PATH/PAIR (with each ribbon's owned faces) is forwarded;
+                // MAIN replaces only those faces, every other face stays native.
+                bodies.mesh=world.resource(Meshes).add({name:'Turntable',...geometry});
             }
             else {bodies.drawing=geometry;railsChanged=true;}
             bodies.rail=entity(state,bodies.mesh,[x*TILE,height,z*TILE],[1,1,1],1);
@@ -80,10 +81,10 @@ function syncTiles(state:State):void {
             pieces.push({geometry:tile.drawing,position:[x*TILE,railway.height(x,z),z*TILE]});
         }
         if(pieces.length){
-            // PATH/PAIR authoring is retained on the geometry. Do not replace
-            // native mesh fallback until the generic consumer draws these
-            // declarations, including all non-path station/switch geometry.
-            const {construction:pendingConstruction,...network}=trackNetworkGeometry(pieces);
+            // PATH/PAIR authoring is forwarded with each ribbon's owned face
+
+            // those faces; station/switch/platform geometry stays native.
+            const network=trackNetworkGeometry(pieces);
             const mesh=world.resource(Meshes).add({name:'Rail network',...network}),drawing=world.create();
             world.add(drawing,Transform);world.add(drawing,MeshInstance,{mesh});world.add(drawing,MeshMaterial,state.materials[1]!);
             state.railDrawing={entity:drawing,mesh};

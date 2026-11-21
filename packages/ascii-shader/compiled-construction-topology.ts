@@ -1,6 +1,9 @@
 import type {CompiledConstructionGraph,SourcePlaneRegion} from './composition.ts';
-import {PART_CAP,PART_CHAIN_SHIFT,PART_FORK,PART_LIMB,PART_ROOT,partPoint,type MeshPartGraph,type PartSection} from './mesh-part-graph.ts';
+import {PART_CAP,PART_CHAIN_SHIFT,PART_FORK,PART_LIMB,PART_ROOT,partPoint,type MeshPartGraph,type PartSample,type PartSection} from './mesh-part-graph.ts';
 import type {MeshSourceComplex} from './source-complex.ts';
+import {sourceBandIncidence} from './source-band-incidence.ts';
+import {sourceContactRequirements} from './source-small-parent.ts';
+import type {SourceConstruction,SourcePathSite} from './source-construction.ts';
 
 /**
  * GPU-resident representation of the source construction graph.
@@ -95,6 +98,38 @@ export const TOPOLOGY_LIMB_MAGIC_WORD=8,TOPOLOGY_LIMB_MAGIC=0x11b0c4a1;
 
 
 export const TOPOLOGY_PART_MAGIC_WORD=11,TOPOLOGY_PART_MAGIC=0x50415254,TOPOLOGY_PART_PACKET_MAGIC=0x50505232,TOPOLOGY_PART_PROGRAM_WORDS=12;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+export const TOPOLOGY_PART_CANONICAL_MAGIC=0x53434150,TOPOLOGY_PART_CANONICAL_VERSION=1;
+export const TOPOLOGY_PART_CANONICAL_HEADER_WORDS=10,TOPOLOGY_PART_CANONICAL_RECORD_WORDS=12,TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS=4;
+export const TOPOLOGY_PART_CANONICAL_FLAG_CLOSED=1,TOPOLOGY_PART_CANONICAL_FLAG_CONTEXT=2,TOPOLOGY_PART_CANONICAL_FLAG_COMPLETE=4;
+
+
+
+
+
+
+export const TOPOLOGY_PART_JUNCTION_MAGIC=0x534a554e,TOPOLOGY_PART_JUNCTION_VERSION=2;
+export const TOPOLOGY_PART_JUNCTION_HEADER_WORDS=16,TOPOLOGY_PART_JUNCTION_RECORD_WORDS=9,TOPOLOGY_PART_JUNCTION_ARM_WORDS=8,TOPOLOGY_PART_JUNCTION_EDGE_WORDS=8,TOPOLOGY_PART_JUNCTION_SAMPLE_WORDS=8;
+// Record words: [feature,sourceId,flags,armAt,armCount,edgeAt,edgeCount,contactAt,contactCount].
+// Arm words: [sectionId,flags,portAt,portCount,edgeRefAt,edgeRefCount,sampleAt,sampleCount].
+// Sample words: [sectionId,sampleIndex,sourceEdge,halfedge,face,a,b,f32(t)].
+export const TOPOLOGY_PART_JUNCTION_FLAG_FORK=1,TOPOLOGY_PART_JUNCTION_FLAG_SPLIT=2,TOPOLOGY_PART_JUNCTION_FLAG_MISSING_ARM=4,TOPOLOGY_PART_JUNCTION_FLAG_COMPLETE=8;
+export const TOPOLOGY_PART_JUNCTION_ARM_HAS_PORT=1,TOPOLOGY_PART_JUNCTION_ARM_HAS_EDGE=2,TOPOLOGY_PART_JUNCTION_ARM_COMPLETE=4,TOPOLOGY_PART_JUNCTION_ARM_HAS_SAMPLE=8;
+export const TOPOLOGY_PART_JUNCTION_NONE=0xffffffff;
 
 export interface ResidentTopologySource {
  readonly domain:number;
@@ -422,6 +457,34 @@ export interface SourcePartProgramRecord {
  readonly kind:1|2;
 }
 
+export interface SourcePartCanonicalRecord {
+ readonly feature:number;readonly sourceId:number;readonly kind:1|2;
+ readonly closed:boolean;readonly context:boolean;readonly complete:boolean;/** Sample ordinal in the immutable source list; serialized packet records use word offsets. */ readonly sampleIndex:number;readonly sampleCount:number;
+ readonly previous:number;readonly next:number;readonly penultimate:number;readonly last:number;
+ readonly startPort:number;readonly endPort:number;
+}
+
+export interface SourcePartJunctionEdge {
+ readonly sourceEdge:number;readonly halfedge:number;readonly face:number;
+ readonly a:number;readonly b:number;readonly labelA:number;readonly labelB:number;
+ /** First source contact candidate on this halfedge, or NONE. The record's
+  * contacts list is the complete source-contact identity set for the fork. */
+ readonly contact:number;
+}
+export interface SourcePartJunctionSample {
+ readonly sectionId:number;readonly sampleIndex:number;readonly sourceEdge:number;
+ readonly halfedge:number;readonly face:number;readonly a:number;readonly b:number;readonly t:number;
+}
+export interface SourcePartJunctionArm {
+ readonly sectionId:number;readonly flags:number;
+ readonly ports:readonly number[];readonly edges:readonly number[];readonly samples:readonly SourcePartJunctionSample[];
+}
+export interface SourcePartJunctionRecord {
+ readonly feature:number;readonly sourceId:number;readonly flags:number;
+ readonly arms:readonly SourcePartJunctionArm[];readonly edges:readonly SourcePartJunctionEdge[];
+ readonly contacts:readonly number[];
+}
+
 /**
  * A source-owned context token for the bounded whole-part consumer.  The
  * upper three bits name the retained-entry context family.  Tangent ports
@@ -664,6 +727,39 @@ export function sourcePartPassageCandidates(axis:readonly number[],role:0|1|2|3,
  }
  return result.sort((a,b)=>b.span-a.span||a.winding-b.winding||a.rank-b.rank).map(item=>item.passage);
 }
+/** One admitted open source path. Unlike a closed-contour passage this never
+ * wraps from the last sample to the first: the endpoints are the actual
+ * source endpoints and the middle segment supplies the page-side context. The
+ * caller must have reconstructed the path from source incidence; this helper
+ * never sorts points or invents an edge. */
+export function sourcePartOpenPassage(axis:readonly number[],role:0|1|2|3,geometry?:SourcePartGeometryContext):SourcePartPassage|undefined{
+ if(!geometry||geometry.points.length<3)return;
+ const chart=sectionChart(axis,geometry.points,geometry.center);if(!chart)return;
+ const openCurvature=(points:readonly (readonly [number,number,number])[]):boolean=>{
+  let sign=0,turns=0;
+  for(let index=1;index+1<points.length;index++){
+   const before=vectorBetween(points[index-1]!,points[index]!),after=vectorBetween(points[index]!,points[index+1]!);
+   const value=dot3(cross3(before,after),chart.axis),scale=Math.max(1,Math.hypot(...before),Math.hypot(...after));
+   if(!Number.isFinite(value)||Math.hypot(...before)<=1e-12||Math.hypot(...after)<=1e-12)return false;
+   if(Math.abs(value)<=1e-7*scale)continue;
+   const next=value<0?-1:1;if(sign!==0&&sign!==next)return false;sign=next;turns++;
+  }
+  return turns>0;
+ };
+ for(const points of [geometry.points,[...geometry.points].reverse()] as const){
+  if(!openCurvature(points))continue;
+  const lengths=points.slice(0,-1).map((point,index)=>Math.hypot(...vectorBetween(point,points[index+1]!))),total=lengths.reduce((sum,value)=>sum+value,0);
+  if(!(total>0)||!lengths.every(Number.isFinite))continue;
+  let middle=0,walked=0;for(let index=0;index<lengths.length;index++){if(walked+lengths[index]!>=total/2){middle=index;break;}walked+=lengths[index]!;}
+  const inside=sourceSidePage(chart,points[middle]!,points[middle+1]!,geometry.center);if(inside==='enclosed')continue;
+  const contextClass=passageContextClass(role,inside);if(contextClass===undefined)continue;
+  const incoming=sourceAxisDirection(chart,vectorBetween(points[1]!,points[0]!)),outgoing=sourceAxisDirection(chart,vectorBetween(points[points.length-2]!,points[points.length-1]!));
+  const token=(contextClass<<SOURCE_PART_CONTEXT_CLASS_SHIFT)&SOURCE_PART_CONTEXT_MASK;
+  const from=points===geometry.points?0:geometry.points.length-1,to=points===geometry.points?geometry.points.length-1:0;
+  return {context:{incoming,outgoing,contextClass,curvature:'convex',inside,token},points,from,to};
+ }
+ return;
+}
 /** Source-space context only. A caller must provide actual contour points;
  * axis/role alone is intentionally insufficient and returns no eligibility. */
 export function sourcePartContext(axis:readonly number[],role:0|1|2|3,closed:boolean,geometry?:SourcePartGeometryContext):SourcePartContext|undefined{
@@ -677,11 +773,222 @@ const partRole=(labels:number,closed:boolean):0|1|2|3=>{
  if((labels&PART_FORK)!==0)return 1;
  return closed?1:2;
 };
+/** Recover an open section's authored path from its source segment incidence.
+ * `PartSection.samples` is not an ordering contract for open sections: the
+ * mesh compiler keeps the actual adjacency in `segments`. Reject a branch,
+ * cycle, duplicate edge, disconnected set or missing sample rather than
+ * turning it into a fake contour. */
+const orderedOpenSection=(section:PartSection):readonly number[]|undefined=>{
+ const count=section.samples.length;if(count<3||section.segments.length!==count-1)return;
+ const links:Array<number[]>=Array.from({length:count},()=>[]),edges=new Set<string>();
+ for(const segment of section.segments){const a=segment[0],b=segment[1];if(!Number.isInteger(a)||!Number.isInteger(b)||a<0||b<0||a>=count||b>=count||a===b)return;const key=a<b?`${a}/${b}`:`${b}/${a}`;if(edges.has(key))return;edges.add(key);links[a]!.push(b);links[b]!.push(a);}
+ const ends:number[]=[];for(const [index,neighbors]of links.entries()){if(neighbors.length===1)ends.push(index);else if(neighbors.length!==2)return;neighbors.sort((a,b)=>a-b);}
+ if(ends.length!==2)return;
+ const order:number[]=[];let previous=-1,current=Math.min(...ends);
+ while(current>=0){order.push(current);const next=links[current]!.find(value=>value!==previous);if(next===undefined)break;previous=current;current=next;}
+ return order.length===count&&new Set(order).size===count?order:undefined;
+};
 const sectionContext=(graph:MeshPartGraph,section:PartSection,role:0|1|2|3,positions:Float32Array|undefined):SourcePartContext|undefined=>{
  if(!positions||section.samples.length<3)return undefined;
- const points=section.samples.map(sample=>partPoint({positions},sample));
- return sourcePartContextCandidates(graph.axis,role,section.closed,{points,center:section.center})[0]?.context;
+ if(section.closed){const points=section.samples.map(sample=>partPoint({positions},sample));return sourcePartContextCandidates(graph.axis,role,true,{points,center:section.center})[0]?.context;}
+ const order=orderedOpenSection(section);if(!order)return undefined;
+ const points=order.map(index=>partPoint({positions},section.samples[index]!));return sourcePartOpenPassage(graph.axis,role,{points,center:section.center})?.context;
 };
+interface SourceCanonicalPath {readonly points:readonly (readonly [number,number,number])[];readonly samples:readonly PartSample[];readonly context:SourcePartContext;readonly closed:boolean;readonly ports?:readonly [number,number];}
+/** Build one genuine fork-band passage from the band-face source graph. Only
+ * edges whose two endpoints carry different source-section incidences are
+ * eligible. A complete programme requires exactly one connected degree-2
+ * chain with two endpoints; branches, cycles, multiple paths and ambiguous
+ * incidence remain the incumbent. Every emitted sample names the actual source
+ * edge traversed by that chain, never a hull chord or a degenerate placeholder. */
+const sourceBandLinearCanonicalPath=(graph:MeshPartGraph,bandId:number,complex:MeshSourceComplex,indices:ArrayLike<number>,positions:Float32Array,role:0|1|2|3):SourceCanonicalPath|undefined=>{
+ const band=graph.bands.find(value=>value.id===bandId);if(!band||!band.lower.length||!band.upper.length||role!==1||((band.labels??0)&PART_FORK)===0)return;
+ const incident=sourceBandIncidence(graph,band,indices,positions),labels=new Set(incident.values());if(labels.size<2)return;
+ type BandEdge={readonly id:number;readonly a:number;readonly b:number};
+ const bandEdges=new Map<string,BandEdge>();
+ for(const face of band.faces)for(let k=0;k<3;k++){
+  const halfedge=complex.halfedges[face*3+k];if(!halfedge)continue;
+  const a=(graph.vertexRepresentatives[halfedge.from]??halfedge.from)>>>0,b=(graph.vertexRepresentatives[halfedge.to]??halfedge.to)>>>0,la=incident.get(a),lb=incident.get(b);if(la===undefined||lb===undefined||la===lb)continue;
+  const sourceEdge=complex.edges[halfedge.edge],id=sourceEdge?.welded?.[0]??sourceEdge?.id??halfedge.id,key=`${Math.min(a,b)}/${Math.max(a,b)}`;
+  if(!bandEdges.has(key))bandEdges.set(key,{id,a,b});
+ }
+ if(bandEdges.size<2)return;
+ const adjacency=new Map<number,{readonly vertex:number;readonly edge:BandEdge}[]>();
+ for(const edge of bandEdges.values())for(const [from,to]of [[edge.a,edge.b],[edge.b,edge.a]] as const){const list=adjacency.get(from)??[];list.push({vertex:to,edge});adjacency.set(from,list);}
+ if([...adjacency.values()].some(list=>list.length>2))return;
+ const endpoints=[...adjacency].filter(([,list])=>list.length===1).map(([vertex])=>vertex);if(endpoints.length!==2)return;
+ const orderedVertices:number[]=[Math.min(...endpoints)],orderedEdges:BandEdge[]=[];let previous=-1,current=orderedVertices[0]!;
+ while(true){const next=(adjacency.get(current)??[]).find(item=>item.vertex!==previous);if(!next)break;orderedEdges.push(next.edge);previous=current;current=next.vertex;orderedVertices.push(current);}
+ if(orderedVertices.length!==adjacency.size||orderedEdges.length!==bandEdges.size||orderedVertices[orderedVertices.length-1]!==Math.max(...endpoints)||new Set(orderedVertices).size!==orderedVertices.length)return;
+ const startLabel=incident.get(orderedVertices[0]!),endLabel=incident.get(orderedVertices[orderedVertices.length-1]!);if(startLabel===undefined||endLabel===undefined||startLabel===endLabel)return;
+ const samples=orderedVertices.map((vertex,index)=>index+1<orderedVertices.length?{a:vertex,b:orderedVertices[index+1]!,t:0}:{a:orderedVertices[index-1]!,b:vertex,t:1} as PartSample);
+ const points=samples.map(sample=>partPoint({positions},sample));if(points.some(point=>point.some(value=>!Number.isFinite(value))))return;
+ const center=points.reduce<[number,number,number]>((sum,point)=>sum.map((value,index)=>value+point[index]!/points.length) as [number,number,number],[0,0,0]);
+ const passage=sourcePartOpenPassage(graph.axis,role,{points,center});if(!passage)return;
+ return {points:passage.points,samples:passage.points.map(point=>{const index=points.indexOf(point);return samples[index]!;}),context:passage.context,closed:false};
+};
+
+/** A genuine branched fork has no single degree-2 canonical contour, but its
+ * source junction still owns exact band edges between the joint and each arm.
+ * This helper publishes one stable two-arm turn passage from those edges.  It
+ * is deliberately narrower than the old hull route: every sample is an actual
+ * band edge, the joint is required to meet every incident section, and the
+ * remaining arms stay in the junction side table for their own consumer.
+ *
+ * The first lower arm and last upper arm are source graph order, not a camera
+ * or visibility choice.  If either arm has no direct source edge at the joint,
+ * or the resulting three-point turn has no native context, the fork remains
+ * incumbent/unsupported. */
+const sourceBandForkCanonicalPath=(graph:MeshPartGraph,bandId:number,complex:MeshSourceComplex,indices:ArrayLike<number>,positions:Float32Array,role:0|1|2|3):SourceCanonicalPath|undefined=>{
+ const band=graph.bands.find(value=>value.id===bandId);if(!band||role!==1||((band.labels??0)&PART_FORK)===0)return;
+ const arms=[...new Set([...band.lower,...band.upper])];if(arms.length<3)return;
+ const incidence=sourceBandIncidence(graph,band,indices,positions),labels=new Set(incidence.values());if(labels.size!==arms.length)return;
+ type Edge={readonly a:number;readonly b:number;readonly sourceEdge:number};
+ const edges=new Map<string,Edge>();
+ for(const face of band.faces)for(let k=0;k<3;k++){
+  const halfedge=complex.halfedges[face*3+k];if(!halfedge)continue;
+  const a=(graph.vertexRepresentatives[halfedge.from]??halfedge.from)>>>0,b=(graph.vertexRepresentatives[halfedge.to]??halfedge.to)>>>0;if(a===b)continue;
+  const low=Math.min(a,b),high=Math.max(a,b),key=`${low}/${high}`;if(!edges.has(key)){
+   const sourceEdge=complex.edges[halfedge.edge]?.welded?.[0]??complex.edges[halfedge.edge]?.id??halfedge.id;
+   edges.set(key,{a:low,b:high,sourceEdge});
+  }
+ }
+ const adjacency=new Map<number,Edge[]>();
+ for(const edge of edges.values())for(const vertex of [edge.a,edge.b]){const list=adjacency.get(vertex)??[];list.push(edge);adjacency.set(vertex,list);}
+ // A joint is the unique source vertex adjacent to every incident section.
+ // A multi-joint/non-manifold fork is not guessed into one passage.
+ const joints=[...adjacency.keys()].filter(vertex=>{
+  const adjacent=new Set<number>();
+  for(const edge of adjacency.get(vertex)??[]){const other=edge.a===vertex?edge.b:edge.a;const label=incidence.get(other);if(label!==undefined)adjacent.add(label);}
+  return arms.every(section=>adjacent.has(section));
+ }).sort((a,b)=>a-b);
+ if(joints.length!==1)return;
+ const joint=joints[0]!,branch=arms[0]!,trunk=arms.at(-1)!;
+ const direct=(section:number):Edge|undefined=>(adjacency.get(joint)??[]).filter(edge=>{
+  const other=edge.a===joint?edge.b:edge.a;return incidence.get(other)===section;
+ }).sort((a,b)=>a.sourceEdge-b.sourceEdge||(a.a-b.a)||(a.b-b.b))[0];
+ const branchEdge=direct(branch),trunkEdge=direct(trunk);if(!branchEdge||!trunkEdge)return;
+ const branchVertex=branchEdge.a===joint?branchEdge.b:branchEdge.a,trunkVertex=trunkEdge.a===joint?trunkEdge.b:trunkEdge.a;
+ if(branchVertex===trunkVertex||branchVertex===joint||trunkVertex===joint)return;
+ const vertices=[branchVertex,joint,trunkVertex],samples:PartSample[]=vertices.map((vertex,index)=>index<vertices.length-1?{a:vertex,b:vertices[index+1]!,t:0}:{a:vertices[index-1]!,b:vertex,t:1});
+ const points=samples.map(sample=>partPoint({positions},sample));if(points.some(point=>point.some(value=>!Number.isFinite(value))))return;
+ const center=points.reduce<[number,number,number]>((sum,point)=>[sum[0]+point[0]!/points.length,sum[1]+point[1]!/points.length,sum[2]+point[2]!/points.length],[0,0,0]);
+ const passage=sourcePartOpenPassage(graph.axis,role,{points,center});if(!passage)return;
+ const orderedSamples=passage.points.map(point=>{const index=points.indexOf(point);return samples[index]!;}),orderedVertices=passage.points.map(point=>vertices[points.indexOf(point)]!);
+ if(orderedSamples.some(sample=>sample===undefined)||orderedVertices.some(vertex=>vertex===undefined))return;
+ return {points:passage.points,samples:orderedSamples,context:passage.context,closed:false,ports:[orderedVertices[0]!,orderedVertices.at(-1)!]};
+};
+
+/** Prefer an exact ordered fork path over the old degree-2 section path.  The
+ * degree-2 path remains the incumbent for simple fork bands; the new branch
+ * path only runs after that route has no answer and never uses a hull/chord. */
+const sourceBandCanonicalPath=(graph:MeshPartGraph,bandId:number,complex:MeshSourceComplex,indices:ArrayLike<number>,positions:Float32Array,role:0|1|2|3):SourceCanonicalPath|undefined=>
+ sourceBandLinearCanonicalPath(graph,bandId,complex,indices,positions,role)??sourceBandForkCanonicalPath(graph,bandId,complex,indices,positions,role);
+
+interface SourceJunctionBuild {
+ readonly feature:number;readonly sourceId:number;readonly flags:number;
+ readonly arms:readonly {readonly sectionId:number;readonly flags:number;readonly ports:readonly number[];readonly edges:readonly number[];readonly samples:readonly SourcePartJunctionSample[]}[];
+ readonly edges:readonly SourcePartJunctionEdge[];readonly contacts:readonly number[];
+}
+/** Compile every PART_FORK as an explicit source incidence graph.  Unlike the
+ * legacy canonical producer this accepts neither a hull nor a degree-2-only
+ * path: all original arms, vertices, halfedges and faces survive.  An
+ * incomplete arm is recorded and marked unsupported; it is never admitted by
+ * the incumbent native role consumer. */
+const compileSourceForkJunctionSection=(graph:MeshPartGraph,complex:MeshSourceComplex,positions:Float32Array,programs:readonly SourcePartProgramRecord[],base:number):Uint32Array|undefined=>{
+ const forkBands=graph.bands.filter(band=>(band.labels??0)&PART_FORK);if(!forkBands.length)return;
+ const sourceIndices=Uint32Array.from(complex.halfedges,halfedge=>halfedge.from>>>0),rep=(vertex:number)=>(graph.vertexRepresentatives[vertex]??vertex)>>>0;
+ const along=(vertex:number)=>positions[vertex*3]!*graph.axis[0]!+positions[vertex*3+1]!*graph.axis[1]!+positions[vertex*3+2]!*graph.axis[2]!;
+ const contactsByHalfedge=new Map<number,number[]>();
+ for(const [contact,entry]of complex.contacts.entries())for(const member of entry.members){const list=contactsByHalfedge.get(member.edge);if(list)list.push(contact);else contactsByHalfedge.set(member.edge,[contact]);}
+ const builds:SourceJunctionBuild[]=[];let allArms=0,allPorts=0,allEdges=0,allContacts=0;
+ for(const band of forkBands){
+  const incidence=sourceBandIncidence(graph,band,sourceIndices,positions),labels=new Set(incidence.values());
+  const edges:SourcePartJunctionEdge[]=[];const edgeIndex=new Map<number,number>();const contacts=new Set<number>();
+  for(const face of band.faces)for(let k=0;k<3;k++){
+   const halfedge=complex.halfedges[face*3+k];if(!halfedge)continue;
+   // Preserve every original halfedge/face incidence. Two opposite
+   // halfedges may name one source edge, but collapsing them by compact edge
+   // id would erase the branch face on the other side.
+   if(edgeIndex.has(halfedge.id))continue;
+   const a=rep(halfedge.from),b=rep(halfedge.to);if(a===b)continue;
+   const sourceEdge=complex.edges[halfedge.edge]?.id??halfedge.id,memberContacts=contactsByHalfedge.get(halfedge.id)??[];
+   for(const contact of memberContacts)contacts.add(contact);
+   edgeIndex.set(halfedge.id,edges.length);edges.push({sourceEdge:sourceEdge>>>0,halfedge:halfedge.id>>>0,face:halfedge.face>>>0,a,b,labelA:incidence.get(a)??TOPOLOGY_PART_JUNCTION_NONE,labelB:incidence.get(b)??TOPOLOGY_PART_JUNCTION_NONE,contact:memberContacts[0]??TOPOLOGY_PART_JUNCTION_NONE});
+  }
+  const sections=[...new Set([...band.lower,...band.upper])];const samplesFor=(sectionId:number):SourcePartJunctionSample[]=>{
+   const section=graph.sections.find(value=>value.id===sectionId);if(!section)return [];
+   const result:SourcePartJunctionSample[]=[];const seen=new Set<string>();
+   for(const [sampleIndex,sample]of section.samples.entries()){
+    const a=rep(sample.a),b=rep(sample.b);if(a===b||!Number.isFinite(sample.t)||sample.t<0||sample.t>1)continue;
+    for(const face of band.faces)for(let k=0;k<3;k++){
+     const halfedge=complex.halfedges[face*3+k];if(!halfedge)continue;
+     const ha=rep(halfedge.from),hb=rep(halfedge.to);if(!((a===ha&&b===hb)||(a===hb&&b===ha)))continue;
+     const key=`${sampleIndex}:${halfedge.id}`;if(seen.has(key))continue;seen.add(key);
+     result.push({sectionId,sampleIndex,sourceEdge:(complex.edges[halfedge.edge]?.id??halfedge.id)>>>0,halfedge:halfedge.id>>>0,face:halfedge.face>>>0,a:sample.a>>>0,b:sample.b>>>0,t:sample.t});
+    }
+   }
+   return result;
+  };
+  const arms=sections.map(sectionId=>{
+   const ports=[...incidence].filter(([,section])=>section===sectionId).map(([vertex])=>vertex).sort((a,b)=>along(a)-along(b)||a-b);
+   const ownedEdges=edges.map((edge,index)=>edge.labelA===sectionId||edge.labelB===sectionId?index:-1).filter(index=>index>=0);
+   const samples=samplesFor(sectionId),flags=(ports.length?TOPOLOGY_PART_JUNCTION_ARM_HAS_PORT:0)|(ownedEdges.length?TOPOLOGY_PART_JUNCTION_ARM_HAS_EDGE:0)|((ports.length&&ownedEdges.length&&samples.length)?TOPOLOGY_PART_JUNCTION_ARM_COMPLETE:0)|(samples.length?TOPOLOGY_PART_JUNCTION_ARM_HAS_SAMPLE:0);
+   return {sectionId,flags,ports,edges:ownedEdges,samples};
+  });
+  const adjacency=new Map<number,Set<number>>();for(const edge of edges){const a=adjacency.get(edge.a)??new Set<number>(),b=adjacency.get(edge.b)??new Set<number>();a.add(edge.b);b.add(edge.a);adjacency.set(edge.a,a);adjacency.set(edge.b,b);}
+  let components=0;const seen=new Set<number>();for(const vertex of adjacency.keys()){if(seen.has(vertex))continue;components++;const pending=[vertex];seen.add(vertex);while(pending.length){for(const next of adjacency.get(pending.pop()!)??[]){if(!seen.has(next)){seen.add(next);pending.push(next);}}}}
+  const split=components>1||[...adjacency.values()].some(list=>list.size>2),missing=arms.some(arm=>(arm.flags&TOPOLOGY_PART_JUNCTION_ARM_COMPLETE)===0),complete=!missing&&labels.size>=2&&edges.length>0;
+  const feature=programs.find(program=>program.kind===2&&program.sourceId===band.id)?.feature??TOPOLOGY_PART_JUNCTION_NONE;
+  const flags=TOPOLOGY_PART_JUNCTION_FLAG_FORK|(split?TOPOLOGY_PART_JUNCTION_FLAG_SPLIT:0)|(missing?TOPOLOGY_PART_JUNCTION_FLAG_MISSING_ARM:0)|(complete?TOPOLOGY_PART_JUNCTION_FLAG_COMPLETE:0);
+  const built={feature,sourceId:band.id,flags,arms,edges,contacts:[...contacts].sort((a,b)=>a-b)};builds.push(built);allArms+=arms.length;allPorts+=arms.reduce((n,arm)=>n+arm.ports.length,0);allEdges+=edges.length;allContacts+=built.contacts.length;
+ }
+ const allEdgeRefs=builds.reduce((sum,build)=>sum+build.arms.reduce((n,arm)=>n+arm.edges.length,0),0),allSamples=builds.reduce((sum,build)=>sum+build.arms.reduce((n,arm)=>n+arm.samples.length,0),0);
+ const recordAt=base+TOPOLOGY_PART_JUNCTION_HEADER_WORDS,armAt=recordAt+builds.length*TOPOLOGY_PART_JUNCTION_RECORD_WORDS,portAt=armAt+allArms*TOPOLOGY_PART_JUNCTION_ARM_WORDS,edgeAt=portAt+allPorts,edgeRefAt=edgeAt+allEdges*TOPOLOGY_PART_JUNCTION_EDGE_WORDS,contactAt=edgeRefAt+allEdgeRefs,sampleAt=contactAt+allContacts,out=new Uint32Array(sampleAt+allSamples*TOPOLOGY_PART_JUNCTION_SAMPLE_WORDS);
+ // Header: magic, version, recordAt, recordCount, armAt, armCount,
+ // portAt, portCount, edgeAt, edgeCount, edgeRefAt, edgeRefCount,
+ // contactAt, contactCount, sampleAt, sampleCount. Arm edge references are
+ // explicit because an arm may own non-contiguous source edges in a branched
+ // face graph; samples retain the section's exact source interpolation.
+ out.set([TOPOLOGY_PART_JUNCTION_MAGIC,TOPOLOGY_PART_JUNCTION_VERSION,recordAt,builds.length,armAt,allArms,portAt,allPorts,edgeAt,allEdges,edgeRefAt,allEdgeRefs,contactAt,allContacts,sampleAt,allSamples],base);
+ let armCursor=0,portCursor=0,edgeCursor=0,edgeRefCursor=0,contactCursor=0,sampleCursor=0;
+ for(const [index,build]of builds.entries()){
+  const at=recordAt+index*TOPOLOGY_PART_JUNCTION_RECORD_WORDS,recordArmAt=armAt+armCursor*TOPOLOGY_PART_JUNCTION_ARM_WORDS,recordEdgeAt=edgeAt+edgeCursor*TOPOLOGY_PART_JUNCTION_EDGE_WORDS,recordContactAt=contactAt+contactCursor;
+  out.set([build.feature>>>0,build.sourceId>>>0,build.flags>>>0,recordArmAt,build.arms.length,recordEdgeAt,build.edges.length,recordContactAt,build.contacts.length],at);
+  for(const arm of build.arms){const armWord=armAt+armCursor*TOPOLOGY_PART_JUNCTION_ARM_WORDS,armRefAt=edgeRefAt+edgeRefCursor,armSampleAt=sampleAt+sampleCursor*TOPOLOGY_PART_JUNCTION_SAMPLE_WORDS;out.set([arm.sectionId>>>0,arm.flags>>>0,portAt+portCursor,arm.ports.length,armRefAt,arm.edges.length,armSampleAt,arm.samples.length],armWord);for(const port of arm.ports)out[portAt+portCursor++]=port>>>0;for(const edge of arm.edges)out[edgeRefAt+edgeRefCursor++]=edge>>>0;for(const sample of arm.samples){out.set([sample.sectionId>>>0,sample.sampleIndex>>>0,sample.sourceEdge>>>0,sample.halfedge>>>0,sample.face>>>0,sample.a>>>0,sample.b>>>0,f32bits(sample.t)],sampleAt+sampleCursor*TOPOLOGY_PART_JUNCTION_SAMPLE_WORDS);sampleCursor++;}armCursor++;}
+  for(const edge of build.edges){const edgeWord=edgeAt+edgeCursor*TOPOLOGY_PART_JUNCTION_EDGE_WORDS;out.set([edge.sourceEdge,edge.halfedge,edge.face,edge.a,edge.b,edge.labelA,edge.labelB,edge.contact],edgeWord);edgeCursor++;}
+  for(const contact of build.contacts)out[contactAt+contactCursor++]=contact>>>0;
+ }
+ return out;
+};
+const sourcePartCanonicalEnd=(packet:Uint32Array,sideAt:number):number=>{
+ if(sideAt+TOPOLOGY_PART_CANONICAL_HEADER_WORDS>packet.length||packet[sideAt]!==TOPOLOGY_PART_CANONICAL_MAGIC||packet[sideAt+1]!==TOPOLOGY_PART_CANONICAL_VERSION)return sideAt;
+ const recordAt=packet[sideAt+2]!,count=packet[sideAt+3]!,sampleAt=packet[sideAt+4]!,sampleWords=packet[sideAt+5]!;
+ return recordAt>=sideAt+TOPOLOGY_PART_CANONICAL_HEADER_WORDS&&recordAt+count*TOPOLOGY_PART_CANONICAL_RECORD_WORDS<=packet.length&&sampleAt>=recordAt+count*TOPOLOGY_PART_CANONICAL_RECORD_WORDS&&sampleAt+sampleWords<=packet.length?sampleAt+sampleWords:sideAt;
+};
+const sourcePartJunctionEnd=(packet:Uint32Array,sideAt:number):number=>{
+ if(sideAt+TOPOLOGY_PART_JUNCTION_HEADER_WORDS>packet.length||packet[sideAt]!==TOPOLOGY_PART_JUNCTION_MAGIC||packet[sideAt+1]!==TOPOLOGY_PART_JUNCTION_VERSION)return sideAt;
+ const recordAt=packet[sideAt+2]!,records=packet[sideAt+3]!,armAt=packet[sideAt+4]!,arms=packet[sideAt+5]!,portAt=packet[sideAt+6]!,ports=packet[sideAt+7]!,edgeAt=packet[sideAt+8]!,edges=packet[sideAt+9]!,edgeRefAt=packet[sideAt+10]!,edgeRefs=packet[sideAt+11]!,contactAt=packet[sideAt+12]!,contacts=packet[sideAt+13]!,sampleAt=packet[sideAt+14]!,samples=packet[sideAt+15]!;
+ const valid=recordAt>=sideAt+TOPOLOGY_PART_JUNCTION_HEADER_WORDS&&recordAt+records*TOPOLOGY_PART_JUNCTION_RECORD_WORDS<=packet.length&&armAt>=recordAt+records*TOPOLOGY_PART_JUNCTION_RECORD_WORDS&&armAt+arms*TOPOLOGY_PART_JUNCTION_ARM_WORDS<=packet.length&&portAt>=armAt+arms*TOPOLOGY_PART_JUNCTION_ARM_WORDS&&portAt+ports<=packet.length&&edgeAt>=portAt+ports&&edgeAt+edges*TOPOLOGY_PART_JUNCTION_EDGE_WORDS<=packet.length&&edgeRefAt>=edgeAt+edges*TOPOLOGY_PART_JUNCTION_EDGE_WORDS&&edgeRefAt+edgeRefs<=packet.length&&contactAt>=edgeRefAt+edgeRefs&&contactAt+contacts<=packet.length&&sampleAt>=contactAt+contacts&&sampleAt+samples*TOPOLOGY_PART_JUNCTION_SAMPLE_WORDS<=packet.length;
+ return valid?sampleAt+samples*TOPOLOGY_PART_JUNCTION_SAMPLE_WORDS:sideAt;
+};
+/** Decode the explicit source junction graph. It is deliberately separate
+ * from the old canonical path reader; an incomplete record remains usable as
+ * an incumbent/diagnostic boundary but is never native-role admission. */
+export function sourcePartJunctions(packet:Uint32Array|undefined):readonly SourcePartJunctionRecord[]{
+ if(!packet||packet[0]!==TOPOLOGY_PART_PACKET_MAGIC)return [];
+ const sideAt=packet[3]!+packet[4]!,canonicalEnd=sourcePartCanonicalEnd(packet,sideAt),junctionAt=canonicalEnd,junctionEnd=sourcePartJunctionEnd(packet,junctionAt);if(junctionEnd===junctionAt)return [];
+ const recordAt=packet[junctionAt+2]!,records=packet[junctionAt+3]!,sampleAt=packet[junctionAt+14]!,result:SourcePartJunctionRecord[]=[];
+ if(recordAt<junctionAt+TOPOLOGY_PART_JUNCTION_HEADER_WORDS||recordAt+records*TOPOLOGY_PART_JUNCTION_RECORD_WORDS>junctionEnd)return [];
+ for(let index=0;index<records;index++){
+  const row=recordAt+index*TOPOLOGY_PART_JUNCTION_RECORD_WORDS,firstArm=packet[row+3]!,arms=packet[row+4]!,firstEdge=packet[row+5]!,edges=packet[row+6]!,firstContact=packet[row+7]!,contacts=packet[row+8]!;
+  if(firstArm<recordAt+records*TOPOLOGY_PART_JUNCTION_RECORD_WORDS||firstArm+arms*TOPOLOGY_PART_JUNCTION_ARM_WORDS>junctionEnd||firstEdge<firstArm+arms*TOPOLOGY_PART_JUNCTION_ARM_WORDS||firstEdge+edges*TOPOLOGY_PART_JUNCTION_EDGE_WORDS>junctionEnd||firstContact<firstEdge+edges*TOPOLOGY_PART_JUNCTION_EDGE_WORDS||firstContact+contacts>junctionEnd)return [];
+  const decodedArms:SourcePartJunctionArm[]=[];const floats=new Float32Array(packet.buffer,packet.byteOffset,packet.length);for(let armIndex=0;armIndex<arms;armIndex++){const word=firstArm+armIndex*TOPOLOGY_PART_JUNCTION_ARM_WORDS,firstPort=packet[word+2]!,portTotal=packet[word+3]!,edgeRefStart=packet[word+4]!,edgeTotal=packet[word+5]!,sampleRefStart=packet[word+6]!,sampleTotal=packet[word+7]!;if(firstPort<firstArm+arms*TOPOLOGY_PART_JUNCTION_ARM_WORDS||firstPort+portTotal>junctionEnd||edgeRefStart<firstEdge+edges*TOPOLOGY_PART_JUNCTION_EDGE_WORDS||edgeRefStart+edgeTotal>firstContact||sampleRefStart<sampleAt||sampleRefStart+sampleTotal*TOPOLOGY_PART_JUNCTION_SAMPLE_WORDS>junctionEnd)return [];const decodedSamples:SourcePartJunctionSample[]=[];for(let sampleIndex=0;sampleIndex<sampleTotal;sampleIndex++){const sampleWord=sampleRefStart+sampleIndex*TOPOLOGY_PART_JUNCTION_SAMPLE_WORDS;decodedSamples.push({sectionId:packet[sampleWord]!,sampleIndex:packet[sampleWord+1]!,sourceEdge:packet[sampleWord+2]!,halfedge:packet[sampleWord+3]!,face:packet[sampleWord+4]!,a:packet[sampleWord+5]!,b:packet[sampleWord+6]!,t:floats[sampleWord+7]!});}decodedArms.push({sectionId:packet[word]!,flags:packet[word+1]!,ports:Array.from(packet.slice(firstPort,firstPort+portTotal)),edges:Array.from(packet.slice(edgeRefStart,edgeRefStart+edgeTotal)).filter(edge=>edge<edges),samples:decodedSamples});}
+  const decodedEdges:SourcePartJunctionEdge[]=[];for(let edgeIndex=0;edgeIndex<edges;edgeIndex++){const word=firstEdge+edgeIndex*TOPOLOGY_PART_JUNCTION_EDGE_WORDS;decodedEdges.push({sourceEdge:packet[word]!,halfedge:packet[word+1]!,face:packet[word+2]!,a:packet[word+3]!,b:packet[word+4]!,labelA:packet[word+5]!,labelB:packet[word+6]!,contact:packet[word+7]!});}
+  result.push({feature:packet[row]!,sourceId:packet[row+1]!,flags:packet[row+2]!,arms:decodedArms,edges:decodedEdges,contacts:Array.from(packet.slice(firstContact,firstContact+contacts))});
+ }
+ return result;
+}
 
 /** Compile one source-owned program per section/band plus a one-word membership
  * table indexed by original halfedge address. The source feature is the
@@ -693,15 +1000,16 @@ const sectionContext=(graph:MeshPartGraph,section:PartSection,role:0|1|2|3,posit
 export function compileSourcePartPrograms(item:Pick<TopologySourceItem,'structure'|'complex'|'sourcePositions'>):Uint32Array|undefined{
  const graph=item.structure,complex=item.complex;if(!graph||!complex?.halfedges.length)return undefined;
  const byFace=new Map<number,number>(),programs:SourcePartProgramRecord[]=[];
+ const positions=item.sourcePositions;
  const byPart=new Map<string,number>();
- const add=(id:number,labels:number,closed:boolean,kind:1|2,section?:PartSection):number=>{
+ const add=(id:number,labels:number,closed:boolean,kind:1|2,section?:PartSection,admittedContext?:SourcePartContext):number=>{
   const key=`${kind}:${id}`,old=byPart.get(key);if(old!==undefined)return old;
   const index=programs.length;
   // The compact consumer key is the packet-local program ordinal, not the
   // section/band ID. This keeps section 0 and band 0 distinct while the full
   // sourceId/kind words preserve source identity for non-compact consumers.
   const role=partRole(labels,closed);
-  const context=kind===1&&section?sectionContext(graph,section,role,item.sourcePositions):undefined;
+  const context=admittedContext??(kind===1&&section?sectionContext(graph,section,role,item.sourcePositions):undefined);
   // The compact token keeps the full context beside an 18-bit packet-local
   // ordinal.  The full source ID and kind remain separate words, so this
   // packing never aliases section/band identity or narrows source IDs.
@@ -717,6 +1025,21 @@ export function compileSourcePartPrograms(item:Pick<TopologySourceItem,'structur
  // unreferenced records. Admit lazily from actual original source faces;
  // preserve the selected parts' order and full semantic identities.
  const unclaimed=new Set<number>();for(const halfedge of complex.halfedges)unclaimed.add(halfedge.face);
+ // A fork band is a source-owned junction, not a decorative overlap of the
+ // section envelopes. When its incidence producer can reconstruct a genuine
+ // cross-section path, reserve its original faces before section ownership.
+ // This keeps one membership per face while preserving the turn producer;
+ // unsupported/ambiguous bands retain the incumbent section-first order.
+ const sourceIndices=positions?Uint32Array.from(complex.halfedges,halfedge=>halfedge.from>>>0):undefined;
+ if(positions&&sourceIndices){
+  for(const band of graph.bands){
+   if(((band.labels??0)&PART_FORK)===0)continue;
+   const role=partRole(band.labels??0,false);
+   const path=sourceBandCanonicalPath(graph,band.id,complex,sourceIndices,positions,role);if(!path)continue;
+   let index:number|undefined;
+   for(const face of band.faces)if(unclaimed.delete(face)){index??=add(band.id,band.labels??0,false,2,undefined,path.context);byFace.set(face,index);}
+  }
+ }
  for(const section of graph.sections){let index:number|undefined;for(const face of section.faces)if(unclaimed.delete(face)){index??=add(section.id,section.labels??0,section.closed,1,section);byFace.set(face,index);}}
  for(const band of graph.bands){let index:number|undefined;for(const face of band.faces)if(unclaimed.delete(face)){index??=add(band.id,band.labels??0,false,2);byFace.set(face,index);}}
  const members=new Uint32Array(complex.halfedges.length);members.fill(0xffffffff);
@@ -729,7 +1052,6 @@ export function compileSourcePartPrograms(item:Pick<TopologySourceItem,'structur
  // take the lowest halfedge id. Members without three finite rest coords
  // (missing positions, out-of-range vertex, NaN) contribute nothing, so a
  // part with no member positions keeps 0xffffffff for all six.
- const positions=item.sourcePositions;
  const anchors=programs.map(()=>({ids:Uint32Array.from([0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff]),values:new Float64Array(6),have:new Uint8Array(6)}));
  if(positions)for(const halfedge of complex.halfedges){
   const part=byFace.get(halfedge.face);if(part===undefined)continue;
@@ -744,7 +1066,67 @@ export function compileSourcePartPrograms(item:Pick<TopologySourceItem,'structur
   }
  }
  const programOffset=5,memberOffset=programOffset+programs.length*TOPOLOGY_PART_PROGRAM_WORDS;
- const out=new Uint32Array(memberOffset+members.length);out[0]=TOPOLOGY_PART_PACKET_MAGIC;out[1]=programOffset;out[2]=programs.length;out[3]=memberOffset;out[4]=members.length;
+ // Canonical passage samples are source graph data, not projected relation
+ // fragments. Closed contours retain their source-context winding; open
+ // sections are reconstructed from segment incidence; fork bands use only
+ // actual band-face vertices labelled by source section incidence. Every
+ // complete record therefore has a source-owned path and provenance, while a
+ // genuine but unsupported incumbent can remain present without being marked
+ // consumable by the canonical reader.
+ const canonicalRecords:SourcePartCanonicalRecord[]=programs.map(source=>({
+  feature:source.feature,sourceId:source.sourceId,kind:source.kind,closed:false,context:false,complete:false,
+  sampleIndex:0,sampleCount:0,previous:0xffffffff,next:0xffffffff,penultimate:0xffffffff,last:0xffffffff,
+  startPort:0xffffffff,endPort:0xffffffff,
+ }));
+ const canonicalSamples:number[]=[];
+ if(positions){
+  const sourceIndices=new Uint32Array(complex.halfedges.length);for(const [index,halfedge]of complex.halfedges.entries())sourceIndices[index]=halfedge.from>>>0;
+  const sourcePort=(sample:PartSample):number=>{
+   const a=partPoint({positions},{a:sample.a,b:sample.a,t:0}),b=partPoint({positions},{a:sample.b,b:sample.b,t:0});
+   const along=(point:readonly number[])=>point[0]!*graph.axis[0]!+point[1]!*graph.axis[1]!+point[2]!*graph.axis[2]!;
+   return (along(b)<along(a)?sample.b:sample.a)>>>0;
+  };
+  const appendPath=(index:number,source:SourcePartProgramRecord,samples:readonly PartSample[],points:readonly (readonly [number,number,number])[],closed:boolean,context:boolean,explicitPorts?:readonly [number,number]):void=>{
+   if(samples.length!==points.length||samples.length<3||samples.some(sample=>!Number.isFinite(sample.t)||sample.t<0||sample.t>1||!Number.isInteger(sample.a)||!Number.isInteger(sample.b)||sample.a<0||sample.b<0||sample.a*3+2>=positions.length||sample.b*3+2>=positions.length)||points.some(point=>point.some(value=>!Number.isFinite(value))))return;
+   const lengths=points.slice(0,closed?points.length:points.length-1).map((point,k)=>Math.hypot(...vectorBetween(point,points[closed?(k+1)%points.length:k+1]!))),perimeter=lengths.reduce((sum,value)=>sum+value,0);if(!(perimeter>0)||!lengths.every(Number.isFinite))return;
+   const sampleIndex=canonicalSamples.length/TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS;let walked=0;
+   for(const [sampleAt,sample]of samples.entries()){canonicalSamples.push(sample.a>>>0,sample.b>>>0,f32bits(sample.t),f32bits(walked/perimeter));walked+=lengths[sampleAt]??0;}
+   const count=samples.length;canonicalRecords[index]={feature:source.feature,sourceId:source.sourceId,kind:source.kind,closed,context,complete:context,
+    sampleIndex,sampleCount:count,previous:closed?count-1:0xffffffff,next:count>1?1:0xffffffff,penultimate:closed?count-2:(count>1?count-2:0xffffffff),last:count-1,
+    startPort:explicitPorts?.[0]??sourcePort(samples[0]!),endPort:explicitPorts?.[1]??sourcePort(samples[count-1]!),};
+  };
+  for(const [index,source]of programs.entries()){
+   if(source.kind===1){
+    const section=graph.sections.find(value=>value.id===source.sourceId);if(!section||section.samples.length<3)continue;
+    const base=section.samples.map(sample=>partPoint({positions},sample));if(base.some(point=>point.some(value=>!Number.isFinite(value))))continue;
+    if(section.closed){
+     const selected=sourcePartContextCandidates(graph.axis,source.role,true,{points:base,center:section.center})[0];
+     const order=(selected?.points??base).map(point=>base.indexOf(point));if(order.length!==section.samples.length||order.some(value=>value<0)||new Set(order).size!==order.length)continue;
+     appendPath(index,source,order.map(value=>section.samples[value]!),order.map(value=>base[value]!),true,!!selected);
+    }else{
+     const order=orderedOpenSection(section);if(!order)continue;
+     const orderedPoints=order.map(value=>base[value]!),selected=sourcePartOpenPassage(graph.axis,source.role,{points:orderedPoints,center:section.center});if(!selected)continue;
+     const selectedIndexes=selected.points.map(point=>orderedPoints.indexOf(point));if(selectedIndexes.some(value=>value<0)||new Set(selectedIndexes).size!==selectedIndexes.length)continue;
+     appendPath(index,source,selectedIndexes.map(value=>section.samples[order[value]!]!),selected.points,false,true);
+    }
+   }else if((source.labels&PART_FORK)!==0){
+    const selected=sourceBandCanonicalPath(graph,source.sourceId,complex,sourceIndices,positions,source.role);if(!selected)continue;
+    appendPath(index,source,selected.samples,selected.points,selected.closed,true,selected.ports);
+   }
+  }
+ }
+ const hasCanonical=canonicalSamples.length>0;
+ const canonicalAt=memberOffset+members.length;
+ const canonicalRecordAt=canonicalAt+TOPOLOGY_PART_CANONICAL_HEADER_WORDS;
+ const canonicalSampleAt=canonicalRecordAt+programs.length*TOPOLOGY_PART_CANONICAL_RECORD_WORDS;
+ const canonicalEnd=hasCanonical?canonicalSampleAt+canonicalSamples.length:canonicalAt;
+ // The junction table is source-owned metadata after the canonical table. It
+ // is intentionally not fed to the canonical role consumer: unsupported or
+ // branched records remain available to the future junction consumer while
+ // the incumbent membership and admission gates stay unchanged.
+ const junction=positions?compileSourceForkJunctionSection(graph,complex,positions,programs,canonicalEnd):undefined;
+ const out=new Uint32Array(junction?.length??(hasCanonical?canonicalEnd:canonicalAt));
+ out[0]=TOPOLOGY_PART_PACKET_MAGIC;out[1]=programOffset;out[2]=programs.length;out[3]=memberOffset;out[4]=members.length;
  for(const [index,source]of programs.entries()){
   const at=programOffset+index*TOPOLOGY_PART_PROGRAM_WORDS;out[at]=source.feature;
   out[at+1]=source.role|(source.d5?1<<8:0);
@@ -752,20 +1134,34 @@ export function compileSourcePartPrograms(item:Pick<TopologySourceItem,'structur
   out[at+2]=source.direction??0;out[at+3]=source.labels>>>0;out[at+4]=source.sourceId>>>0;out[at+5]=source.kind;
   out.set(anchors[index]!.ids,at+6);
  }
- out.set(members,memberOffset);return out;
+ out.set(members,memberOffset);
+ if(hasCanonical){
+  // Words 8/9 are filled by SurfaceRelations when it assigns this source a
+  // per-instance projected sample range; zero here is deliberately not a
+  // usable output address.
+  out.set([TOPOLOGY_PART_CANONICAL_MAGIC,TOPOLOGY_PART_CANONICAL_VERSION,canonicalRecordAt,programs.length,canonicalSampleAt,canonicalSamples.length,TOPOLOGY_PART_CANONICAL_RECORD_WORDS,TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS,0,0],canonicalAt);
+  for(const [index,record]of canonicalRecords.entries()){
+   const at=canonicalRecordAt+index*TOPOLOGY_PART_CANONICAL_RECORD_WORDS;
+   out.set([record.feature,record.sourceId,record.kind,(record.closed?TOPOLOGY_PART_CANONICAL_FLAG_CLOSED:0)|(record.context?TOPOLOGY_PART_CANONICAL_FLAG_CONTEXT:0)|(record.complete?TOPOLOGY_PART_CANONICAL_FLAG_COMPLETE:0),record.sampleCount?canonicalSampleAt+record.sampleIndex*TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS:0,record.sampleCount,record.previous,record.next,record.penultimate,record.last,record.startPort,record.endPort],at);
+  }
+  out.set(canonicalSamples,canonicalSampleAt);
+ }
+ if(junction)out.set(junction.subarray(canonicalEnd),canonicalEnd);
+ return out;
 }
 
 /** Adapter from T6 anchor halfedges to 137 anchor vertices (crawl brief item
  * C): six origin vertex ids per part program in packet order, for
  * `SurfaceRelations.registerPartAnchors`. Each anchor halfedge id resolves to
  * that halfedge's `from` vertex; 0xffffffff stays 0xffffffff, and an id with
- * no matching halfedge becomes 0xffffffff. Returns undefined unless the
- * packet carries TOPOLOGY_PART_PACKET_MAGIC with a well-formed header
- * (program offset/count safe integers, offset>=5, count>=1, and the full
- * program records inside the packet at TOPOLOGY_PART_PROGRAM_WORDS stride),
- * so an old-magic or truncated packet is rejected, never misread. The
- * producer assigns unique halfedge ids; if a hand-built array repeated one,
- * the first entry wins. */
+ * no matching halfedge becomes 0xffffffff. A valid canonical side table is
+ * copied after the legacy anchors; old packets retain the six-word output.
+ * Returns undefined unless the packet carries TOPOLOGY_PART_PACKET_MAGIC with
+ * a well-formed header (program offset/count safe integers, offset>=5, count>=1,
+ * and the full program records inside the packet at TOPOLOGY_PART_PROGRAM_WORDS
+ * stride), so an old-magic or truncated packet is rejected, never misread.
+ * The producer assigns unique halfedge ids; if a hand-built array repeated
+ * one, the first entry wins. */
 export function sourcePartAnchorVertices(packet:Uint32Array,halfedges:readonly {readonly id:number;readonly from:number}[]|Uint32Array):Uint32Array|undefined{
  if(packet[0]!==TOPOLOGY_PART_PACKET_MAGIC)return undefined;
  const offset=packet[1]!,count=packet[2]!;
@@ -776,7 +1172,16 @@ export function sourcePartAnchorVertices(packet:Uint32Array,halfedges:readonly {
  const indexed=halfedges instanceof Uint32Array;
  const origin=new Map<number,number>();
  if(!indexed)for(const halfedge of halfedges)if(!origin.has(halfedge.id))origin.set(halfedge.id,halfedge.from);
- const out=new Uint32Array(count*6);
+ const anchorWords=count*6,memberOffset=packet[3]!,memberCount=packet[4]!,sideAt=memberOffset+memberCount;
+ const sideValid=sideAt+TOPOLOGY_PART_CANONICAL_HEADER_WORDS<=packet.length&&
+  packet[sideAt]===TOPOLOGY_PART_CANONICAL_MAGIC&&packet[sideAt+1]===TOPOLOGY_PART_CANONICAL_VERSION&&
+  packet[sideAt+2]!>=sideAt+TOPOLOGY_PART_CANONICAL_HEADER_WORDS&&packet[sideAt+3]===count&&
+  packet[sideAt+4]!>=packet[sideAt+2]!+count*TOPOLOGY_PART_CANONICAL_RECORD_WORDS&&
+  packet[sideAt+5]!%TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS===0&&
+  packet[sideAt+6]===TOPOLOGY_PART_CANONICAL_RECORD_WORDS&&packet[sideAt+7]===TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS&&
+  packet[sideAt+2]!+count*TOPOLOGY_PART_CANONICAL_RECORD_WORDS<=packet.length&&
+  packet[sideAt+4]!+packet[sideAt+5]!<=packet.length;
+ const out=new Uint32Array(anchorWords+(sideValid?TOPOLOGY_PART_CANONICAL_HEADER_WORDS+count*TOPOLOGY_PART_CANONICAL_RECORD_WORDS+packet[sideAt+5]!:0));
  for(let index=0;index<count;index++){
   const at=offset+index*TOPOLOGY_PART_PROGRAM_WORDS;
   for(let k=0;k<6;k++){
@@ -785,6 +1190,17 @@ export function sourcePartAnchorVertices(packet:Uint32Array,halfedges:readonly {
    const from=indexed?(id<halfedges.length?halfedges[id]:undefined):origin.get(id);
    out[index*6+k]=from===undefined?0xffffffff:from>>>0;
   }
+ }
+ if(sideValid){
+  const outSideAt=anchorWords,outRecordAt=outSideAt+TOPOLOGY_PART_CANONICAL_HEADER_WORDS;
+  const outSampleAt=outRecordAt+count*TOPOLOGY_PART_CANONICAL_RECORD_WORDS;
+  out.set([TOPOLOGY_PART_CANONICAL_MAGIC,TOPOLOGY_PART_CANONICAL_VERSION,outRecordAt,count,outSampleAt,packet[sideAt+5]!,TOPOLOGY_PART_CANONICAL_RECORD_WORDS,TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS,0,0],outSideAt);
+  for(let index=0;index<count;index++){
+   const sourceAt=packet[sideAt+2]!+index*TOPOLOGY_PART_CANONICAL_RECORD_WORDS,sampleCount=packet[sourceAt+5]!,at=outRecordAt+index*TOPOLOGY_PART_CANONICAL_RECORD_WORDS;
+   for(let word=0;word<TOPOLOGY_PART_CANONICAL_RECORD_WORDS;word++)out[at+word]=packet[sourceAt+word]!;
+   out[at+4]=sampleCount===0?0:outSampleAt+(packet[sourceAt+4]!-packet[sideAt+4]!);
+  }
+  out.set(packet.subarray(packet[sideAt+4]!,packet[sideAt+4]!+packet[sideAt+5]!),outSampleAt);
  }
  return out;
 }
@@ -797,7 +1213,11 @@ export function sourcePartProgramPacket(topology:Uint32Array):Uint32Array|undefi
  if(base<0||base+5>topology.length||members<base+5||members+length>topology.length)return;
  if(topology[base]!==TOPOLOGY_PART_PACKET_MAGIC||topology[base+1]!==5||topology[base+2]!==count||
   topology[base+3]!==members-base||topology[base+4]!==length||members!==base+5+count*TOPOLOGY_PART_PROGRAM_WORDS)return;
- return topology.subarray(base,members+length);
+ // The packet's side-table offsets are relative to the packet start. The
+ // resident topology appends the packet at `base` without rebasing its words,
+ // so decode a packet-local view before finding the optional extensions.
+ const packet=topology.subarray(base),end=members-base+length,canonicalEnd=sourcePartCanonicalEnd(packet,end),junctionEnd=sourcePartJunctionEnd(packet,canonicalEnd);
+ return topology.subarray(base,base+Math.max(end,canonicalEnd,junctionEnd));
 }
 
 function appendPartProgramTable(target:number[],item:TopologySourceItem):void{
@@ -1206,18 +1626,37 @@ export function compileMeshSolid(positions:ArrayLike<number>,indices:ArrayLike<n
  const hullVolume=volume(faces,i=>points[support[i]!]!);if(!(hullVolume>0))return false;
  return volume(tris,i=>points[i]!)>=OUTLINE_HULL_FILL*hullVolume;
 }
-export function compileConstructionLevels(topology:Uint32Array,complex:MeshSourceComplex,positions:ArrayLike<number>,type:string):Uint32Array|undefined{
- if(type==='terrain')return undefined;
+export function compileConstructionLevels(topology:Uint32Array,complex:MeshSourceComplex,positions:ArrayLike<number>,type:string,construction?:SourceConstruction,planarLevels?:PlanarLevels):Uint32Array|undefined{
+
+ const authored=construction?compileSourcePathProgram(construction):undefined;
+ if(type==='terrain'){
+  // Terrain keeps its fine edge levels unchanged: every code 0 ("produced
+  // at every tier", the reading of a source with no table) and every other
+  // section empty. Only an explicit authored path section is carried.
+  if(!authored)return undefined;
+  const heads=[Uint32Array.of(OUTLINE_HULL_MAGIC,0),Uint32Array.of(PRINCIPAL_CHAIN_MAGIC,0),Uint32Array.of(PANEL_JOIN_MAGIC,0),Uint32Array.of(PANEL_MEMBER_MAGIC,0),
+   Uint32Array.of(PLANAR_OUTLINE_MAGIC,0,0,0,0),Uint32Array.of(PLANAR_CONTACT_MAGIC,0),Uint32Array.of(PLANAR_SPAN_MAGIC,0,PLANAR_SPAN_VERSION),authored];
+  const words=Math.ceil(complex.halfedges.length/2),out=new Uint32Array(words+heads.reduce((sum,part)=>sum+part.length,0));
+  let at=words;for(const part of heads){out.set(part,at);at+=part.length;}return out;
+ }
  const H=complex.halfedges.length,words=Math.ceil(H/2);
  const compiled=compileEdgeLevels(topology,complex,positions);
  const codes=compiled.length?compiled:new Uint32Array(words);
  const hull=type==='rounded'||type==='paper'?undefined:compileOutlineHull(complex,positions);
  const chains=type==='rounded'||type==='paper'?undefined:compilePrincipalChains(topology,complex,positions,codes);
- if(!hull&&!chains)return compiled.length?compiled:undefined;
- // [codes][HULL_MAGIC, n, hull records][CHAIN_MAGIC, m, chain records]: the
- // hull header is written (n = 0) whenever chains follow it.
- const hullWords=hull??Uint32Array.of(OUTLINE_HULL_MAGIC,0),out=new Uint32Array(words+hullWords.length+(chains?.length??0));
- out.set(codes);out.set(hullWords,words);if(chains)out.set(chains,words+hullWords.length);return out;
+ const planar=type==='rounded'||type==='paper'?{}:planarLevels??compilePlanarLevels(complex,positions);
+ // [codes][HULL n][CHAIN m][PANEL_JOIN j][PANEL_MEMBER k][PLANAR_OUTLINE r]
+ // [PLANAR_CONTACT c] (compilePlanarLevels): every header before the last
+ // present section is written with count 0, so each reader keeps its offsets.
+ const sections:(Uint32Array|undefined)[]=[hull,chains,planar.joins,planar.members,planar.outline,planar.contacts,planar.spans,authored];
+ const empty=[Uint32Array.of(OUTLINE_HULL_MAGIC,0),Uint32Array.of(PRINCIPAL_CHAIN_MAGIC,0),Uint32Array.of(PANEL_JOIN_MAGIC,0),Uint32Array.of(PANEL_MEMBER_MAGIC,0),
+  Uint32Array.of(PLANAR_OUTLINE_MAGIC,0,0,0,0),Uint32Array.of(PLANAR_CONTACT_MAGIC,0),Uint32Array.of(PLANAR_SPAN_MAGIC,0,PLANAR_SPAN_VERSION),
+  Uint32Array.of(SOURCE_PATH_MAGIC,0,SOURCE_PATH_VERSION,0,0,0,0,0)];
+ let last=-1;sections.forEach((section,index)=>{if(section)last=index;});
+ if(last<0)return compiled.length?compiled:undefined;
+ const parts=sections.slice(0,last+1).map((section,index)=>section??empty[index]!);
+ const out=new Uint32Array(words+parts.reduce((sum,part)=>sum+part.length,0));
+ out.set(codes);let at=words;for(const part of parts){out.set(part,at);at+=part.length;}return out;
 }
 
 
@@ -1281,4 +1720,430 @@ export function compilePrincipalChains(topology:Uint32Array,complex:MeshSourceCo
  if(records.length/PRINCIPAL_CHAIN_WORDS>complex.edges.length)return undefined;
  const out=new Uint32Array(2+records.length);out[0]=PRINCIPAL_CHAIN_MAGIC;out[1]=records.length/PRINCIPAL_CHAIN_WORDS;out.set(records,2);
  return out;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+export const PANEL_JOIN_MAGIC=0x504a4e54;
+export const PANEL_JOIN_WORDS=6;
+const PANEL_JOIN_SINE=1e-4;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+export const PANEL_MEMBER_MAGIC=0x504d4252;
+export const PANEL_MEMBER_WORDS=4;
+export const PLANAR_OUTLINE_MAGIC=0x504c4f55;
+export const PLANAR_OUTLINE_HEADER=5;
+export const PLANAR_OUTLINE_WORDS=6;
+export const PLANAR_OUTLINE_OPENING=1,PLANAR_OUTLINE_JOINED=2,PLANAR_OUTLINE_OPEN_WALK=4;
+export const PLANAR_CONTACT_MAGIC=0x50434e54;
+export const PLANAR_CONTACT_WORDS=3;
+export const PLANAR_CONTACT_INTERIOR=1,PLANAR_CONTACT_CROSS=2;
+const PLANAR_NORMAL_SINE=1e-3;
+
+
+
+
+
+
+
+export const PLANAR_SPAN_MAGIC=0x50535041;
+export const PLANAR_SPAN_VERSION=1;
+export const PLANAR_SPAN_HEADER=3;
+export const PLANAR_SPAN_WORDS=7;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+export const SOURCE_PATH_MAGIC=0x53504154;
+export const SOURCE_PATH_VERSION=2;
+export const SOURCE_PATH_HEADER=8;
+export const SOURCE_PATH_WORDS=9,SOURCE_PATH_SITE_WORDS=5,SOURCE_PATH_PAIR_WORDS=6,SOURCE_PATH_PORT_WORDS=3,SOURCE_PATH_COVER_WORDS=3;
+export const SOURCE_PATH_PAIR_B=1,SOURCE_PATH_REVERSED=2;
+export function compileSourcePathProgram(construction:SourceConstruction):Uint32Array|undefined{
+ const paths=construction.paths??[],pairs=construction.pathPairs??[];if(!paths.length)return undefined;
+ const NONE=0xffffffff;
+ const bits=new Float32Array(1),word=new Uint32Array(bits.buffer),f32=(x:number)=>{bits[0]=x;return word[0]!;};
+ const sites:number[]=[],siteCount=()=>sites.length/SOURCE_PATH_SITE_WORDS;
+ const site=(s:SourcePathSite)=>{if(s.kind==='vertex')sites.push(0,s.vertex>>>0,f32(1),0,0);else sites.push(1,s.face>>>0,f32(s.barycentric[0]),f32(s.barycentric[1]),f32(s.barycentric[2]));};
+ const index=new Map<number,number>();paths.forEach((path,k)=>index.set(path.id,k));
+ const role=new Map<number,{pair:number;flags:number}>(),pairWords:number[]=[];
+ for(const [p,pair] of pairs.entries()){
+  const a=index.get(pair.paths[0]),b=index.get(pair.paths[1]);if(a===undefined||b===undefined)throw Error('Source path pair references an absent feature');
+  const A=paths[a]!,B=paths[b]!,row=pair.endPorts.find(ports=>ports[0]===A.ports[0]);if(!row)throw Error('Source path pair does not map path A start');
+  const reverse=row[1]===B.ports[1]?1:0;
+  if(role.has(a)||role.has(b))throw Error('Source path belongs to two pairs');
+  role.set(a,{pair:p,flags:0});role.set(b,{pair:p,flags:SOURCE_PATH_PAIR_B|(reverse?SOURCE_PATH_REVERSED:0)});
+  pairWords.push(pair.id>>>0,a,b,reverse,0,pair.gap.length);
+ }
+ const pathWords:number[]=[],cover:[number,number,number][]=[];let segments=0;
+ for(const [k,path] of paths.entries()){
+  const first=siteCount();for(const s of path.sites)site(s);segments+=path.sites.length-1;
+  const faceSite=path.sites.find(s=>s.kind==='face');
+  const owner=path.faces?.[0]?.[0]??(faceSite?.kind==='face'?faceSite.face:NONE);
+  for(const range of path.faces??[])cover.push([range[0]>>>0,range[1]>>>0,k]);
+  const r=role.get(k);
+  pathWords.push(path.id>>>0,path.ports[0]>>>0,path.ports[1]>>>0,f32(path.rank),first,path.sites.length,owner>>>0,r?r.pair:NONE,r?r.flags:0);
+ }
+ // Gap sites follow every path site; patch each pair's firstGapSite.
+ for(const [p,pair] of pairs.entries()){pairWords[p*SOURCE_PATH_PAIR_WORDS+4]=siteCount();for(const s of pair.gap)site(s);}
+ const ports:[number,number,number][]=[];
+ for(const [k,path] of paths.entries())for(const end of [0,1])ports.push([path.ports[end]!>>>0,k,end]);
+ ports.sort((x,y)=>x[0]-y[0]||x[1]-y[1]||x[2]-y[2]);
+ cover.sort((x,y)=>x[0]-y[0]);
+ const out=new Uint32Array(SOURCE_PATH_HEADER+pathWords.length+sites.length+pairWords.length+ports.length*SOURCE_PATH_PORT_WORDS+cover.length*SOURCE_PATH_COVER_WORDS);
+ out.set([SOURCE_PATH_MAGIC,paths.length,SOURCE_PATH_VERSION,siteCount(),pairs.length,ports.length,cover.length,segments]);
+ let at=SOURCE_PATH_HEADER;for(const part of [pathWords,sites,pairWords,ports.flat(),cover.flat()]){out.set(part,at);at+=part.length;}
+ return out;
+}
+export interface PlanarLevels {readonly joins?:Uint32Array;readonly members?:Uint32Array;readonly outline?:Uint32Array;readonly contacts?:Uint32Array;readonly spans?:Uint32Array}
+export function compilePanelJoins(complex:MeshSourceComplex,positions:ArrayLike<number>):Uint32Array|undefined{
+ return compilePlanarLevels(complex,positions).joins;
+}
+export function compilePlanarLevels(complex:MeshSourceComplex,positions:ArrayLike<number>):PlanarLevels{
+ if(!complex.boundaries.length)return {};
+ const P=(v:number):readonly [number,number,number]=>[positions[v*3]!,positions[v*3+1]!,positions[v*3+2]!];
+ const NONE=0xffffffff;
+ let magnitude=1;
+ for(const boundary of complex.boundaries)for(const h of boundary.halfedges){const v=complex.halfedges[h]?.from;if(v===undefined||v*3+2>=positions.length)return {};for(const x of P(v))magnitude=Math.max(magnitude,Math.abs(x));}
+ const tol=Math.max(1e-6,magnitude*2**-20);
+ const dot=(x:readonly number[],y:readonly number[])=>x[0]!*y[0]!+x[1]!*y[1]!+x[2]!*y[2]!;
+ const cross=(x:readonly number[],y:readonly number[])=>[x[1]!*y[2]!-x[2]!*y[1]!,x[2]!*y[0]!-x[0]!*y[2]!,x[0]!*y[1]!-x[1]!*y[0]!];
+ const sub=(x:readonly number[],y:readonly number[])=>[x[0]!-y[0]!,x[1]!-y[1]!,x[2]!-y[2]!];
+ // Planar components: every non-degenerate face parallel to the component's
+ // largest face and every vertex on its plane. Face f owns halfedges 3f..3f+2.
+ const faces=complex.faceComponents.length,componentList=[...new Set(complex.faceComponents)];
+ const plane=new Map<number,{n:number[];o:readonly number[];area:number}>();
+ const faceNormal=(f:number)=>{const a=complex.halfedges[f*3],b=complex.halfedges[f*3+1],c=complex.halfedges[f*3+2];if(!a||!b||!c||a.face!==f)return undefined;const p=P(a.from),q=P(b.from),r=P(c.from);return {p,n:cross(sub(q,p),sub(r,p))};};
+ for(let f=0;f<faces;f++){const fn=faceNormal(f);if(!fn)continue;const area=Math.hypot(...fn.n);const c=complex.faceComponents[f]!,old=plane.get(c);if(area>0&&(!old||area>old.area))plane.set(c,{n:fn.n.map(x=>x/area),o:fn.p,area});}
+ const planar=new Set<number>(plane.keys());
+ // One angular criterion: a face normal within PLANAR_NORMAL_SINE of the
+ // reference, and every vertex within that same angle times the panel's own
+ // extent (or 8 tol) of the reference plane. Numabe d8fc panels deviate by
+ // sine <= 8.2e-4 and 2.5e-5..1.2e-4 of their extent: flat, not bent.
+ const extent=new Map<number,number>();
+ for(let f=0;f<faces;f++){const c=complex.faceComponents[f]!,ref=plane.get(c);if(!ref)continue;for(let k=0;k<3;k++){const h=complex.halfedges[f*3+k];if(!h)continue;extent.set(c,Math.max(extent.get(c)??0,Math.hypot(...sub(P(h.from),ref.o))));}}
+ for(let f=0;f<faces;f++){
+  const c=complex.faceComponents[f]!;if(!planar.has(c))continue;const ref=plane.get(c)!,fn=faceNormal(f);if(!fn){planar.delete(c);continue;}
+  const area=Math.hypot(...fn.n);if(area>0&&Math.hypot(...cross(fn.n.map(x=>x/area),ref.n))>PLANAR_NORMAL_SINE){planar.delete(c);continue;}
+  const limit=Math.max(8*tol,PLANAR_NORMAL_SINE*(extent.get(c)??0));
+  for(let k=0;k<3;k++){const v=complex.halfedges[f*3+k]!.from;if(Math.abs(dot(sub(P(v),ref.o),ref.n))>limit){planar.delete(c);break;}}
+ }
+ interface Run {readonly component:number;readonly a:number;readonly b:number;readonly p:readonly number[];readonly d:readonly number[];readonly length:number;readonly face:number;readonly first:number;readonly members:readonly number[];readonly flags:number}
+ const runs:Run[]=[];
+ const direction=(h:number)=>{const e=complex.halfedges[h]!,p=P(e.from),q=P(e.to),t=sub(q,p),l=Math.hypot(...t);return l>0?t.map(x=>x/l):undefined;};
+ // Openings: inner closed cycles of a planar component (the outer cycle has
+ // the largest area in the panel plane).
+ const cycleArea=(cycle:readonly number[],n:readonly number[])=>{let s=[0,0,0];for(const h of cycle){const e=complex.halfedges[h]!,x=cross(P(e.from),P(e.to));s=[s[0]!+x[0]!,s[1]!+x[1]!,s[2]!+x[2]!];}return Math.abs(dot(s,n))/2;};
+ const outer=new Map<number,{index:number;area:number}>();
+ for(const [index,boundary] of complex.boundaries.entries()){
+  if(!boundary.closed||!planar.has(boundary.component))continue;
+  const area=cycleArea(boundary.halfedges,plane.get(boundary.component)!.n),old=outer.get(boundary.component);if(!old||area>old.area)outer.set(boundary.component,{index,area});
+ }
+ for(const [index,boundary] of complex.boundaries.entries()){
+  const cycle=boundary.halfedges,n=cycle.length;if(n<1)continue;
+  const dirs=cycle.map(direction);if(dirs.some(d=>!d))continue;
+  const opening=boundary.closed&&planar.has(boundary.component)&&outer.get(boundary.component)?.index!==index;
+  const flags=(boundary.closed?0:PLANAR_OUTLINE_OPEN_WALK)|(opening?PLANAR_OUTLINE_OPENING:0);
+  // Straight continuation: consecutive halfedges within the chain tolerance.
+  const inLine=(i:number)=>{const x=dirs[i]!,y=dirs[(i+1)%n]!;return x[0]!*y[0]!+x[1]!*y[1]!+x[2]!*y[2]!>=CHAIN_STRAIGHT_COS;};
+  let start=0;if(boundary.closed){while(start<n&&inLine((start+n-1)%n))start++;if(start===n)continue;}
+  for(let i=0;i<n;){
+   const begin=(start+i)%n;let end=begin,count=1;
+   while(i+count<n&&inLine((start+i+count-1)%n)){end=(start+i+count)%n;count++;}
+   const first=complex.halfedges[cycle[begin]!]!,last=complex.halfedges[cycle[end]!]!,p=P(first.from),q=P(last.to),t=sub(q,p),length=Math.hypot(...t);
+   const members=Array.from({length:count},(_,k)=>cycle[(begin+k)%n]!);
+   if(length>tol)runs.push({component:boundary.component,a:first.from,b:last.to,p,d:t.map(x=>x/length),length,face:first.face,first:cycle[begin]!,members,flags});
+   i+=count;
+  }
+ }
+ const partners=runs.map(()=>new Set<number>());
+ const offLine=(run:Run,point:readonly number[])=>{const r=sub(point,run.p),t=dot(r,run.d);return Math.hypot(r[0]!-t*run.d[0]!,r[1]!-t*run.d[1]!,r[2]!-t*run.d[2]!);};
+ const endOf=(run:Run)=>run.p.map((x,k)=>x+run.d[k]!*run.length);
+ // The overlap of s on r in r's parameter, or undefined when not a join.
+ const overlap=(r:Run,s:Run):readonly [number,number]|undefined=>{
+  if(r.component===s.component)return;
+  const c=Math.abs(dot(r.d,s.d)),sine=Math.sqrt(Math.max(0,1-c*c));
+  if(sine>PANEL_JOIN_SINE+2*tol/Math.min(r.length,s.length))return;
+  const short=r.length<=s.length?r:s,long=short===r?s:r;
+  if(offLine(long,short.p)>tol||offLine(long,endOf(short))>tol)return;
+  const t0=dot(sub(s.p,r.p),r.d),t1=dot(sub(endOf(s),r.p),r.d);
+  const from=Math.max(0,Math.min(t0,t1)),to=Math.min(r.length,Math.max(t0,t1));
+  return to-from>tol?[from,to]:undefined;
+ };
+ if(runs.length>=2&&new Set(runs.map(run=>run.component)).size>=2){
+  // Candidate pairs: two collinear runs with a positive overlap always have an
+  // END of one within tol of the other run. Ends go into a grid whose cell is
+  // the median run length; each run visits the cells along itself.
+  const lengths=runs.map(run=>run.length).sort((x,y)=>x-y);
+  const cell=Math.max(8*tol,lengths[lengths.length>>1]!);
+  const C=(x:number)=>Math.floor(x/cell),key=(x:number,y:number,z:number)=>((x*73856093)^(y*19349663)^(z*83492791))|0;
+  const grid=new Map<number,number[]>();
+  for(const [index,run] of runs.entries())for(const point of [run.p,endOf(run)]){
+   const k=key(C(point[0]!),C(point[1]!),C(point[2]!)),list=grid.get(k);if(list)list.push(index);else grid.set(k,[index]);
+  }
+  const stamp=new Int32Array(runs.length).fill(-1);
+  for(const [index,run] of runs.entries()){
+   // Every point of the run lies within half a cell of a sample spaced one
+   // cell apart (ends included), so any end within tol of the run sits in a
+   // sample's 27-cell neighbourhood. Hash collisions only add candidates;
+   // `overlap` decides. Discovery is one-sided, so both orders are tested.
+   stamp[index]=index;
+   const steps=Math.max(1,Math.ceil(run.length/cell));
+   for(let s=0;s<=steps;s++){const t=run.length*s/steps,x=C(run.p[0]!+run.d[0]!*t),y=C(run.p[1]!+run.d[1]!*t),z=C(run.p[2]!+run.d[2]!*t);
+    for(let i=-1;i<=1;i++)for(let j=-1;j<=1;j++)for(let k=-1;k<=1;k++){
+     const list=grid.get(key(x+i,y+j,z+k));if(!list)continue;
+     for(const other of list){if(stamp[other]===index)continue;stamp[other]=index;
+      if(partners[index]!.has(other))continue;
+      if(overlap(run,runs[other]!)){partners[index]!.add(other);partners[other]!.add(index);}}
+    }}
+  }
+ }
+ const joinRecords:number[]=[],joined:{run:number;join:number;ends:readonly [readonly number[],readonly number[]];vertices:readonly [number,number]}[]=[];
+ for(const [index,run] of runs.entries())for(const other of partners[index]!){
+  if(other<index)continue;
+  const s=runs[other]!,A=run.component<=s.component?run:s,B=A===run?s:run,span=overlap(A,B)!;
+  // Ambiguous: a third run on this line overlaps the same stretch.
+  const third=[...partners[index]!,...partners[other]!].some(q=>{if(q===index||q===other)return false;const o=overlap(A,runs[q]!);return !!o&&Math.min(o[1],span[1])-Math.max(o[0],span[0])>tol;});
+  if(third)continue;
+  // Overlap ends are real run ends; A's own end wins a coincidence.
+  const tB0=dot(sub(B.p,A.p),A.d),tB1=dot(sub(endOf(B),A.p),A.d);
+  const at=(t:number)=>Math.abs(t)<=tol?A.a:Math.abs(t-A.length)<=tol?A.b:Math.abs(t-tB0)<=tol?B.a:Math.abs(t-tB1)<=tol?B.b:undefined;
+  const a=at(span[0]),b=at(span[1]);if(a===undefined||b===undefined||a===b)continue;
+  const join=joinRecords.length/PANEL_JOIN_WORDS;joinRecords.push(a,b,A.face,B.face,A.first,B.first);
+  const ends=[P(a),P(b)] as const,vertices=[a,b] as const;joined.push({run:index,join,ends,vertices},{run:other,join,ends,vertices});
+ }
+ // Outline: the runs of planar components, in run order.
+ const outlineOf=new Int32Array(runs.length).fill(-1),outlineRecords:number[]=[];
+ const joinedRuns=new Set(joined.map(item=>item.run));
+ for(const [index,run] of runs.entries()){
+  if(!planar.has(run.component))continue;
+  outlineOf[index]=outlineRecords.length/PLANAR_OUTLINE_WORDS;
+  outlineRecords.push(run.a,run.b,run.face,run.first,run.component,(run.flags|(joinedRuns.has(index)?PLANAR_OUTLINE_JOINED:0))>>>0);
+ }
+ // Members: the joined span of each halfedge of a joined run (any component),
+ // plus one join-NONE record for every other halfedge of an outline run.
+ const memberRows:[number,number,number,number,number][]=[];
+ const covered=new Set<number>();
+ for(const item of joined){
+  const run=runs[item.run]!,s0=dot(sub(item.ends[0],run.p),run.d),s1=dot(sub(item.ends[1],run.p),run.d),lo=Math.min(s0,s1),hi=Math.max(s0,s1);
+  for(const h of run.members){
+   const e=complex.halfedges[h]!,t0=dot(sub(P(e.from),run.p),run.d),t1=dot(sub(P(e.to),run.p),run.d),span=t1-t0;if(!(span>0))continue;
+   const from=Math.max(t0,lo),to=Math.min(t1,hi);if(!(to-from>tol))continue;
+   const f0=from-t0<=tol?0:(from-t0)/span,f1=t1-to<=tol?1:(to-t0)/span;
+   const q0=Math.round(f0*65535),q1=Math.round(f1*65535);if(q1<=q0)continue;
+   memberRows.push([h,outlineOf[item.run]!<0?NONE:outlineOf[item.run]!,item.join,(q0|(q1<<16))>>>0,q0]);covered.add(h);
+  }
+ }
+ for(const [index,run] of runs.entries())if(outlineOf[index]!>=0)for(const h of run.members)if(!covered.has(h))memberRows.push([h,outlineOf[index]!,NONE,0,0]);
+ memberRows.sort((x,y)=>x[0]-y[0]||x[4]-y[4]);
+
+ // endpoints of the joins covering it. A span's ends are original source
+ // vertices: the run's own corners, or a join end (a real vertex of either
+ // panel). Order: outline run order, then along the run. A run with no join is
+ // one whole span; a fully joined run has none.
+ const spanRecords:number[]=[];
+ const byRun=new Map<number,{lo:number;hi:number;vlo:number;vhi:number}[]>();
+ for(const item of joined){
+  const run=runs[item.run]!,s0=dot(sub(item.ends[0],run.p),run.d),s1=dot(sub(item.ends[1],run.p),run.d);
+  const entry=s0<=s1?{lo:s0,hi:s1,vlo:item.vertices[0],vhi:item.vertices[1]}:{lo:s1,hi:s0,vlo:item.vertices[1],vhi:item.vertices[0]};
+  const list=byRun.get(item.run);if(list)list.push(entry);else byRun.set(item.run,[entry]);
+ }
+ for(const [index,run] of runs.entries()){
+  const at=outlineOf[index]!;if(at<0)continue;
+  const covers=(byRun.get(index)??[]).sort((x,y)=>x.lo-y.lo);
+  // The member halfedge holding a span start (first member ending past it).
+  const memberAt=(t:number)=>{for(const h of run.members){const e=complex.halfedges[h]!;if(dot(sub(P(e.to),run.p),run.d)>t+tol)return h;}return run.members[run.members.length-1]!;};
+  const emit=(from:number,vFrom:number,to:number,vTo:number)=>{if(to-from>tol&&vFrom!==vTo)spanRecords.push(vFrom,vTo,run.face,memberAt(from),run.component,outlineRecords[at*PLANAR_OUTLINE_WORDS+5]!,at);};
+  let t=0,v=run.a;
+  for(const cover of covers){emit(t,v,cover.lo,cover.vlo);if(cover.hi>t){t=cover.hi;v=cover.vhi;}}
+  emit(t,v,run.length,run.b);
+ }
+ // Required contacts with their owning panel.
+ const required=sourceContactRequirements(complex),contactRecords:number[]=[];
+ let interior=0,requiredCount=0;
+ for(const [index,contact] of complex.contacts.entries()){
+  if(!required[index])continue;requiredCount++;
+  const memberFaces=contact.members.map(member=>complex.halfedges[member.edge]?.face).filter((face):face is number=>face!==undefined);
+  const component=memberFaces.length?complex.faceComponents[memberFaces[0]!]!:NONE,same=memberFaces.length>0&&memberFaces.every(face=>complex.faceComponents[face]===component);
+  const flags=(memberFaces.length&&!same?PLANAR_CONTACT_CROSS:0)|(same&&planar.has(component)?PLANAR_CONTACT_INTERIOR:0);
+  if(flags&PLANAR_CONTACT_INTERIOR)interior++;
+  contactRecords.push(index,component>>>0,flags);
+ }
+ const complete=componentList.length>0&&componentList.every(c=>planar.has(c))&&interior===requiredCount?1:0;
+ const section=(magic:number,words:number,records:readonly number[],header:readonly number[]=[])=>{const out=new Uint32Array(2+header.length+records.length);out[0]=magic;out[1]=records.length/words;out.set(header,2);out.set(records,2+header.length);return out;};
+ return {
+  ...(joinRecords.length?{joins:section(PANEL_JOIN_MAGIC,PANEL_JOIN_WORDS,joinRecords)}:{}),
+  ...(memberRows.length?{members:section(PANEL_MEMBER_MAGIC,PANEL_MEMBER_WORDS,memberRows.flatMap(row=>row.slice(0,4)))}:{}),
+  ...(outlineRecords.length?{outline:section(PLANAR_OUTLINE_MAGIC,PLANAR_OUTLINE_WORDS,outlineRecords,[planar.size,componentList.length,complete])}:{}),
+  ...(outlineRecords.length&&contactRecords.length?{contacts:section(PLANAR_CONTACT_MAGIC,PLANAR_CONTACT_WORDS,contactRecords)}:{}),
+  // Always present with an outline (an explicit empty section when every run
+  // is fully joined), so a consumer never confuses "no spans" with "old packet".
+  ...(outlineRecords.length?{spans:section(PLANAR_SPAN_MAGIC,PLANAR_SPAN_WORDS,spanRecords,[PLANAR_SPAN_VERSION])}:{}),
+ };
+}
+
+/** One source-owned closed boundary cycle from the planar level producer.
+ * Vertices are original source vertex addresses, in cycle order, with the
+ * closing duplicate omitted.  This is deliberately a semantic view of the
+ * existing outline table: no hull, chord, vertex fitting or plane merge is
+ * performed here. */
+export interface SourcePlanarBoundaryPath {
+ readonly component:number;
+ readonly vertices:readonly number[];
+ readonly faces:readonly number[];
+ readonly flags:number;
+}
+
+/** One ordered source-edge-only passage of a planar boundary. Convex
+ * components remain one closed cycle; concave components split at source
+ * reflex transitions into open passages. Adjacent passages share only their
+ * endpoint, so every original boundary edge is emitted exactly once. */
+export interface SourcePlanarBoundaryPassage extends SourcePlanarBoundaryPath {
+ readonly passage:number;
+ readonly closed:boolean;
+}
+
+/** Recover complete planar boundary cycles from the same outline records that
+ * are transported in `compileConstructionLevels`.  A component is published
+ * only when the level producer declared the multipart construction complete;
+ * ambiguous, open or malformed cycles retain their incumbent geometry. */
+export function compileSourcePlanarBoundaryPaths(complex:MeshSourceComplex,positions:ArrayLike<number>,planarLevels?:PlanarLevels):readonly SourcePlanarBoundaryPath[]{
+ const outline=(planarLevels??compilePlanarLevels(complex,positions)).outline;
+ if(!outline||outline[4]!==1)return [];
+ type Run={readonly a:number;readonly b:number;readonly face:number;readonly component:number;readonly flags:number};
+ const byComponent=new Map<number,Run[]>();
+ for(let at=PLANAR_OUTLINE_HEADER;at+PLANAR_OUTLINE_WORDS<=outline.length;at+=PLANAR_OUTLINE_WORDS){
+  const flags=outline[at+5]!;
+  // Inner cycles are protected openings, not boundary part geometry. They
+  // remain represented by the existing opening/contact producer.
+  if(flags&PLANAR_OUTLINE_OPENING)continue;
+  const run={a:outline[at]!,b:outline[at+1]!,face:outline[at+2]!,component:outline[at+4]!,flags};
+  const list=byComponent.get(run.component);if(list)list.push(run);else byComponent.set(run.component,[run]);
+ }
+ const paths:SourcePlanarBoundaryPath[]=[];
+ for(const [component,runs]of byComponent){
+  if(!runs.length)continue;
+  const remaining=runs.slice(),first=remaining.shift()!,vertices=[first.a,first.b],faces=[first.face];
+  let flags=first.flags,valid=true;
+  while(remaining.length){
+   const at=vertices.at(-1)!;
+   const matches=remaining.flatMap((run,index)=>run.a===at||run.b===at?[index]:[]);
+   // A source boundary must have one continuation. Multiple continuations
+   // are a non-manifold/ambiguous cycle and stay on the incumbent path.
+   if(matches.length!==1){valid=false;break;}
+   const run=remaining.splice(matches[0]!,1)[0]!;
+   vertices.push(run.a===at?run.b:run.a);faces.push(run.face);flags|=run.flags;
+  }
+  if(!valid||vertices.length<4||vertices.at(-1)!==vertices[0]!)continue;
+  vertices.pop();
+  if(new Set(vertices).size!==vertices.length||faces.length!==runs.length)continue;
+  paths.push({component,vertices,faces,flags});
+ }
+ return paths.sort((a,b)=>a.component-b.component);
+}
+
+/** Decompose concave planar boundaries into ordered convex open passages.
+ * This uses only the existing boundary vertices and edges: no hull, chord,
+ * plane merge or camera-facing choice is introduced. */
+export function compileSourcePlanarBoundaryPassages(complex:MeshSourceComplex,positions:ArrayLike<number>,planarLevels?:PlanarLevels):readonly SourcePlanarBoundaryPassage[]{
+ const paths=compileSourcePlanarBoundaryPaths(complex,positions,planarLevels),result:SourcePlanarBoundaryPassage[]=[];
+ const cross=(a:readonly number[],b:readonly number[])=>[a[1]!*b[2]!-a[2]!*b[1]!,a[2]!*b[0]!-a[0]!*b[2]!,a[0]!*b[1]!-a[1]!*b[0]!] as const;
+ const subtract=(a:readonly number[],b:readonly number[])=>[a[0]!-b[0]!,a[1]!-b[1]!,a[2]!-b[2]!] as const;
+ for(const path of paths){
+  const n=path.vertices.length;if(n<3)continue;
+  const points=path.vertices.map(vertex=>[positions[vertex*3]!,positions[vertex*3+1]!,positions[vertex*3+2]!] as const);
+  const normal=points.reduce<readonly [number,number,number]|undefined>((found,_,index)=>{
+   if(found)return found;
+   const value=cross(subtract(points[index]!,points[(index+n-1)%n]!),subtract(points[(index+1)%n]!,points[index]!));
+   return Math.hypot(...value)>1e-12?value:undefined;
+  },undefined);
+  if(!normal)continue;
+  const signed=points.map((_,index)=>{
+   const before=points[(index+n-1)%n]!,at=points[index]!,after=points[(index+1)%n]!;
+   const value=dot3(cross(subtract(before,at),subtract(at,after)),normal);
+   return Math.abs(value)<=1e-7?0:Math.sign(value);
+  });
+  if(new Set(signed.filter(value=>value!==0)).size<=1){result.push({...path,passage:0,closed:true});continue;}
+  const passageAt=(start:number):readonly SourcePlanarBoundaryPassage[]|undefined=>{
+   const passages:SourcePlanarBoundaryPassage[]=[];let cursor=start,guard=0;
+   do{
+    if(++guard>n+1)return;
+    const sign=signed[(cursor+1)%n]||signed[cursor]||signed[(cursor+n-1)%n];if(!sign)return;
+    let next=(cursor+2)%n,span=2;
+    while(next!==start&&(signed[next]===0||signed[next]===sign)){next=(next+1)%n;span++;}
+    if(span<2)return;
+    const vertices:number[]=[path.vertices[cursor]!],faces:number[]=[];let at=cursor;
+    while(at!==next){faces.push(path.faces[at]!);at=(at+1)%n;vertices.push(path.vertices[at]!);}
+    passages.push({component:path.component,vertices,faces,flags:path.flags,passage:passages.length,closed:false});cursor=next;
+   }while(cursor!==start);
+   return passages.length>1?passages:undefined;
+  };
+  let passages:readonly SourcePlanarBoundaryPassage[]|undefined;
+  for(let start=0;start<n&&!passages;start++)passages=passageAt(start);
+  if(passages)result.push(...passages);
+ }
+ return result.sort((a,b)=>a.component-b.component||a.passage-b.passage);
 }

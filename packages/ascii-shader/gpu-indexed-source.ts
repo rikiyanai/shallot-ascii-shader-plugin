@@ -36,7 +36,22 @@ export interface GpuIndexedRestCellChartInput {
  readonly cornerOrder:'shallot-voxel-quad-v1';
  readonly extent:readonly [number,number,number];
  readonly vertexCellCodes:GPUBufferBinding;
+
+
+
+ readonly occupancy?:GpuIndexedCellOccupancy;
 }
+/** Producer-issued cell occupancy, written by the same dispatch that wrote
+ * `vertexCellCodes` (valid for exactly the chart's generation). u32 words,
+ * W = ceil(extent[1]/32) per column: cell (x,y,z) is word
+ * (z*extent[0]+x)*W+(y>>5), bit (y&31); set = SOLID in the meshed source.
+ * Bits for y >= extent[1] are zero. */
+export interface GpuIndexedCellOccupancy {
+ readonly kind:'voxel-column-occupancy-v1';
+ readonly columns:GPUBufferBinding;
+}
+export const occupancyWordsPerColumn=(extent:readonly [number,number,number]):number=>Math.ceil(extent[1]/32);
+export const occupancyWords=(extent:readonly [number,number,number]):number=>extent[0]*extent[2]*occupancyWordsPerColumn(extent);
 export interface GpuIndexedRestCellChart extends GpuIndexedRestCellChartInput {
  /** Exact topology generation whose vertex-code binding is still valid. */
  readonly sourceGeneration:number;
@@ -194,6 +209,11 @@ export function validateGpuIndexedSourceDescriptor(value:GpuIndexedSourceDescrip
   bindingBytes(value.restCellChart.vertexCellCodes,'source rest-cell vertex codes',vertexCapacity*4);
   integer(value.restCellChart.sourceGeneration,'rest-cell chart source generation');
   if(value.restCellChart.sourceGeneration!==value.generation)throw Error('GPU indexed source rest-cell chart names the wrong topology generation');
+  const occupancy=value.restCellChart.occupancy;
+  if(occupancy){
+   if(occupancy.kind!=='voxel-column-occupancy-v1')throw Error('GPU indexed source rest-cell occupancy has an unsupported kind');
+   bindingBytes(occupancy.columns,'source rest-cell occupancy',occupancyWords(value.restCellChart.extent)*4);
+  }
  }
  if(value.poseContent){
   validatePoseContent(value.poseContent);
@@ -242,7 +262,7 @@ export class GpuIndexedSourceResidency{
    if(descriptor.generation<previous.generation)throw Error('GPU indexed source generation moved backwards');
    if(descriptor.generation===previous.generation){
     const a=descriptor.restCellChart,b=previous.restCellChart;
-    if(descriptor.revision!==previous.revision||descriptor.posedNormalClass!==previous.posedNormalClass||descriptor.edgeContactClass!==previous.edgeContactClass||!sameBinding(descriptor.topology.indices,previous.topology.indices)||!!a!==!!b||!!a&&!!b&&(a.sourceGeneration!==b.sourceGeneration||a.cornerOrder!==b.cornerOrder||a.extent.some((n,i)=>n!==b.extent[i])||!sameBinding(a.vertexCellCodes,b.vertexCellCodes)))throw Error('GPU indexed source changed without advancing generation');
+    if(descriptor.revision!==previous.revision||descriptor.posedNormalClass!==previous.posedNormalClass||descriptor.edgeContactClass!==previous.edgeContactClass||!sameBinding(descriptor.topology.indices,previous.topology.indices)||!!a!==!!b||!!a&&!!b&&(a.sourceGeneration!==b.sourceGeneration||a.cornerOrder!==b.cornerOrder||a.extent.some((n,i)=>n!==b.extent[i])||!sameBinding(a.vertexCellCodes,b.vertexCellCodes)||!!a.occupancy!==!!b.occupancy||!!a.occupancy&&!!b.occupancy&&!sameBinding(a.occupancy.columns,b.occupancy.columns)))throw Error('GPU indexed source changed without advancing generation');
     if(descriptor.registrationIndexCount===undefined)return previous;
     if(descriptor.registrationIndexCount!==previous.incidence.layout.corners)throw Error('GPU indexed source live topology changed without advancing generation');
     return previous;

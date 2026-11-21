@@ -1,5 +1,5 @@
 import {SourceStorage,allocateStorageRanges,type SourceStorageRange} from './source-storage.ts';
-import {prepareComputePipelines} from './gpu-pipeline-preparation.ts';
+import {prepareComputePipelines,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 function validatePhysicalPreparation(backend:'legacy'|'gpu-csr',retention:SourceComplexRetention):void{
  if(retention==='summary'&&backend!=='gpu-csr')throw Error('Physical summary residency requires compiled GPU incidence');
 }
@@ -7,24 +7,38 @@ import type {CompositionGeometry,SourceAnalysis} from './composition.ts';
 import {SourceInstanceArena,type SourceInstanceRange} from './source-instance-arena.ts';
 import type {MeshSourceComplex} from './source-complex.ts';
 import {SourceProgramCompiler,type SourceCompilation} from './source-program-compiler.ts';
-import type {CompiledSourceProgram,SourceComplexRetention,PlaybackSourceAnalysis} from './source-program.ts';
+import type {CompiledSourceProgram,SourceComplexRetention,PlaybackSourceAnalysis,SourceProgramInput} from './source-program.ts';
 import type {RegisteredSourceComplex} from './source-cache.ts';
 import type {SourceResidencySummary} from './source-transfer.ts';
 import type {PosedSourceBatch} from './surface-relations.ts';
 import {GpuRelationSourceCompiler} from './source-incidence-residual.ts';
+import {GpuSourceNumerics,canRegisterNumericSource,type NumericSourceCompilation,type NumericSourceReady} from './gpu-source-numerics.ts';
+import {decodeSourceSemanticResidual,type SourceSemanticResidual} from './source-semantic-residual.ts';
+import {sourcePartAnchorVertices} from './compiled-construction-topology.ts';
 import {SOURCE_CHART_TAG,REST_SOURCE_CHART_WGSL} from './source-coordinates.ts';
 import {MATERIAL_FOLIAGE_FACES_BIT} from './source-material.ts';
 import {SpatialIndex,type SpatialBounds} from './spatial-index.ts';
-import {bindSourceWholeConstruction,fitsParentTier,selectSourceLod,type SourceLodInstance,type SourceLodParent,type SourceLodSelection,ParentGroupCache,type SourceWholeConstructionTemplate,type SmallConstructionAvailability} from './source-lod.ts';
+import {bindSourceWholeConstruction,fitsParentTier,selectSourceLod,type SourceLodInstance,type SourceLodParent,type SourceLodSelection,ParentGroupCache,type SourceWholeConstructionTemplate,type SmallConstructionAvailability,type SourceWholeNativePartAdmission} from './source-lod.ts';
 import type {SourceSmallParent} from './source-small-parent.ts';
 
+export type PhysicalSourceGeometry=CompositionGeometry&{readonly contactKeys?:Uint32Array;readonly semantic?:Uint8Array};
+/** Exact dynamic-worker input shared by runtime registration and build-time
+ * semantic identity. Keep source id, P0 adjacency, contact keys, material and
+ * producer lineage in one factory; baked assets use this same model authority
+ * before their semantic residual is attached. */
+export function physicalSourceProgramInput(geometry:PhysicalSourceGeometry,backend:'legacy'|'gpu-csr',retention:SourceComplexRetention):SourceProgramInput{
+ return {id:geometry.lineage?.source??geometry.owner,revision:geometry.revision,positions:geometry.positions,indices:geometry.indices,contactKeys:geometry.contactKeys,adjacency:geometry.lineage?.adjacency,incidence:backend==='gpu-csr'?'gpu-csr':undefined,complexMode:retention,physical:{lineage:geometry.lineage,surface:geometry.surface,materialSource:geometry.materialSource,construction:geometry.construction}};
+}
+export interface PhysicalSourceSemanticAttributes {readonly semantic:Uint8Array;readonly normals?:Float32Array}
+export type PhysicalSourceSemanticResolver=(geometry:PhysicalSourceGeometry,input:SourceProgramInput)=>Promise<PhysicalSourceSemanticAttributes|undefined>;
 interface PhysicalSourceData {
  readonly id:string;readonly revision:number;readonly positions:GPUBuffer;readonly normals:GPUBuffer;
  readonly indices:GPUBuffer;
- readonly incidence:GPUBuffer;readonly geometry:CompositionGeometry;
+ readonly incidence:GPUBuffer;readonly geometry:PhysicalSourceGeometry;
  readonly bounds:Float32Array;retired?:boolean;
  readonly positionsBinding:GPUBufferBinding;readonly normalsBinding:GPUBufferBinding;readonly indicesBinding:GPUBufferBinding;readonly incidenceBinding:GPUBufferBinding;
  readonly ranges:{positions:SourceStorageRange;normals:SourceStorageRange;indices?:SourceStorageRange;incidence:SourceStorageRange};
+ readonly numeric?:NumericSourceReady;
  readonly wholeConstruction?:SourceWholeConstructionTemplate;
  readonly smallParent?:SourceSmallParent;
  readonly partAnchorVertices?:Uint32Array;
@@ -32,7 +46,7 @@ interface PhysicalSourceData {
 export type PhysicalSource=PhysicalSourceData&(
  {readonly complex:MeshSourceComplex;readonly summary?:never;readonly analysis:SourceAnalysis;readonly profileSafe:boolean}|
  {readonly summary:SourceResidencySummary;readonly complex?:never;readonly analysis:PlaybackSourceAnalysis;readonly profileSafe:boolean});
-interface Registration {readonly bounds:Float32Array;priority?:number;readonly geometry:CompositionGeometry;compilation?:SourceCompilation;readonly promise:Promise<void>;readonly resolve:()=>void;readonly reject:(error:Error)=>void;error?:Error}
+interface Registration {readonly id:number;readonly bounds:Float32Array;priority?:number;readonly geometry:PhysicalSourceGeometry;resolvedGeometry?:PhysicalSourceGeometry;resolving?:Promise<void>;compilation?:SourceCompilation;numeric?:NumericSourceCompilation;readonly promise:Promise<void>;readonly resolve:()=>void;readonly reject:(error:Error)=>void;error?:Error}
 export interface PhysicalSourceInstance {readonly geometry:CompositionGeometry;readonly domain:number;readonly owner:number}
 export interface PhysicalResidentBatch {readonly batch:PosedSourceBatch;readonly source:RegisteredSourceComplex<SourceComplexRetention>;readonly domain:number}
 export interface PhysicalProducerOwner {readonly mesh:number;readonly eid:number}
@@ -174,9 +188,11 @@ export class PhysicalSourceTransport {
  private readonly sourcePositions:SourceStorage;private readonly sourceNormals:SourceStorage;private readonly sourceWords:SourceStorage;
  private readonly posedVertices:SourceStorage;private readonly posedAttributes:SourceStorage;private readonly catalog:SourceStorage;
  private readonly cache=new WeakMap<Float32Array,Map<Uint32Array,PhysicalSource>>();
- private readonly sourceKeys=new WeakMap<PhysicalSource,CompositionGeometry>();
+ private readonly sourceKeys=new WeakMap<PhysicalSource,PhysicalSourceGeometry>();
  private readonly activeSources=new Set<PhysicalSource>();
  private readonly compiler=new SourceProgramCompiler();
+ private numerics?:GpuSourceNumerics;
+ private serial=0;
  private readonly registrations=new WeakMap<Float32Array,Map<Uint32Array,Registration>>();
  private demand?:{readonly jobs:ReadonlySet<Registration>;readonly promise:Promise<void>};
  private readonly work=new Set<Registration>();private readonly compiled:PhysicalSource[]=[];private disposed=false;
@@ -191,13 +207,14 @@ export class PhysicalSourceTransport {
  inView:ReadonlySet<PhysicalResidentBatch>&Set<PhysicalResidentBatch>=new Set();
  private readonly buffers=new Set<GPUBuffer>();private readonly leasedSlots=new Set<SourceFrameSlot>();private readonly retired:GPUBuffer[]=[];
  private readonly incidenceCompiler?:GpuRelationSourceCompiler;
- static async create(device:GPUDevice,backend:'legacy'|'gpu-csr'='legacy',retention:SourceComplexRetention='full',progress?:(fraction:number)=>void):Promise<PhysicalSourceTransport>{
+ private semanticResolver?:PhysicalSourceSemanticResolver;
+ static async create(device:GPUDevice,backend:'legacy'|'gpu-csr'='legacy',retention:SourceComplexRetention='full',progress?:ComputePipelineProgress):Promise<PhysicalSourceTransport>{
   validatePhysicalPreparation(backend,retention);
   const sourceWords=new SourceStorage(device,'MAIN source words');let arena:SourceInstanceArena|undefined,incidenceCompiler:GpuRelationSourceCompiler|undefined;
   try{
-   const pipelines=await prepareComputePipelines(device,new Map([['physical-source-posing',()=>({layout:'auto' as const,compute:{module:device.createShaderModule({label:'MAIN physical source posing',code:SHADER}),entryPoint:'main'}})]]),p=>progress?.(p/4));
-   arena=await SourceInstanceArena.create(device,p=>progress?.(1/4+p/4));
-   if(backend==='gpu-csr')incidenceCompiler=await GpuRelationSourceCompiler.create(device,sourceWords,p=>progress?.(1/2+p/2));
+   const pipelines=await prepareComputePipelines(device,new Map([['physical-source-posing',()=>({layout:'auto' as const,compute:{module:device.createShaderModule({label:'MAIN physical source posing',code:SHADER}),entryPoint:'main'}})]]),(p,stage)=>progress?.(p/4,stage));
+   arena=await SourceInstanceArena.create(device,(p,stage)=>progress?.(1/4+p/4,stage));
+   if(backend==='gpu-csr')incidenceCompiler=await GpuRelationSourceCompiler.create(device,sourceWords,(p,stage)=>progress?.(1/2+p/2,stage));
    else progress?.(1);
    return new PhysicalSourceTransport(device,backend,retention,{pipeline:pipelines.get('physical-source-posing')!,arena,sourceWords,incidenceCompiler});
   }catch(error){if(incidenceCompiler)await incidenceCompiler.dispose();arena?.dispose();sourceWords.dispose();throw error;}
@@ -208,7 +225,11 @@ export class PhysicalSourceTransport {
   this.sourcePositions=new SourceStorage(device,'MAIN source positions');this.sourceNormals=new SourceStorage(device,'MAIN source normals');this.sourceWords=prepared?.sourceWords??new SourceStorage(device,'MAIN source words');
   this.posedVertices=new SourceStorage(device,'MAIN posed vertices');this.posedAttributes=new SourceStorage(device,'MAIN posed attributes');this.catalog=new SourceStorage(device,'MAIN source catalog');
   if(backend==='gpu-csr')this.incidenceCompiler=prepared?.incidenceCompiler??new GpuRelationSourceCompiler(device,this.sourceWords);}
- acquire(g:CompositionGeometry):PhysicalSource{
+ /** Attach the optional build-time semantic asset owner. It is consulted only
+  * by startRegistration, after prepare has admitted a demanded source. A
+  * resolver miss deliberately falls through to the complete worker producer. */
+ setSemanticResolver(resolver?:PhysicalSourceSemanticResolver):void{this.semanticResolver=resolver;}
+ acquire(g:PhysicalSourceGeometry):PhysicalSource{
   if(this.disposed)throw Error('Physical source transport is disposed');
   const source=this.cache.get(g.positions)?.get(g.indices);
   if(!source||source.retired||source.revision!==g.revision)throw Error('Physical source revision is not registered; prepare sources before encoding');
@@ -224,7 +245,7 @@ export class PhysicalSourceTransport {
   * Physical fields have source-model
   * vertex authority, so transformed local bounds enclose every raster vertex.
   * Original engine shadow/caster input remains outside this readiness gate. */
- prepare(geometry:readonly CompositionGeometry[],clip?:Float32Array):Promise<void>|undefined{
+ prepare(geometry:readonly PhysicalSourceGeometry[],clip?:Float32Array):Promise<void>|undefined{
   if(this.disposed)throw Error('Physical source transport is disposed');
   const requested=new Set<Registration>(),required=new Set<Registration>(),predicted=new Set<Registration>(),live=new Set<PhysicalSource>();
   const eye=clip&&clipEye(clip),wide=clip&&widenedClip(clip,PREDICT_WIDEN);
@@ -237,7 +258,7 @@ export class PhysicalSourceTransport {
    let job=byIndex.get(g.indices);
    if(job&&job.geometry.revision!==g.revision){this.cancelRegistration(job);byIndex.delete(g.indices);job=undefined;}
    if(!job){
-    const definition:CompositionGeometry={owner:g.owner,positions:g.positions,indices:g.indices,revision:g.revision,lineage:g.lineage,surface:g.surface,materialSource:g.materialSource,construction:g.construction};
+    const definition:PhysicalSourceGeometry={owner:g.owner,positions:g.positions,indices:g.indices,revision:g.revision,normals:g.normals,contactKeys:g.contactKeys,semantic:g.semantic,lineage:g.lineage,surface:g.surface,materialSource:g.materialSource,construction:g.construction};
     // Bounds are registered once per source revision, not recomputed per
     // camera or instance. The worker's completed bounds replace this scratch.
     const bounds=new Float32Array([Infinity,Infinity,Infinity,0,-Infinity,-Infinity,-Infinity,0]);
@@ -245,7 +266,7 @@ export class PhysicalSourceTransport {
     let resolve!:()=>void,reject!:(error:Error)=>void;
     const promise=new Promise<void>((yes,no)=>{resolve=yes;reject=no;});
     void promise.catch(()=>{});
-    job={geometry:definition,bounds,promise,resolve,reject};byIndex.set(definition.indices,job);this.work.add(job);
+    job={id:++this.serial,geometry:definition,bounds,promise,resolve,reject};byIndex.set(definition.indices,job);this.work.add(job);
    }
    requested.add(job);
    // OR across ALL instances of one source, regardless of enumeration order.
@@ -261,7 +282,8 @@ export class PhysicalSourceTransport {
    // scheduler priority does not change the resulting compiled program.
    // Predicted (near, not yet seen) sources come after every required one.
    const priority=required.has(job)?1_000_000:predicted.has(job)?1_000:1;
-   if(job.compilation&&priority!==job.priority){job.compilation.prioritize(priority);job.priority=priority;}
+   if(priority!==job.priority){job.priority=priority;job.compilation?.prioritize(priority);}
+   job.numeric?.setRequired(required.has(job));
    if(required.has(job)&&job.error)throw job.error;
   }
   for(const source of this.activeSources)if(!live.has(source))this.retireSource(source);
@@ -273,16 +295,69 @@ export class PhysicalSourceTransport {
  /** The current-view sources the last prepare() still waits for: in view and
   * not yet compiled. A caller that publishes without them reports them. */
  demanded():readonly CompositionGeometry[]{return this.demand?[...this.demand.jobs].map(job=>job.geometry):[];}
- private cancelRegistration(job:Registration):void{this.work.delete(job);job.compilation?.cancel();job.resolve();}
+ private cancelRegistration(job:Registration):void{this.work.delete(job);job.compilation?.cancel();job.numeric?.cancel();job.resolve();}
+ private bakedSemantic(geometry:PhysicalSourceGeometry):{semantic:SourceSemanticResidual;identity:Uint32Array}|undefined{
+  if(this.retention!=='summary'||this.backend!=='gpu-csr'||!this.incidenceCompiler||!geometry.semantic)return;
+  // Physical posing must retain the producer's authored normal field. A
+  // missing/incorrect normal stream is an unbaked source, so it deliberately
+  // stays on the complete worker path instead of inventing a replacement.
+  const vertices=geometry.positions.length/3;if(!geometry.normals||geometry.normals.length!==vertices*4)return;
+  if(geometry.semantic.byteOffset%4||geometry.semantic.byteLength<48*4)throw Error('Physical baked source semantic packet is truncated');
+  const words=new Uint32Array(geometry.semantic.buffer,geometry.semantic.byteOffset,geometry.semantic.byteLength/4),identity=words.subarray(40,48);
+  const semantic=decodeSourceSemanticResidual(geometry.semantic,identity);
+  if(semantic.vertices!==vertices||semantic.corners!==geometry.indices.length)throw Error('Physical baked source semantic revision does not match positions or indices');
+  if(semantic.publishedAdjacency!==Boolean(geometry.lineage?.adjacency))return;
+  if(!canRegisterNumericSource({positions:geometry.positions,indices:geometry.indices,contactKeys:geometry.contactKeys,revision:geometry.revision},semantic))return;
+  return {semantic,identity:new Uint32Array(identity)};
+ }
  private startRegistration(job:Registration):void{
-  if(job.compilation||job.error||this.disposed)return;
-  const definition=job.geometry;
+  if(job.compilation||job.numeric||job.resolving||job.error||this.disposed)return;
+  const definition=job.resolvedGeometry??job.geometry;
+  const fail=(error:unknown)=>{
+   if(this.disposed||!this.work.has(job))return;
+   job.error=error instanceof Error?error:Error(String(error));job.reject(job.error);
+  };
+  // Asset lookup is intentionally after prepare's current-view admission. A
+  // catalog miss, blocked storage or cancellation must never make every scene
+  // geometry a startup dependency or prevent the normal worker route.
+  // Published P0 is loaded through the same exact source-content identity.
+  // Only its complete authority packet can pass bakedSemantic; legacy/missing
+  // metadata still takes the original complete worker producer below.
+  if(this.semanticResolver&&this.retention==='summary'&&this.backend==='gpu-csr'&&!definition.semantic){
+   const input=physicalSourceProgramInput(definition,this.backend,this.retention),resolver=this.semanticResolver;
+   job.resolving=Promise.resolve().then(()=>resolver(definition,input)).then(attributes=>{
+    job.resolving=undefined;
+    if(this.disposed||!this.work.has(job))return;
+    const resolved=attributes?{...definition,semantic:attributes.semantic,...(attributes.normals?{normals:attributes.normals}:{})}:definition;
+    job.resolvedGeometry=resolved;this.dispatchRegistration(job,resolved);
+   }).catch(fail);
+   return;
+  }
+  this.dispatchRegistration(job,definition);
+ }
+ private dispatchRegistration(job:Registration,definition:PhysicalSourceGeometry):void{
+  if(job.compilation||job.numeric||job.error||this.disposed||!this.work.has(job))return;
   const fail=(error:unknown)=>{
    if(this.disposed||!this.work.has(job))return;
    job.error=error instanceof Error?error:Error(String(error));job.reject(job.error);
   };
   try{
-   const compilation=job.compilation=this.compiler.compile({id:definition.lineage?.source??definition.owner,revision:definition.revision,positions:definition.positions,indices:definition.indices,adjacency:definition.lineage?.adjacency,incidence:this.backend==='gpu-csr'?'gpu-csr':undefined,complexMode:this.retention,physical:{lineage:definition.lineage,surface:definition.surface,materialSource:definition.materialSource,construction:definition.construction}});
+   const baked=this.bakedSemantic(definition);
+   if(baked){
+    this.numerics??=new GpuSourceNumerics(this.device,this.sourceWords,this.incidenceCompiler!);
+    job.numeric=this.numerics.register({positions:definition.positions,indices:definition.indices,contactKeys:definition.contactKeys,revision:definition.revision},baked.semantic,job.id,baked.identity);
+    job.numeric.setRequired(job.priority===1_000_000);
+    void job.numeric.result.then(async result=>{
+     if(!this.work.has(job)||this.disposed){this.numerics!.retire(result);return;}
+     await this.installNumeric(job,result,baked.semantic);
+     this.work.delete(job);const byIndex=this.registrations.get(definition.positions);if(byIndex?.get(definition.indices)===job)byIndex.delete(definition.indices);job.resolve();
+    }).catch(fail);
+    return;
+   }
+   const compilation=job.compilation=this.compiler.compile(physicalSourceProgramInput(definition,this.backend,this.retention));
+   // Asset resolution may finish after prepare returned. Preserve that
+   // camera's required/predicted priority before the worker's first slice.
+   if(job.priority!==undefined)compilation.prioritize(job.priority);
    void compilation.result.then(async program=>{
     if(!this.work.has(job)||this.disposed)return;
     if(program)await this.install(job,program);
@@ -299,11 +374,29 @@ export class PhysicalSourceTransport {
   return !!source&&!source.retired&&source.revision===geometry.revision;
  }
  takeCompiled():readonly PhysicalSource[]{return this.compiled.splice(0).filter(source=>!source.retired);}
+ private async installNumeric(registration:Registration,result:NumericSourceReady,semantic:SourceSemanticResidual):Promise<void>{
+  const g=registration.resolvedGeometry??registration.geometry,vertices=g.positions.length/3,positions=new Float32Array(vertices*4);
+  for(let vertex=0;vertex<vertices;vertex++){positions.set(g.positions.subarray(vertex*3,vertex*3+3),vertex*4);positions[vertex*4+3]=1;}
+  let ranges:{positions:SourceStorageRange;normals:SourceStorageRange};
+  try{ranges=allocateStorageRanges({positions:{storage:this.sourcePositions,data:positions},normals:{storage:this.sourceNormals,data:g.normals!}});}
+  catch(error){this.numerics!.retire(result);throw error;}
+  const indicesBinding=result.indices,incidenceBinding=result.binding;
+  if(this.disposed||!this.work.has(registration)){this.sourcePositions.retire(ranges.positions);this.sourceNormals.retire(ranges.normals);this.numerics!.retire(result);return;}
+  const geometry=g,numericRanges={...ranges,indices:result.range,incidence:result.range},positionsBinding=this.sourcePositions.binding(ranges.positions),normalsBinding=this.sourceNormals.binding(ranges.normals);
+  const base={id:geometry.owner,revision:g.revision,positions:positionsBinding.buffer,normals:normalsBinding.buffer,indices:indicesBinding.buffer,incidence:incidenceBinding.buffer,positionsBinding,normalsBinding,indicesBinding,incidenceBinding,ranges:numericRanges,geometry,bounds:registration.bounds,profileSafe:semantic.profileSafe===true,numeric:result,...(semantic.wholeConstruction?{wholeConstruction:semantic.wholeConstruction}:{}),...(semantic.smallParent?{smallParent:semantic.smallParent}:{}),...(semantic.partPrograms?{partAnchorVertices:sourcePartAnchorVertices(semantic.partPrograms,g.indices)}:{})};
+  const resident:PhysicalSource={...base,summary:{schema:'shallot.source-residency-summary.v1',edgeCount:semantic.indexedEdges},analysis:{type:semantic.type,styleWord:semantic.styleWord,foliage:semantic.foliage,organic:semantic.organic,toneRegions:semantic.toneRegions,runProgram:result.runProgram}};
+  let byIndex=this.cache.get(g.positions);if(!byIndex){byIndex=new Map();this.cache.set(g.positions,byIndex);}
+  const previous=byIndex.get(g.indices);if(previous&&!previous.retired)this.retireSource(previous);
+  byIndex.set(g.indices,resident);this.sourceKeys.set(resident,g);this.activeSources.add(resident);this.compiled.push(resident);
+ }
  private async install(registration:Registration,program:CompiledSourceProgram):Promise<void>{
   if(program.complexMode!==this.retention)throw Error('Physical source returned the wrong topology retention');
-  const g=registration.geometry;
+  const g=registration.resolvedGeometry??registration.geometry;
   const physical=program.physical;if(!physical)throw Error('Physical source compiler returned no vertex inputs');
-  const geometry=physical.geometry;
+  // The worker's physical projection computes normals and retains the source
+  // lineage; merge the admitted input fields so a semantic asset cannot vanish
+  // merely because this source took the complete fallback route.
+  const geometry:PhysicalSourceGeometry={...physical.geometry,contactKeys:g.contactKeys,semantic:g.semantic};
   const vertices=allocateStorageRanges({positions:{storage:this.sourcePositions,data:physical.positions},normals:{storage:this.sourceNormals,data:geometry.normals!}});
   let incidence:SourceStorageRange|undefined,indices:SourceStorageRange|undefined,indicesBinding:GPUBufferBinding,incidenceBinding:GPUBufferBinding;
   try{
@@ -335,7 +428,7 @@ export class PhysicalSourceTransport {
   const key=this.sourceKeys.get(source),byIndex=key&&this.cache.get(key.positions);
   if(key&&byIndex?.get(key.indices)===source)byIndex.delete(key.indices);
   this.sourceKeys.delete(source);
-  this.sourcePositions.retire(source.ranges.positions);this.sourceNormals.retire(source.ranges.normals);if(source.ranges.indices)this.sourceWords.retire(source.ranges.indices);this.sourceWords.retire(source.ranges.incidence);
+  this.sourcePositions.retire(source.ranges.positions);this.sourceNormals.retire(source.ranges.normals);if(source.numeric)this.numerics?.retire(source.numeric);else{if(source.ranges.indices)this.sourceWords.retire(source.ranges.indices);this.sourceWords.retire(source.ranges.incidence);}
  }
  private frameSlot(retained:RetainedBatch,source:PhysicalSource,size:number):SourceFrameSlot{
   let slot=retained.slots.find(value=>!value.busy);
@@ -424,7 +517,7 @@ export class PhysicalSourceTransport {
     // An unchanged source at an unchanged posed revision publishes the SAME
     // record: same domain, same `complex` object, same revision.
     if(retained.published?.batch.source.posedRevision!==retained.revision||retained.published.batch.source.visibleInstances!==this.arena.visibility){
-     const data={id:source.id,domain,revision:g.revision,buffer:source.incidence,bufferBinding:source.incidenceBinding,geometry:{positions:source.geometry.positions,indices:source.geometry.indices,normals:source.geometry.normals,revision:g.revision,lineage:source.geometry.lineage,surface:g.surface},...(source.partAnchorVertices?{partAnchorVertices:source.partAnchorVertices}:{})};
+     const data={id:source.id,domain,revision:g.revision,buffer:source.incidence,bufferBinding:source.incidenceBinding,geometry:{...source.geometry,positions:source.geometry.positions,indices:source.geometry.indices,normals:source.geometry.normals,revision:g.revision},...(source.partAnchorVertices?{partAnchorVertices:source.partAnchorVertices}:{})};
      const relation:RegisteredSourceComplex<SourceComplexRetention>=source.complex
       ?{...data,complex:source.complex,analysis:source.analysis}
       :{...data,summary:source.summary,analysis:source.analysis};
@@ -456,7 +549,7 @@ export class PhysicalSourceTransport {
   * runs after roots/bounds are updated but before relations, contacts or runs;
   * the spatial index remains the culler and its `select` traversal supplies
   * the same node membership to the LOD compiler. */
- selectLod(clip:ArrayLike<number>,width:number,height:number,pageWidth:number,pageHeight:number,exterior:boolean,perspective:boolean,held:ReadonlySet<number>=new Set(),cache:ParentGroupCache=new ParentGroupCache(),smallAvailable?:SmallConstructionAvailability,heldSmall:ReadonlySet<string>=new Set()):SourceLodSelection{
+ selectLod(clip:ArrayLike<number>,width:number,height:number,pageWidth:number,pageHeight:number,exterior:boolean,perspective:boolean,held:ReadonlySet<number>=new Set(),cache:ParentGroupCache=new ParentGroupCache(),smallAvailable?:SmallConstructionAvailability,heldSmall:ReadonlySet<string>=new Set(),nativePart?:SourceWholeNativePartAdmission):SourceLodSelection{
   const instances:SourceLodInstance[]=[],parents:SourceLodParent[]=[],profiles=new Map<number,boolean>();
   const toInstance=(entry:SpatialInstance):SourceLodInstance|undefined=>{
    const identity=parsePhysicalProducerOwner(entry.batch.members[entry.instance]??'');if(!identity)return;
@@ -483,11 +576,11 @@ export class PhysicalSourceTransport {
    // at the full parent tier; rejected groups fall back to their members.
    if(certified)parents.push({bounds,instances:members,key});else instances.push(...members);
   },value=>{const member=toInstance(value);if(member)instances.push(member);});
-  return selectSourceLod(instances,clip,width,height,pageWidth,pageHeight,exterior,perspective,parents,held,mesh=>profiles.get(mesh)===true,eid=>eid,cache,false,smallAvailable,heldSmall);
+  return selectSourceLod(instances,clip,width,height,pageWidth,pageHeight,exterior,perspective,parents,held,mesh=>profiles.get(mesh)===true,eid=>eid,cache,false,smallAvailable,heldSmall,nativePart);
  }
  private retireBatch(retained:RetainedBatch):void{for(let i=0;i<retained.range.count;i++)this.spatial.delete(retained.range.base+i);this.arena.retire(retained.range);this.posedVertices.retire(retained.storageRanges.vertices);this.posedAttributes.retire(retained.storageRanges.attributes);this.catalog.retire(retained.storageRanges.metadata);for(const slot of retained.slots)this.retired.push(slot.roots,slot.params);}
  /** Host releases only at the native job's terminal submission fence, or
   * after discarding its encoder. The next live tick is not a release. */
- submitted():void{this.arena.submitted();for(const store of [this.sourcePositions,this.sourceNormals,this.sourceWords,this.posedVertices,this.posedAttributes,this.catalog])store.submitted();for(const slot of this.leasedSlots)slot.busy=false;this.leasedSlots.clear();for(const buffer of this.retired.splice(0)){buffer.destroy();this.buffers.delete(buffer);}}
- dispose():void{this.disposed=true;this.demand=undefined;for(const job of this.work)job.resolve();this.compiler.dispose();this.work.clear();this.compiled.length=0;this.submitted();this.activeSources.clear();this.batches.clear();this.spatial.clear();this.arena.dispose();const stores=[this.sourcePositions,this.sourceNormals,this.sourceWords,this.posedVertices,this.posedAttributes,this.catalog];if(this.incidenceCompiler)void this.incidenceCompiler.dispose().then(()=>{for(const store of stores)store.dispose();});else for(const store of stores)store.dispose();for(const buffer of this.buffers)buffer.destroy();this.buffers.clear();}
+ submitted():void{this.arena.submitted();this.numerics?.submitted();for(const store of [this.sourcePositions,this.sourceNormals,this.sourceWords,this.posedVertices,this.posedAttributes,this.catalog])store.submitted();for(const slot of this.leasedSlots)slot.busy=false;this.leasedSlots.clear();for(const buffer of this.retired.splice(0)){buffer.destroy();this.buffers.delete(buffer);}}
+ dispose():void{this.disposed=true;this.demand=undefined;for(const job of this.work)job.resolve();this.compiler.dispose();this.work.clear();this.compiled.length=0;this.submitted();this.activeSources.clear();this.batches.clear();this.spatial.clear();this.arena.dispose();const stores=[this.sourcePositions,this.sourceNormals,this.sourceWords,this.posedVertices,this.posedAttributes,this.catalog];if(this.incidenceCompiler)void (async()=>{await this.numerics?.dispose();await this.incidenceCompiler!.dispose();for(const store of stores)store.dispose();})();else{void this.numerics?.dispose();for(const store of stores)store.dispose();}for(const buffer of this.buffers)buffer.destroy();this.buffers.clear();}
 }

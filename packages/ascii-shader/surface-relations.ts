@@ -1,9 +1,66 @@
 import {storageBinding,sameStorageBinding,type SourceStorageBinding} from './source-storage.ts';
 import type {MaterialGeometryBatch,MaterialGeometryDraw} from './geometry.ts';
-export type PosedSourceBatch=Pick<MaterialGeometryBatch,'vertices'|'attributes'|'metadata'|'gpuPose'>&{readonly storage?:{readonly identity:object;readonly vertices:GPUBufferBinding;readonly attributes:GPUBufferBinding;readonly metadata:GPUBufferBinding};readonly source:Pick<MaterialGeometryDraw,'vertexCapacity'|'indexBase'|'cullMode'|'instanceCapacity'>&{readonly bounds?:GPUBuffer;readonly visibleInstances?:GPUBuffer;readonly visibleInstanceOffset?:number;readonly visibleInstanceFrontier?:import('./source-instance-arena.ts').SourceInstanceFrontier;readonly posedRevision?:number}};
+export type PosedSourceBatch=Pick<MaterialGeometryBatch,'vertices'|'attributes'|'metadata'|'gpuPose'>&{readonly capacity?:number;readonly storage?:{readonly identity:object;readonly vertices:GPUBufferBinding;readonly attributes:GPUBufferBinding;readonly metadata:GPUBufferBinding};readonly source:Pick<MaterialGeometryDraw,'vertexCapacity'|'indexBase'|'cullMode'|'instanceCapacity'|'ownerAuthority'|'nativeVisibleInstanceFrontier'>&{readonly material?:unknown;readonly bounds?:GPUBuffer;readonly visibleInstances?:GPUBuffer;readonly visibleInstanceOffset?:number;readonly visibleInstanceFrontier?:import('./source-instance-arena.ts').SourceInstanceFrontier;readonly posedRevision?:number}};
+/** The engine's materialType publishes an explicit `vertex` member, including
+ * undefined for its ordinary affine instance transform. A rest-planar mesh
+ * alone is NOT this certificate: skinning, morphs and custom vertex functions
+ * may bend its straight boundary runs. Unknown material owners stay fine. */
+export function sourceMaterialIsAffine(material:unknown):boolean{
+ return typeof material==='object'&&material!==null&&'vertex' in material&&material.vertex===undefined;
+}
 export function posedBatchIdentity(batch:PosedSourceBatch):object{return batch.storage?.identity??batch.vertices;}
+/** The anchor projection dispatch enumerates the immutable camera frontier when
+ * one exists. Otherwise it must cover the live transport slice, not the
+ * producer's reusable instance-table capacity. `batch.capacity` is the number
+ * of posed vertex records exposed by this same-encoder slice; dividing by the
+ * source vertex stride gives the instance range the GPU can actually visit.
+ * The GPU indirect count may be smaller and is still checked by the shader.
+ * The declared capacity is only a ceiling for malformed/legacy batches. */
+export function partAnchorInstanceCount(batch:Pick<PosedSourceBatch,'source'>&Partial<Pick<PosedSourceBatch,'capacity'>>):number{
+ const frontier=batch.source.visibleInstanceFrontier;
+ if(frontier)return frontier.indices.length;
+ // A transport batch is already bounded to the source slice the current
+ // encoder exposes. Never substitute the producer's reusable instance-table
+ // capacity for that bounded extent.
+ const vertexCapacity=batch.source.vertexCapacity,capacity=batch.capacity;
+ const live=capacity!==undefined&&Number.isSafeInteger(capacity)&&capacity>0&&Number.isSafeInteger(vertexCapacity)&&vertexCapacity>0
+  ?Math.max(1,Math.ceil(capacity/vertexCapacity)):undefined;
+ const declared=batch.source.instanceCapacity;
+ return live===undefined?Math.max(1,declared??1):Math.max(1,declared===undefined?live:Math.min(declared,live));
+}
+/** The number of native instance ordinals exposed by this transport slice.
+ * Geometry transport capacity is a vertex-record count; derive the slice
+ * extent from the same vertex stride rather than the renderer's reusable
+ * instance-table capacity or a CPU visibility census. */
+function nativeTransportInstanceCapacity(batch:PosedSourceBatch):number{
+ const vertexCapacity=batch.source.vertexCapacity,capacity=batch.capacity;
+ if(capacity!==undefined&&Number.isSafeInteger(capacity)&&capacity>0&&Number.isSafeInteger(vertexCapacity)&&vertexCapacity>0){
+  return Math.max(1,Math.ceil(capacity/vertexCapacity));
+ }
+ return Math.max(1,batch.source.instanceCapacity??1);
+}
+/** Bytes for the complete owner-keyed anchor table, including its head words,
+ * extent records and projected canonical sample rows. */
+export function partAnchorTableBytes(headSlots:number,recordCapacity:number,canonicalCapacity:number):number{
+ const canonicalBase=2+headSlots+recordCapacity*PART_ANCHOR_RECORD_WORDS;
+ return (canonicalBase+canonicalCapacity*PART_ANCHOR_CANONICAL_WORDS)*4;
+}
+/** Bytes for the prepared canonical native-row arena. The bitset and prefix
+ * are group×row bits/blocks; only `touchedRows` receive edge-ordinal payloads. */
+export function partAnchorRowTableBytes(runCount:number,groupCount:number,rowCount:number,touchedRows:number):number{
+ return sourcePartRowTableLayout(runCount,groupCount,rowCount,touchedRows).bytes;
+}
+/** Reusable row-payload capacity.  The rounded reserve is an allocation
+ * policy, not a drawing quota: callers still report the exact required count
+ * separately, and an over-limit reserve falls back to that exact count. */
+export function partAnchorRowCapacity(required:number,runCount:number,groupCount:number,rowCount:number,maxBytes:number):number{
+ for(const value of [required,runCount,groupCount,rowCount,maxBytes])if(!Number.isSafeInteger(value)||value<0)throw Error('Invalid native row capacity extent');
+ if(required===0)return 0;
+ const rounded=Math.max(required,Math.ceil(required*1.25/256)*256);
+ return sourcePartRowTableLayout(runCount,groupCount,rowCount,rounded).bytes<=maxBytes?rounded:required;
+}
 import {isGpuIndexedResident,type ResidentRelationSource,type ResidentGpuIndexedSource} from './source-cache.ts';
-import type {GpuIndexedRestCellChart} from './gpu-indexed-source.ts';
+import type {GpuIndexedRestCellChart,GpuIndexedCellOccupancy} from './gpu-indexed-source.ts';
 import type {SurfaceField} from './surface-fields.ts';
 import {SurfaceIntersections} from './surface-intersections.ts';
 import {SubmissionExpiry} from './submission-expiry.ts';
@@ -12,8 +69,9 @@ import {sourceResidencyEdgeCount,sourceResidencyVertexCount,sourceResidencyFaceC
 import {compileComputePipelines,prepareComputePipelines,type ComputePipelinePlan} from './gpu-pipeline-preparation.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
 import {FORM_DEPTH_WGSL,FORM_DEPTH_HEADER_ROW,FAR_STRIP_BELOW_ROWS,LOD_TIER_HOLD,NEAR_FROM_ROWS,formDepths} from './form-depths.ts';
-import {EDGE_LEVEL_UNIT,EDGE_LEVEL_DETAIL,EDGE_LEVEL_CHAINED,FACET_CREASE_LEAST_ROWS} from './compiled-construction-topology.ts';
+import {SOURCE_PATH_REVERSED,SOURCE_PATH_PAIR_B,EDGE_LEVEL_UNIT,EDGE_LEVEL_DETAIL,EDGE_LEVEL_CHAINED,FACET_CREASE_LEAST_ROWS,TOPOLOGY_PART_CANONICAL_MAGIC,TOPOLOGY_PART_CANONICAL_VERSION,TOPOLOGY_PART_CANONICAL_HEADER_WORDS,TOPOLOGY_PART_CANONICAL_RECORD_WORDS,TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS,TOPOLOGY_PART_CANONICAL_FLAG_COMPLETE} from './compiled-construction-topology.ts';
 import {FAR_AGGREGATE_MEMBER_WGSL} from './gpu-source-far-forms.ts';
+import {sourcePartRowTableLayout} from './gpu-playback-program.ts';
 export interface SurfaceGraphView {
   readonly clipFromWorld:Float32Array;readonly eye:readonly number[];
   readonly direction:readonly number[];readonly perspective:boolean;
@@ -61,7 +119,7 @@ export function contactPatchRows(points:readonly ContactPatchPoint[]):Uint32Arra
 }
 export const SURFACE_RELATIONS_SHADER=/* wgsl */`
 ${VOXEL_REST_CORNER_WGSL}
-struct Params {clip:mat4x4f,eye:vec4f,direction:vec4f,capacity:u32,domain:u32,vertexCapacity:u32,indexBase:u32,selection:vec4u,owners:array<vec4u,4>}
+struct Params {clip:mat4x4f,eye:vec4f,direction:vec4f,capacity:u32,domain:u32,vertexCapacity:u32,indexBase:u32,selection:vec4u,owners:array<vec4u,4>,frontier:vec4u}
 ${RELATION_RECORD_WGSL}
 struct Status {count:atomic<u32>,overflow:atomic<u32>,nonmanifold:atomic<u32>,reserved:atomic<u32>}
 @group(0) @binding(0) var<uniform> params:Params;
@@ -72,7 +130,7 @@ struct Status {count:atomic<u32>,overflow:atomic<u32>,nonmanifold:atomic<u32>,re
 @group(0) @binding(5) var<storage,read_write> relations:array<Relation>;
 @group(0) @binding(6) var<storage,read_write> status:Status;
 @group(0) @binding(7) var<storage,read_write> dispatch:array<u32>;
-@group(0) @binding(8) var<storage,read> selectedOwners:array<u32>;
+@group(0) @binding(8) var<storage,read_write> selectedOwners:array<u32>;
 @group(0) @binding(10) var formDepths:texture_2d<u32>;
 @group(0) @binding(11) var<uniform> detailWorldFromClip:mat4x4f;
 ${FORM_DEPTH_WGSL}
@@ -94,9 +152,32 @@ ${FAR_AGGREGATE_MEMBER_WGSL}
 // canonical vertex port, no distance and no drawn pose.
 @group(0) @binding(15) var contactPatches:texture_2d<u32>;
 
-// owner-keyed extent table (heads + records).
-@group(0) @binding(16) var<storage,read> partAnchorVertices:array<u32>;
+// parts, 6
+
+// table after those vertices; its projected samples are written into the
+// trailing region of the same owner table by the existing posed dispatch.
+// The owner table record is the exact directory link for each projected path;
+// no consumer is allowed to recover a path by a global sample range or page
+// proximity.
+@group(0) @binding(16) var<storage,read_write> partAnchorVertices:array<u32>;
 @group(0) @binding(17) var<storage,read_write> partAnchorTable:array<atomic<u32>>;
+// [records, canonical rows, overflow, candidates] for the live projected
+// frontier. This is separate from relation Status because both producers run
+// in the same compute pass and must not alias their counters.
+@group(0) @binding(19) var<storage,read_write> partAnchorAlloc:array<atomic<u32>>;
+
+// (restCellChart.occupancy, 'voxel-column-occupancy-v1'): W=ceil(Y/32) words
+// per column, cell (x,y,z) is word (z*X+x)*W+(y>>5), bit (y&31), set = SOLID.
+// Bound (and owners[3].y bit 32 set) only when the producer published it.
+@group(0) @binding(18) var<storage,read> cellOccupancy:array<u32>;
+// Native standard-renderer ownership is a same-submit read-only pair: the
+// packed EID/producer-row list and the exact indirect record that gives its
+// live count and firstInstance. The whole indirect buffer is bound because a
+// storage binding offset need not satisfy the device's storage alignment;
+// frontier.x carries the exact record word offset. MAIN never guesses an
+// owner from geometry.
+@group(0) @binding(20) var<storage,read> nativeMembers:array<vec4u>;
+@group(0) @binding(21) var<storage,read> nativeIndirect:array<u32>;
 fn contactCorner(owner:vec2u,port:u32)->u32{
  if(port>=0x80000000u){return 0u;}
  let n=textureLoad(contactPatches,vec2i(0,0),0).x;if(n==0u){return 0u;}
@@ -138,11 +219,55 @@ fn selected(instance:u32)->bool{
  while(lo<hi){let mid=(lo+hi)/2u;let value=selectedOwners[mid];if(value<owner){lo=mid+1u;}else{hi=mid;}}
  return lo<params.selection.x&&selectedOwners[lo]==owner;
 }
-fn selectedCount()->u32{if(params.owners[3].x!=0u){return params.owners[2].z;}return native[1];}
+// The source frontier is compacted after final form-depth parent admission.
+// Direct sources use the whole filtered list; batched tensor chunks carry an
+// ORDINAL start in frontier.y. The list pointer remains owners[2].w, and the
+// compacted count remains at frontier.x; never compare the absolute list
+// address with that count.
+fn selectedCount()->u32{
+ if(params.owners[3].x==0u){return native[1];}
+ if(params.frontier.w==0u){return params.owners[2].z;}
+ let total=selectedOwners[select(params.frontier.x,0u,nativeFrontier())];let ordinalStart=params.frontier.y;
+ if(ordinalStart>=total){return 0u;}return min(params.owners[2].z,total-ordinalStart);
+}
 fn selectedInstance(ordinal:u32)->u32{if(params.owners[3].x!=0u){return selectedOwners[params.owners[2].w+ordinal];}return ordinal;}
+fn nativeFrontier()->bool{return (params.owners[3].y&64u)!=0u;}
+fn nativeProducerRows()->bool{return (params.owners[3].y&128u)!=0u;}
+fn nativeIndirectBase()->u32{return select(0u,params.frontier.x,nativeFrontier());}
+fn nativeIndirectWord(index:u32)->u32{return nativeIndirect[nativeIndirectBase()+index];}
+fn nativeOwnerAt(ordinal:u32)->vec2u{
+ let member=nativeMembers[nativeIndirectWord(4u)+ordinal];let producer=nativeProducerRows();
+ return vec2u(params.domain|select(0u,0x80000000u,producer),select(member.x,member.y,producer));
+}
+fn frontierOwner(instance:u32)->vec2u{
+ if(nativeFrontier()){return nativeOwnerAt(native[4u]-nativeIndirectWord(4u)+instance);}
+ let first=halfedge(native[2]-params.indexBase).x;let at=slot(first,instance);let entity=positions[at].w;let producer=entity==0xffffffffu;
+ return vec2u(params.domain|select(0u,0x80000000u,producer),select(entity,attributes[at].w,producer));
+}
+// Final representation admission. The producer's frontier is the only list
+// mutated: a parent-selected owner removes its replaced child instance, while
+// an unadmitted/unknown owner remains in the incumbent list. The count lives
+// in the existing word immediately before the list, so all later consumers
+// (contacts, anchors, lines and interior tensors) read the same result.
+@compute @workgroup_size(1) fn admitFrontier(){
+ if(params.owners[3].x==0u||params.frontier.w==0u||native[0u]<3u||native[2u]<params.indexBase){return;}
+ let countAt=select(params.frontier.x,0u,nativeFrontier());let listAt=params.owners[2].w;var write=0u;
+ if(nativeFrontier()){
+  let first=nativeIndirectWord(4u);let slice=native[4u];let total=nativeIndirectWord(1u);
+  if(slice<first||slice-first>total){return;}
+  let available=min(total-(slice-first),params.owners[2].z);
+  for(var read=0u;read<available;read++){if(!formParentSelected(nativeOwnerAt(slice-first+read))){selectedOwners[listAt+write]=read;write++;}}
+ }else{
+  let count=selectedOwners[countAt];
+  for(var read=0u;read<count;read++){
+   let instance=selectedOwners[listAt+read];if(!formParentSelected(frontierOwner(instance))){selectedOwners[listAt+write]=instance;write++;}
+  }
+ }
+ selectedOwners[countAt]=write;
+}
 fn edge(id:u32)->vec4u{return sourceEdge(id);}
 const NO_CONTACT=0xffffffffu;
-fn posedContacts()->bool{return (params.owners[3].y&1u)!=0u&&native[1]==1u&&native[2]==params.indexBase&&native[5]==0u;}
+fn posedContacts()->bool{return (params.owners[3].y&1u)!=0u&&selectedCount()!=0u&&native[1]==1u&&native[2]==params.indexBase&&native[5]==0u;}
 fn contactSlots()->u32{return params.owners[2].y;}
 fn cellParts()->bool{return (params.owners[3].y&2u)!=0u;}
 fn partBase()->u32{return contactSlots()*3u+sourceEdgeCount();}
@@ -181,7 +306,9 @@ fn voxelRuleBlock(cell:f32)->f32{
 // 0 = none: a fresh home, a scratch home, no chart).
 fn heldChunkBlock()->f32{
  if(!persistentHome()||!chartOn()){return 0.0;}
- let w=atomicLoad(&contactWork[homeBase()+2u]);if(w==0u||w>5u){return 0.0;}
+
+ // not in a level home: during the vote the voted home is not yet known.
+ let w=atomicLoad(&contactWork[params.owners[0].w+3u]);if(w==0u||w>5u){return 0.0;}
  return exp2(f32(5u-w));
 }
 // A cluster corner's port: never a source vertex id (bit 30), equal for every
@@ -253,15 +380,149 @@ fn faceBase()->u32{return chunkBlockWord()+4u;}
 fn cornerBase()->u32{return faceBase()+chartCells()*19u;}
 fn scratchHome()->u32{return cornerBase()+chartCornerCount()*4u;}
 fn persistentHome()->bool{return params.owners[0].w!=0u;}
-fn homeBase()->u32{return select(scratchHome(),params.owners[0].w,persistentHome());}
+
+// level homes from params.owners[0].w: blocks 2, 4, 8, 16, each 4 header words
+// + 4 words per cluster of its OWN level (the host's chartLevelClusters /
+// chartHomeWords). Each home keeps its own [capacity, token, block] header, so
+// a level transition lands on that level's retained home and its resident
+// records instead of rebuilding a single shared home. The base home's header
+// word 3 holds the HELD level (the previous vote), read during the vote.
+fn levelClusters(b:u32)->u32{let n=(partExtent()+vec3u(b-1u))/b;return n.x*n.y*n.z;}
+fn levelHomeOffset(b:u32)->u32{var off=0u;var level=2u;loop{if(level>=b||level>16u){break;}off+=4u+levelClusters(level)*4u;level*=2u;}return off;}
+// Generation-owned per-part frontier membership follows the source packet's
+// complete canonical table. Each word is a certified level-node index (high
+// bit set) or zero for mixed/border/seam/unsupported content. The host appends
+// exactly partCount*5 words (four level nodes plus one frame marker), so this
+// address never depends on a partial draw
+// or a camera-sized home.
+fn partFrontierCacheBase()->u32{return arrayLength(&partAnchorVertices)-partAnchorVertices[1u]*5u;}
+fn partFrontierCacheAt(part:u32,ordinal:u32)->u32{return partFrontierCacheBase()+part*5u+ordinal;}
+fn partFrontierMarkerAt(part:u32)->u32{return partFrontierCacheBase()+part*5u+4u;}
+// The voted cluster level (vote code w: 4 = block 2 ... 1 = block 16); 0 for
+// no cluster level this frame (no vote, block 1, an overflow is not read here).
+fn votedClusterBlock()->u32{let w=atomicLoad(&contactWork[chunkBlockWord()]);if(w<1u||w>4u){return 0u;}return 1u<<(5u-w);}
+fn homeBase()->u32{
+ if(!persistentHome()){return scratchHome();}
+ let b=votedClusterBlock();return params.owners[0].w+select(0u,levelHomeOffset(b),b>=2u);
+}
 fn clusterCapacity()->u32{if(persistentHome()){return atomicLoad(&contactWork[homeBase()]);}return chartClusters();}
+
+// block b, not the voted one, so all four level homes are built (occupancy,
+// classification, compiled records) when content changes, each kept or rebuilt
+// under its own header. The scratch home (no persistent home) holds only the
+// voted level. levelOrdinal: block 2 -> 0 ... 16 -> 3.
+fn levelOrdinal(b:u32)->u32{return countTrailingZeros(b)-1u;}
+fn levelHomeBase(b:u32)->u32{if(!persistentHome()){return scratchHome();}return params.owners[0].w+levelHomeOffset(b);}
+fn levelCapacity(b:u32)->u32{if(persistentHome()){return atomicLoad(&contactWork[levelHomeBase(b)]);}return chartClusters();}
+// A home exists for block b this draw: every level of a persistent source, only
+// the voted level of a scratch home.
+fn levelHomed(b:u32)->bool{return b>=2u&&b<=16u&&(persistentHome()||b==votedClusterBlock());}
+// Per-draw retained decision of each level home (voxelHome), in scratch words
+// after the selected list (cleared by contactClear every draw).
+fn levelRetainedWord(b:u32)->u32{return selectedListBase()+2u+selectedListCapacity()+levelOrdinal(b);}
+fn levelRetained(b:u32)->bool{return levelHomed(b)&&atomicLoad(&contactWork[levelRetainedWord(b)])!=0u;}
+// The block code a level home stores (the vote code of that block: 2 -> 4 ... 16 -> 1).
+fn levelCode(b:u32)->u32{return 5u-countTrailingZeros(b);}
+
+// implementation"; CPU reference voxel-ancestor-cache.ts selectVoxelFrontier).
+// Replaces the chunk-wide finest vote for a persistent source (every level is
+
+// for a block (voxelBlock, its region's held level as hysteresis); chartQuad
+// records the FINEST ask of every node containing it, one atomicMax per level
+// into per-draw scratch words (cleared by contactClear). A node's requirement
+// only gets finer as the node grows, so the levels L whose node admits L form
+// a down-set: a cell's level is unique, the LARGEST such L, and cluster C is
+// SELECTED at L exactly when its node admits L and its parent does not admit
+// 2L. A node therefore takes its complete record XOR its children, with two
+// word reads and no per-frame topology walk, and only quads inside a node can
+// refine it: a near region never promotes unrelated far regions. A scratch
+// home keeps the single voted level.
+fn frontierOn()->bool{return persistentHome()&&chartOn();}
+fn requirementBase()->u32{return selectedListBase()+2u+selectedListCapacity()+4u;}
+fn requirementCount()->u32{return select(0u,levelClusters(2u)+levelClusters(4u)+levelClusters(8u)+levelClusters(16u),chartOn());}
+fn requirementWord(b:u32,index:u32)->u32{var off=0u;var l=2u;loop{if(l>=b){break;}off+=levelClusters(l);l*=2u;}return requirementBase()+off+index;}
+fn levelIndex(c:vec3i,b:u32)->u32{let n=vec3i((partExtent()+vec3u(b-1u))/b);return u32((c.z*n.y+c.y)*n.x+c.x);}
+fn levelCoord(index:u32,b:u32)->vec3i{let n=(partExtent()+vec3u(b-1u))/b;return vec3i(i32(index%n.x),i32((index/n.x)%n.y),i32(index/(n.x*n.y)));}
+fn levelInside(c:vec3i,b:u32)->bool{let n=vec3i((partExtent()+vec3u(b-1u))/b);return all(c>=vec3i(0))&&all(c<n);}
+// The finest block any quad of node C (level b) asked for this draw; 32 = no ask.
+// A forced node (unknown/cave/border in range, stamped at build) reads as
+// requiring block 0: finer than every ask, so clusterAtLevel/cellLevel
+// recurse exactly like the CPU reference (voxel-ancestor-cache.ts).
+fn nodeRequired(c:vec3i,b:u32)->u32{
+ if(!levelInside(c,b)){return 32u;}
+ if(clusterForced(c,b)){return 0u;}
+ let w=atomicLoad(&contactWork[requirementWord(b,levelIndex(c,b))]);if(w==0u||w>5u){return 32u;}return 1u<<(5u-w);
+}
+fn clusterAtLevel(c:vec3i,b:u32)->bool{
+ if(!frontierOn()){return b>=2u&&b==votedClusterBlock();}
+ if(b<2u||b>16u||!levelInside(c,b)||nodeRequired(c,b)<b){return false;}
+ return b==16u||nodeRequired(c/2,2u*b)<2u*b;
+}
+// Node C admits its own level b (the first half of clusterAtLevel; no parent read).
+fn clusterOwnLevel(c:vec3i,b:u32)->bool{
+ if(!frontierOn()){return b>=2u&&b==votedClusterBlock();}
+ return b>=2u&&b<=16u&&levelInside(c,b)&&nodeRequired(c,b)>=b;
+}
+// The frontier's level at an in-grid cell (0 = fine: block 1).
+fn cellLevel(cell:vec3i)->u32{
+ if(!frontierOn()){return select(0u,votedClusterBlock(),votedClusterBlock()>=2u);}
+ for(var b=16u;b>=2u;b/=2u){if(nodeRequired(cell/i32(b),b)>=b){return b;}}
+ return 0u;
+}
+// Region seams: a declared cluster belongs to the level only when the frontier
+// selected it there; an undeclared (empty) cluster is level-agnostic, so a
+// silhouette against empty space still coarsens. Declared clusters of two
+// different levels meeting at a seam keep their fine segments on BOTH sides
+// and emit no coarse edge there: never drawn twice, never joined by fiction.
+fn clusterLevelOk(c:vec3i,b:u32)->bool{return !clusterDeclared(c,b)||clusterAtLevel(c,b);}
+// HOLD per region: the level-2 cluster word 3 bits 28..30 keep the level code
+// its cells took last draw (1 block 16 ... 4 block 2, 5 fine; 0 none), written
+// by chartCertify after the frontier is complete and read by the next draw's
+// asks (LOD_TIER_HOLD band, voxelBlock). Cleared with a rebuilt home.
+const CLUSTER_HELD_SHIFT=28u;const CLUSTER_HELD_MASK=0x70000000u;
+fn heldCellBlock(cell:vec3i)->f32{
+ if(!frontierOn()){return heldChunkBlock();}
+ let s=clusterSlot(cell/2,2u);if(s==NONE_CLUSTER){return 0.0;}
+ let code=(atomicLoad(&contactWork[s+3u])&CLUSTER_HELD_MASK)>>CLUSTER_HELD_SHIFT;if(code==0u||code>5u){return 0.0;}
+ return exp2(f32(5u-code));
+}
+
+// that stores holds, one thread per cluster index across all levels, so on a
+// home-rebuild draw an ancestor's bit may not be stamped yet (no ordering
+// between workgroups). Reading it there gave a schedule-dependent, too-coarse
+// hold. Store a hold only when every ancestor node cellLevel reads is stamped
+// (EDGES_DONE and FORCED are set by one atomicOr); otherwise clear it (code 0 =
+// no hold: the next draw's ask has no hysteresis, then holds resume).
+fn storeHeld(s:u32,c2:vec3i){
+ for(var b=4u;b<=16u;b*=2u){let a=clusterSlot((c2*2)/i32(b),b);if(a!=NONE_CLUSTER&&(atomicLoad(&contactWork[a+3u])&CLUSTER_EDGES_DONE)==0u){atomicAnd(&contactWork[s+3u],~CLUSTER_HELD_MASK);return;}}
+ let level=cellLevel(c2*2);let code=select(5u,levelCode(level),level>=2u);
+ atomicAnd(&contactWork[s+3u],~CLUSTER_HELD_MASK);atomicOr(&contactWork[s+3u],code<<CLUSTER_HELD_SHIFT);
+}
+// The level a fine segment va-vb would be represented at: the frontier level
+// of the first DECLARED cell whose closure holds its midpoint (0: none / fine).
+fn segmentLevel(va:u32,vb:u32)->u32{
+ if(!chartOn()||atomicLoad(&contactWork[overflowWord()])!=0u){return 0u;}
+ let la=storedLattice(va);let lb=storedLattice(vb);if(la.w==0||lb.w==0){return 0u;}
+ let cells=segmentClusters(la.xyz,lb.xyz,1u);
+ for(var k=0;k<8;k++){if(cells[k].w!=0&&faceMask(cells[k].xyz)!=0u){return cellLevel(cells[k].xyz);}}
+ return 0u;
+}
 
 // (x | y<<9 | z<<18, plus 1; 0 = none), written by chartCorners (which binds
 // the cell codes) so the boundary stage reads lattice points WITHOUT binding
 // partCodes (it stays within 8 storage buffers).
 fn chartVertices()->u32{return select(0u,sourceFaceCount()*2u,chartOn());}
 fn latticeBase()->u32{return scratchHome()+4u+chartClusters()*4u;}
-fn columnEnd()->u32{return latticeBase()+chartVertices();}
+
+// the rest of the scratch): [count, overflow, then chartClusters() cluster
+// indices]. chartSelect appends a cluster exactly once, when its own atomicOr
+// first sets CLUSTER_SELECTED; chartEmitAt visits only these clusters instead
+// of scanning every cluster of the selected level. An index past the list's
+// capacity (a persistent home larger than this frame's chart) sets overflow,
+// and chartEmitAt then falls back to the full scan: never a dropped cluster.
+fn selectedListBase()->u32{return latticeBase()+chartVertices();}
+fn selectedListCapacity()->u32{return chartClusters();}
+fn columnEnd()->u32{return selectedListBase()+select(0u,2u+selectedListCapacity()+4u+requirementCount(),chartOn());}
 fn storedLattice(v:u32)->vec4i{
  if(v>=chartVertices()){return vec4i(0);}let w=atomicLoad(&contactWork[latticeBase()+v]);if(w==0u){return vec4i(0);}
  let p=w-1u;return vec4i(i32(p&511u),i32((p>>9u)&511u),i32((p>>18u)&511u),1);
@@ -341,7 +602,7 @@ fn runState(m:vec3i,g:u32)->u32{
  return CLUSTER_UNKNOWN;
 }
 fn classifyCluster(index:u32,b:u32){
- let n=(partExtent()+vec3u(b-1u))/b;let s=homeBase()+4u+index*4u;if(atomicLoad(&contactWork[s])!=0u){return;}
+ let n=(partExtent()+vec3u(b-1u))/b;let s=levelHomeBase(b)+4u+index*4u;if(atomicLoad(&contactWork[s])!=0u){return;}
  let m=vec3i(i32(index%n.x),i32((index/n.x)%n.y),i32(index/(n.x*n.y)))*i32(b);
  var state=0u;
  for(var g=0u;g<6u;g++){let r=runState(m,g);if(r==CLUSTER_UNKNOWN){continue;}if(state==0u){state=r;}else if(state!=r){state=CLUSTER_UNKNOWN;break;}}
@@ -350,10 +611,13 @@ fn classifyCluster(index:u32,b:u32){
 // In chartCorners (after voxelBin completed every face mask and claim), by
 // every vertex thread over the clusters; skipped when the home is retained.
 fn chartClassifyAt(t:u32,threads:u32){
- if(!chartSurface()||atomicLoad(&contactWork[retainedWord()])!=0u){return;}
- let block=voxelChunkBlock();if(block<=1.0){return;}let b=u32(block);
- let n=(partExtent()+vec3u(b-1u))/b;let total=min(n.x*n.y*n.z,clusterCapacity());
- for(var i=t;i<total;i+=max(threads,1u)){classifyCluster(i,b);}
+ if(!chartSurface()){return;}
+
+ for(var b=2u;b<=16u;b*=2u){
+  if(!levelHomed(b)||levelRetained(b)){continue;}
+  let total=min(levelClusters(b),levelCapacity(b));
+  for(var i=t;i<total;i+=max(threads,1u)){classifyCluster(i,b);}
+ }
 }
 fn cellOf(v:u32)->vec3u{let c=partCodes[v];return vec3u(c&255u,(c>>8u)&255u,(c>>16u)&255u);}
 fn faceOf(v:u32)->u32{return (partCodes[v]>>24u)&255u;}
@@ -371,18 +635,31 @@ fn chartQuad(id:u32){
  let at=faceBase()+cellIndex(c)*19u;
  atomicStore(&contactWork[at+f*3u],bitcast<u32>(centre.x));atomicStore(&contactWork[at+f*3u+1u],bitcast<u32>(centre.y));atomicStore(&contactWork[at+f*3u+2u],bitcast<u32>(centre.z));
  atomicOr(&contactWork[at+18u],1u<<f);
- if(atomicLoad(&contactWork[retainedWord()])!=0u){return;}
- let block=voxelChunkBlock();if(block<=1.0){return;}
- let slot=clusterSlot(vec3i(c/vec3u(u32(block))),u32(block));if(slot==NONE_CLUSTER){chartUnsupported();return;}
- atomicMax(&contactWork[slot],~cellIndex(c));atomicMax(&contactWork[slot+1u],~sourceEdgeCorner(halfedge(edge(id).x).z,0u));
+
+ // retained (a persistent source prebuilds all four, whatever this frame's
+ // vote; a scratch home builds only the voted level).
+
+ // region's last level) refines every node that contains it, every draw.
+ if(frontierOn()){
+  let s=distance(position(v,0u),position(v+1u,0u));
+  let ask=voxelBlock(centre,s,heldCellBlock(vec3i(c)));let w=5u-u32(round(log2(ask)));
+  for(var b=2u;b<=16u;b*=2u){atomicMax(&contactWork[requirementWord(b,levelIndex(vec3i(c/vec3u(b)),b))],w);}
+ }
+ let corner=~sourceEdgeCorner(halfedge(edge(id).x).z,0u);
+ for(var b=2u;b<=16u;b*=2u){
+  if(!levelHomed(b)||levelRetained(b)){continue;}
+  let slot=clusterSlot(vec3i(c/vec3u(b)),b);if(slot==NONE_CLUSTER){chartUnsupported();return;}
+  atomicMax(&contactWork[slot],~cellIndex(c));atomicMax(&contactWork[slot+1u],corner);
+ }
 }
 const NONE_CLUSTER=0xffffffffu;
 // The words of cluster C at block b (dense over the cluster grid), or NONE
 // outside the grid (open space above or below a chunk is simply empty).
 fn clusterSlot(c:vec3i,b:u32)->u32{
+ if(!levelHomed(b)){return NONE_CLUSTER;}
  let n=vec3i((partExtent()+vec3u(b-1u))/b);if(any(c<vec3i(0))||any(c>=n)){return NONE_CLUSTER;}
- let index=u32((c.z*n.y+c.y)*n.x+c.x);if(index>=clusterCapacity()){return NONE_CLUSTER;}
- return homeBase()+4u+index*4u;
+ let index=u32((c.z*n.y+c.y)*n.x+c.x);if(index>=levelCapacity(b)){return NONE_CLUSTER;}
+ return levelHomeBase(b)+4u+index*4u;
 }
 fn clusterState(c:vec3i,b:u32)->u32{
  let s=clusterSlot(c,b);if(s==NONE_CLUSTER){return select(CLUSTER_AIR,CLUSTER_UNKNOWN,chartSurface());}
@@ -419,6 +696,112 @@ fn clusterCertified(c:vec3i,b:u32)->bool{
 }
 // On the chunk's x/z border: the chunk meets its neighbour there.
 fn clusterBorder(c:vec3i,b:u32)->bool{let e=vec3i(partExtent());let n=i32(b);return c.x<=0||c.z<=0||(c.x+1)*n>=e.x||(c.z+1)*n>=e.z;}
+
+// A node whose box holds an unknown, cave or x/z-border cell must recurse
+// (complete fine children), exactly the CPU reference selectVoxelFrontier.
+// The decision is stamped once per home build into the cluster's own word 3
+// bit 7 (CLUSTER_FORCED) by compileClusterEdges, alongside the resident edge
+// topology under the same EDGES_DONE guard, so it is kept with a retained
+// home for free: voxelHome's retained reset only clears word 2 bits 0..3,
+// and every other word-3 writer touches only its own bits (classification
+// 0..1, near certificates 4..5, edge records 8..27, hold code 28..30).
+// nodeRequired reads a forced node as requiring block 0 (finer than every
+// ask), which keeps the frontier's down-set: clusterAtLevel/cellLevel then
+// recurse exactly like the reference, and the region seams keep fine
+// segments on both sides (clusterLevelOk) with no other change.
+const CLUSTER_FORCED=128u;
+const CAVE_WALK_BOUND=128u;
+fn clusterForced(c:vec3i,b:u32)->bool{let s=clusterSlot(c,b);return s!=NONE_CLUSTER&&(atomicLoad(&contactWork[s+3u])&CLUSTER_FORCED)!=0u;}
+
+// quads, so faceMask==0 is not air: a solid interior has no face. Air is
+// certified ONLY by the producer's occupancy; without it nothing is air here
+// and clusterForceBox keeps complete fine children instead.
+fn occupancyOn()->bool{return (params.owners[3].y&32u)!=0u;}
+fn cellSolid(c:vec3i)->bool{
+ let e=partExtent();let w=(e.y+31u)/32u;let y=u32(c.y);
+ return ((cellOccupancy[(u32(c.z)*e.x+u32(c.x))*w+y/32u]>>(y%32u))&1u)!=0u;
+}
+// The cell's column above it holds no solid cell up to the top of the grid
+// (open to the exterior; exact for any occupancy, every cell for a heightfield).
+fn cellOpenAbove(c:vec3i)->bool{
+ let e=partExtent();let w=(e.y+31u)/32u;let base=(u32(c.z)*e.x+u32(c.x))*w;let y=u32(c.y)+1u;
+ if(y>=e.y){return true;}
+ for(var k=y/32u;k<w;k++){var bits=cellOccupancy[base+k];if(k==y/32u){bits&=~((1u<<(y%32u))-1u);}if(bits!=0u){return false;}}
+ return true;
+}
+// A cell the cave walk may step on: in the grid and certified AIR.
+fn caveWalkable(cell:vec3i)->bool{
+ if(any(cell<vec3i(0))||any(cell>=vec3i(partExtent()))){return false;}
+ if(!occupancyOn()){return false;}
+ return !cellSolid(cell);
+}
+// Whether start's air reaches the open exterior: bounded depth-first walk
+// over walkable cells in fixed neighbor order (+x,-x,+y,-y,+z,-z), with a
+// linear visited set. Reaching outside the grid is open (true); exhausting
+// the component, overflowing the visit arrays, or hitting CAVE_WALK_BOUND
+// visits without leaving is a cave (false). The bound only ever over-forces
+// (safe): a truly enclosed region is correctly a cave at any bound, since
+// only boundary contact returns open. Terminates: every iteration pops one
+// entry or returns, visits are capped, arrays are never overrun.
+fn caveWalkOpen(start:vec3i)->bool{
+ var seen:array<u32,CAVE_WALK_BOUND>;var count=0u;
+ var stack:array<vec3i,CAVE_WALK_BOUND>;var top=0u;
+ stack[0]=start;top=1u;seen[0]=cellIndex(vec3u(start));count=1u;
+ var visits=0u;
+ let e=vec3i(partExtent());
+ loop{
+  if(top==0u){return false;}
+  if(visits>=CAVE_WALK_BOUND){return false;}
+  visits+=1u;top-=1u;let c=stack[top];
+  for(var k=0u;k<6u;k++){
+   let n=c+vec3i(select(0,1,k==0u)-select(0,1,k==1u),select(0,1,k==2u)-select(0,1,k==3u),select(0,1,k==4u)-select(0,1,k==5u));
+   if(any(n<vec3i(0))||any(n>=e)){return true;}
+   if(!caveWalkable(n)){continue;}
+   let li=cellIndex(vec3u(n));
+   var known=false;for(var i=0u;i<count;i++){if(seen[i]==li){known=true;break;}}
+   if(known){continue;}
+   if(count>=CAVE_WALK_BOUND||top>=CAVE_WALK_BOUND){return false;}
+   seen[count]=li;count+=1u;
+   stack[top]=n;top+=1u;
+  }
+ }
+ return false;// Unreachable: the loop only exits via return. Naga requires it.
+}
+// Whether node (c,b) must recurse: its box holds an unknown, cave or
+// x/z-border cell. Border is exact arithmetic (clusterBorder already tests
+// box/strip intersection); unknown reads the node's own state plus every
+// level-2 state in range (both rebuild-stable here); caves walk from
+// non-boundary walkable cells adjacent to non-walkable ones (every enclosed
+// component has one: its maximum-x cell's +x neighbour is in-grid and
+// non-member, hence non-walkable). Reads only rebuild-stable words.
+fn clusterForceBox(c:vec3i,b:u32)->bool{
+ if(clusterBorder(c,b)){return true;}
+ if(clusterState(c,b)==CLUSTER_UNKNOWN){return true;}
+ let e=vec3i(partExtent());let n=i32(b);
+ let lo=c*n;let hi=min(lo+vec3i(n),e);
+ for(var qz=lo.z/2;qz*2<hi.z;qz++){for(var qy=lo.y/2;qy*2<hi.y;qy++){for(var qx=lo.x/2;qx*2<hi.x;qx++){
+  if(clusterState(vec3i(qx,qy,qz),2u)==CLUSTER_UNKNOWN){return true;}
+ }}}
+
+ if(!occupancyOn()){return true;}
+ for(var z=lo.z;z<hi.z;z++){for(var y=lo.y;y<hi.y;y++){for(var x=lo.x;x<hi.x;x++){
+  let cell=vec3i(x,y,z);
+  if(x==0||y==0||z==0||x+1>=e.x||y+1>=e.y||z+1>=e.z){continue;}
+  if(!caveWalkable(cell)){continue;}
+  // Open to the top of the grid: exterior air, no walk (exact).
+  if(cellOpenAbove(cell)){continue;}
+  var edge=false;
+  if(!caveWalkable(cell+vec3i(1,0,0))){edge=true;}
+  if(!caveWalkable(cell+vec3i(-1,0,0))){edge=true;}
+  if(!caveWalkable(cell+vec3i(0,1,0))){edge=true;}
+  if(!caveWalkable(cell+vec3i(0,-1,0))){edge=true;}
+  if(!caveWalkable(cell+vec3i(0,0,1))){edge=true;}
+  if(!caveWalkable(cell+vec3i(0,0,-1))){edge=true;}
+  if(!edge){continue;}
+  if(!caveWalkOpen(cell)){return true;}
+ }}}
+ return false;
+}
 struct Frame {ok:bool,centre:vec3f,axis:mat3x3f}
 fn cellFrame(c:vec3u)->Frame{if(chartSurface()){return surfaceFrame(c);}return closedFrame(c);}
 fn closedFrame(c:vec3u)->Frame{
@@ -487,30 +870,80 @@ fn patternEdges(p:vec4<bool>,a:vec3f,b:vec3f,U:vec3f,V:vec3f,t:Triangle,address:
  if(n==3u){for(var i=0u;i<4u;i++){if(p[i]){continue;}let s=signs[i];columnEdge(a,b,U*s.x,V*s.y,t,address,block,face);}}
 }
 fn unit(k:u32)->vec3i{return vec3i(select(0,1,k==0u),select(0,1,k==1u),select(0,1,k==2u));}
+
+// implementation"). Cluster C owns 12 candidate coarse edges: along each chart
+// axis k (0..2) its four corner edges (corner 0..3), edge e = k*4 + corner.
+// The four clusters around edge e:
+fn edgeClusters(c:vec3i,e:u32)->array<vec3i,4>{
+ let k=e/4u;let corner=e%4u;let ei=unit((k+1u)%3u);let ej=unit((k+2u)%3u);let oi=i32(corner&1u);let oj=i32(corner>>1u);
+ return array<vec3i,4>(c+ei*(oi-1)+ej*(oj-1),c+ei*oi+ej*(oj-1),c+ei*(oi-1)+ej*oj,c+ei*oi+ej*oj);
+}
+// The TOPOLOGY of edge e of cluster C at block b, independent of camera,
+// pose, lighting and this draw's selection: the 4-bit occupancy pattern
+// (bit i = cluster i of edgeClusters occupied) when the edge produces a coarse
+// edge (one occupied, three occupied, or a diagonal pair), every surrounding
+// cluster is known (surface semantics) and none lies on the chunk's x/z border;
+// else 0 (flat, unknown or border: never a coarse edge). It reads only the
+// generation-owned occupancy/classification words, so it is compiled ONCE per
+// home build and retained with the home (generation token + block).
+fn clusterEdgePattern(c:vec3i,b:u32,e:u32)->u32{
+ let q=edgeClusters(c,e);
+ if(chartSurface()&&!(clusterKnown(q[0],b)&&clusterKnown(q[1],b)&&clusterKnown(q[2],b)&&clusterKnown(q[3],b))){return 0u;}
+ if(clusterBorder(q[0],b)||clusterBorder(q[1],b)||clusterBorder(q[2],b)||clusterBorder(q[3],b)){return 0u;}
+ let p=u32(clusterOccupied(q[0],b))|(u32(clusterOccupied(q[1],b))<<1u)|(u32(clusterOccupied(q[2],b))<<2u)|(u32(clusterOccupied(q[3],b))<<3u);
+ let n=countOneBits(p);
+ return select(0u,p,n==1u||n==3u||(n==2u&&(p==9u||p==6u)));
+}
+// Resident storage, in the cluster's EXISTING home words (no layout or binding
+// change): word 2 bits 4..31 hold edges 0..6 (4 bits each; voxelHome resets
+// only bits 0..3 of word 2 on a retained home), word 3 bits 8..27 hold edges
+// 7..11, and word 3 bit 6 (CLUSTER_EDGES_DONE) marks the cluster compiled.
+// Both words are zeroed with the rest of the home on a rebuild, so a content
+// (generation) or level change recompiles every cluster of that home.
+const CLUSTER_EDGES_DONE=64u;
+fn compileClusterEdges(s:u32,c:vec3i,b:u32){
+ if((atomicLoad(&contactWork[s+3u])&CLUSTER_EDGES_DONE)!=0u){return;}
+ var lo=0u;var hi=0u;
+ for(var e=0u;e<12u;e++){let p=clusterEdgePattern(c,b,e);if(e<7u){lo|=p<<(4u+4u*e);}else{hi|=p<<(8u+4u*(e-7u));}}
+ var forced=0u;if(frontierOn()&&clusterForceBox(c,b)){forced=CLUSTER_FORCED;}
+ atomicOr(&contactWork[s+2u],lo);atomicOr(&contactWork[s+3u],hi|CLUSTER_EDGES_DONE|forced);
+}
+fn residentEdgePattern(s:u32,e:u32)->u32{
+ if(e<7u){return (atomicLoad(&contactWork[s+2u])>>(4u+4u*e))&15u;}
+ return (atomicLoad(&contactWork[s+3u])>>(8u+4u*(e-7u)))&15u;
+}
 // Cluster C's share of the coarse edges: along each chart axis k, the four
-// edges of C, each only where C is the first occupied of its four surrounding
-// clusters and all four are interior. Ends at the posed lattice points, faces
-// turned by the posed axes of C's least cell.
+// edges of C, each only where C is the first selected declared cluster of its
+
+// is a coarse edge. Ends at the posed lattice points, faces turned by the
+// posed axes of C's least cell: projection, pose, facing and this draw's
+// selection stay dynamic; the occupancy/known/border topology is READ from the
+
+// compiled record (no chartCertify this build) computes the same rule live.
 fn clusterEmit(c:vec3i,b:u32,t:Triangle,address:u32,face:u32){
  let rep=latticeCell(c*i32(b)+vec3i(i32(b)),b);let frame=cellFrame(vec3u(max(rep.xyz,vec3i(0))));if(rep.w==0||!frame.ok){return;}
- let block=f32(b);
+ let block=f32(b);let s=clusterSlot(c,b);
+ let resident=s!=NONE_CLUSTER&&(atomicLoad(&contactWork[s+3u])&CLUSTER_EDGES_DONE)!=0u;
  for(var k=0u;k<3u;k++){
   let i=(k+1u)%3u;let j=(k+2u)%3u;let ek=unit(k);let ei=unit(i);let ej=unit(j);
   let U=normalize(frame.axis[i]);let V=normalize(frame.axis[j]);
   for(var corner=0u;corner<4u;corner++){
-   let oi=i32(corner&1u);let oj=i32(corner>>1u);
-   let q0=c+ei*(oi-1)+ej*(oj-1);let q1=c+ei*oi+ej*(oj-1);let q2=c+ei*(oi-1)+ej*oj;let q3=c+ei*oi+ej*oj;
-   let p=vec4<bool>(clusterOccupied(q0,b),clusterOccupied(q1,b),clusterOccupied(q2,b),clusterOccupied(q3,b));
-   if(chartSurface()&&!(clusterKnown(q0,b)&&clusterKnown(q1,b)&&clusterKnown(q2,b)&&clusterKnown(q3,b))){continue;}
+   let e=k*4u+corner;
+   var pattern=0u;if(resident){pattern=residentEdgePattern(s,e);}else{pattern=clusterEdgePattern(c,b,e);}
+   if(pattern==0u){continue;}
+   let q=edgeClusters(c,e);
+
+   // its clusters belong to level b; otherwise its fine segments stay fine.
+   if(!(clusterLevelOk(q[0],b)&&clusterLevelOk(q[1],b)&&clusterLevelOk(q[2],b)&&clusterLevelOk(q[3],b))){continue;}
 
    // a coarse edge beside an owned (suppressed) fine edge is always drawn,
    // exactly once, by a cluster that runs clusterEmit (only selected ones do).
-   let d=vec4<bool>(clusterEmits(q0,b),clusterEmits(q1,b),clusterEmits(q2,b),clusterEmits(q3,b));
+   let d=vec4<bool>(clusterEmits(q[0],b),clusterEmits(q[1],b),clusterEmits(q[2],b),clusterEmits(q[3],b));
    var owner=4u;if(d.w){owner=3u;}if(d.z){owner=2u;}if(d.y){owner=1u;}if(d.x){owner=0u;}
    if(owner!=3u-corner){continue;}
-   if(clusterBorder(q0,b)||clusterBorder(q1,b)||clusterBorder(q2,b)||clusterBorder(q3,b)){continue;}
+   let oi=i32(corner&1u);let oj=i32(corner>>1u);
    let o=(c+ei*oi+ej*oj)*i32(b);let a=latticePoint(o,b);let z=latticePoint(o+ek*i32(b),b);if(a.w==0.0||z.w==0.0){continue;}
-   patternEdges(p,a.xyz,z.xyz,U,V,t,address,block,face);
+   patternEdges(vec4<bool>((pattern&1u)!=0u,(pattern&2u)!=0u,(pattern&4u)!=0u,(pattern&8u)!=0u),a.xyz,z.xyz,U,V,t,address,block,face);
   }
  }
 }
@@ -533,10 +966,12 @@ fn segmentClusters(a:vec3i,b:vec3i,block:u32)->array<vec4i,8>{
 // segment va-vb (two posed vertices) when the chunk is at a cluster level and
 // every cluster around it is interior.
 fn chartSegmentCoarse(va:u32,vb:u32)->bool{
- let block=voxelChunkBlock();if(block<=1.0){return false;}let b=u32(block);
- let la=storedLattice(va);let lb=storedLattice(vb);if(la.w==0||lb.w==0){return false;}
+
+ // vote; every cluster around it must belong to that level (clusterLevelOk).
+ let b=segmentLevel(va,vb);if(b<2u){return false;}
+ let la=storedLattice(va);let lb=storedLattice(vb);
  let around=segmentClusters(la.xyz,lb.xyz,b);
- for(var k=0;k<8;k++){if(around[k].w!=0&&(clusterBorder(around[k].xyz,b)||!clusterCertified(around[k].xyz,b))){return false;}}
+ for(var k=0;k<8;k++){if(around[k].w!=0&&(clusterBorder(around[k].xyz,b)||!clusterCertified(around[k].xyz,b)||!clusterLevelOk(around[k].xyz,b))){return false;}}
  return true;
 }
 fn voxelEdgeCoarse(id:u32)->bool{if(!chartOn()){return false;}let h=halfedge(edge(id).x);return chartSegmentCoarse(h.x,h.y);}
@@ -546,11 +981,19 @@ fn voxelVertexCoarse(v:u32)->bool{
 }
 // contactEdges: an owned fine edge marks every declared cluster around it.
 fn chartSelect(id:u32){
- let b=u32(voxelChunkBlock());let h=halfedge(edge(id).x);
+ let h=halfedge(edge(id).x);let b=segmentLevel(h.x,h.y);if(b<2u){return;}
  let around=segmentClusters(storedLattice(h.x).xyz,storedLattice(h.y).xyz,b);
  for(var k=0;k<8;k++){
   if(around[k].w==0){continue;}let s=clusterSlot(around[k].xyz,b);
-  if(s!=NONE_CLUSTER&&atomicLoad(&contactWork[s])!=0u){atomicOr(&contactWork[s+2u],CLUSTER_SELECTED);}
+  if(s!=NONE_CLUSTER&&atomicLoad(&contactWork[s])!=0u){
+   let old=atomicOr(&contactWork[s+2u],CLUSTER_SELECTED);
+   if((old&CLUSTER_SELECTED)==0u){
+
+    let index=(s-levelHomeBase(b)-4u)/4u;let list=selectedListBase();let at=atomicAdd(&contactWork[list],1u);
+
+    if(at<selectedListCapacity()){atomicStore(&contactWork[list+2u+at],index|(levelOrdinal(b)<<28u));}else{atomicStore(&contactWork[list+1u],1u);}
+   }
+  }
  }
 }
 // boundaryAt's voxel branch. True: the chart owns this fine edge; it produces
@@ -561,11 +1004,22 @@ fn voxelColumnEdge(id:u32,t:Triangle,face:u32)->bool{return voxelEdgeCoarse(id);
 // gates) - never re-expanded from the fine edges that own it.
 fn chartEmitAt(id:u32,threads:u32){
  if(!posedContacts()||!chartOn()||selectedCount()==0u){return;}
- let block=voxelChunkBlock();if(block<=1.0){return;}let b=u32(block);
- let n=(partExtent()+vec3u(b-1u))/b;let total=min(n.x*n.y*n.z,clusterCapacity());
+ if(atomicLoad(&contactWork[overflowWord()])!=0u){return;}
  let instance=selectedInstance(0u);if(!selected(instance)){return;}
- for(var i=id;i<total;i+=max(threads,1u)){
-  let s=homeBase()+4u+i*4u;if(atomicLoad(&contactWork[s])==0u||(atomicLoad(&contactWork[s+2u])&CLUSTER_SELECTED)==0u){continue;}
+
+ // ITS frontier level), not every cluster; after a list overflow, the full
+ // scan covers every homed level in turn.
+ let list=selectedListBase();let overflow=atomicLoad(&contactWork[list+1u])!=0u;
+ let listed=min(atomicLoad(&contactWork[list]),selectedListCapacity());
+ var scan=0u;for(var l=2u;l<=16u;l*=2u){if(levelHomed(l)){scan+=levelClusters(l);}}
+ let span=select(listed,scan,overflow);
+ for(var j=id;j<span;j+=max(threads,1u)){
+  var b=0u;var i=0u;
+  if(!overflow){let entry=atomicLoad(&contactWork[list+2u+j]);b=2u<<(entry>>28u);i=entry&0x0fffffffu;}
+  else{var r=j;for(var l=2u;l<=16u;l*=2u){if(!levelHomed(l)){continue;}let m=levelClusters(l);if(r<m){b=l;i=r;break;}r-=m;}}
+  if(!levelHomed(b)){continue;}
+  let n=(partExtent()+vec3u(b-1u))/b;if(i>=min(n.x*n.y*n.z,levelCapacity(b))){continue;}
+  let s=levelHomeBase(b)+4u+i*4u;if(atomicLoad(&contactWork[s])==0u||(atomicLoad(&contactWork[s+2u])&CLUSTER_SELECTED)==0u){continue;}
   let inc=~atomicLoad(&contactWork[s+1u]);if(!inDraw(inc)||!validFace(inc)){continue;}
   let v=halfedge(inc).x;let owner=edgeOwner(v,instance);
   if(ownerUnseen(v,instance)||ownerMerged(owner)||outlineLevel(owner)){continue;}
@@ -640,48 +1094,205 @@ fn posedEdgeSlot(id:u32)->u32{
 }
 fn boundaryPort(v:u32,instance:u32)->u32{if(posedContacts()){return posedVertexPort(v);}return vertexPort(v,instance);}
 
-// Projection, insertion and clearing are separate dispatches. A record is
-// published (its index exchanged into a bucket head) only after a previous
-// dispatch wrote its complete key and extent; readers walk the bucket list and
-// compare the full key (domain|producer, native owner, part ordinal). The
+// Projection and clearing are separate dispatches. A record is published (its
+// index exchanged into a bucket head) only after the same projection invocation
+// wrote its complete key and extent; readers walk the bucket list and compare
+// the full key (domain|producer, native owner, instance, part ordinal). The
 // owner is edgeOwner of the anchor vertex, exactly a run's (identity.y,
-// identity.z); never the selected-instance ordinal. Visibility is never read.
-const PART_ANCHOR_RECORD_WORDS=8u;
+// identity.z); instance is retained separately in the record and row.
+// Visibility is never read.
+const PART_ANCHOR_RECORD_WORDS=16u;
+const PART_ANCHOR_CANONICAL_WORDS=8u;
+const PART_ANCHOR_CANONICAL_HEADER_WORDS=10u;
 fn partAnchorHeads()->u32{return atomicLoad(&partAnchorTable[0]);}
 fn partAnchorRecord(record:u32)->u32{return atomicLoad(&partAnchorTable[1])+record*PART_ANCHOR_RECORD_WORDS;}
-fn partAnchorBucket(owner:vec2u,part:u32)->u32{
- var h=(owner.x*0x9e3779b9u)^(owner.y*0x85ebca6bu)^(part*0xc2b2ae35u);h=(h^(h>>16u))*0x7feb352du;h=h^(h>>15u);
+fn partAnchorBucket(owner:vec2u,part:u32,instance:u32)->u32{
+ var h=(owner.x*0x9e3779b9u)^(owner.y*0x85ebca6bu)^(part*0xc2b2ae35u)^(instance*0x27d4eb2fu);h=(h^(h>>16u))*0x7feb352du;h=h^(h>>15u);
  return 2u+(h&(partAnchorHeads()-1u));
 }
-fn partAnchorCount()->u32{return max(partAnchorVertices[1],0u)*max(selectedCount(),1u);}
+// An empty same-pose selection is a real empty result.  Do not manufacture one
+// anchor instance merely because the source has a declared part bank.
+// The native indirect count/frontier is the live candidate extent. The packet's
+// first word is the source edge count used only by the anchor-only chart reader
+// above; it is not a capacity or a source-instance census.
+fn partAnchorCount()->u32{return partAnchorVertices[1]*selectedCount();}
+// Batch frontier preparation can carry the registered part count in the
+// frontier packet; the anchor consumer still uses partAnchorCount() and its
+// declared source bank.
+fn prepareAnchorParts()->u32{return partAnchorVertices[1];}
+fn partAnchorCanonicalBase(parts:u32)->u32{
+ // All source packet kinds share this directory boundary. The old fallback
+ // to table length let legacy records overwrite canonical payload storage.
+ return partAnchorVertices[0u];
+}
+fn partAnchorTableCapacity(parts:u32)->u32{
+ let total=arrayLength(&partAnchorTable);let base=atomicLoad(&partAnchorTable[1]);let canonical=partAnchorCanonicalBase(parts);
+ return select(0u,(canonical-base)/PART_ANCHOR_RECORD_WORDS,base<canonical&&canonical<=total);
+}
+fn partAnchorReserve(parts:u32,samples:u32)->vec2u{
+ let record=atomicAdd(&partAnchorAlloc[0],1u);
+ let canonical=atomicAdd(&partAnchorAlloc[1],samples);
+ let recordCapacity=partAnchorTableCapacity(parts);let canonicalBase=partAnchorCanonicalBase(parts);
+ let recordAt=partAnchorRecord(record);let canonicalAt=canonicalBase+canonical*PART_ANCHOR_CANONICAL_WORDS;
+ // Legacy six-anchor packets have no canonical payload: their canonical
+ // base is the table end. A prior source may already have advanced the shared
+ // sample cursor, but that cannot exhaust an empty range or reject its record.
+ if(record>=recordCapacity||(samples>0u&&canonicalAt+samples*PART_ANCHOR_CANONICAL_WORDS>arrayLength(&partAnchorTable))){
+  atomicStore(&partAnchorAlloc[2],1u);return vec2u(0xffffffffu,0xffffffffu);
+ }
+ atomicAdd(&partAnchorAlloc[3],1u);return vec2u(recordAt,canonicalAt);
+}
+fn partAnchorInvalidate(at:u32,instance:u32){
+ atomicStore(&partAnchorTable[at+2u],0u);atomicStore(&partAnchorTable[at+3u],0u);
+ atomicStore(&partAnchorTable[at+8u],0u);atomicStore(&partAnchorTable[at+9u],0u);atomicStore(&partAnchorTable[at+10u],0u);atomicStore(&partAnchorTable[at+11u],0u);
+ atomicStore(&partAnchorTable[at+12u],instance);atomicStore(&partAnchorTable[at+13u],0u);atomicStore(&partAnchorTable[at+14u],0u);atomicStore(&partAnchorTable[at+15u],0u);
+}
+fn partAnchorCanonicalAt(parts:u32)->u32{return 2u+parts*6u;}
+fn partAnchorCanonicalReady(parts:u32)->bool{
+ let at=partAnchorCanonicalAt(parts);return at+PART_ANCHOR_CANONICAL_HEADER_WORDS<=arrayLength(&partAnchorVertices)&&
+  partAnchorVertices[at]==${TOPOLOGY_PART_CANONICAL_MAGIC}u&&partAnchorVertices[at+1u]==${TOPOLOGY_PART_CANONICAL_VERSION}u&&
+  partAnchorVertices[at+2u]>=at+PART_ANCHOR_CANONICAL_HEADER_WORDS&&partAnchorVertices[at+3u]==parts&&
+  partAnchorVertices[at+4u]>=partAnchorVertices[at+2u]+parts*${TOPOLOGY_PART_CANONICAL_RECORD_WORDS}u&&
+  partAnchorVertices[at+5u]%${TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS}u==0u&&
+  partAnchorVertices[at+6u]==${TOPOLOGY_PART_CANONICAL_RECORD_WORDS}u&&partAnchorVertices[at+7u]==${TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS}u&&
+  partAnchorVertices[0u]>0u&&partAnchorVertices[at+9u]>0u&&
+  partAnchorVertices[at+2u]+parts*${TOPOLOGY_PART_CANONICAL_RECORD_WORDS}u<=arrayLength(&partAnchorVertices)&&
+  partAnchorVertices[at+4u]+partAnchorVertices[at+5u]<=arrayLength(&partAnchorVertices);
+}
+// Build the source-owned cache only when the generation-owned homes are being
+// rebuilt. A canonical part is admitted at a level only when every complete
+// source segment's exact lattice-cell closure is in one interior node. The
+// source endpoint/cell table is the producer's original topology; no native
+// draw count, projected bounds, or six-anchor approximation participates.
+fn partFrontierCacheBuild(part:u32){
+ let parts=partAnchorVertices[1u];
+ for(var ordinal=0u;ordinal<4u;ordinal++){partAnchorVertices[partFrontierCacheAt(part,ordinal)]=0u;}
+ // Packet lifetime is distinct from the geometry home's lifetime. A newly
+ // registered packet starts at zero even when that home is retained. Mark
+ // complete inspection, including unsupported content, separately from the
+ // current camera's ownership bit so that case is built once, not never.
+ partAnchorVertices[partFrontierMarkerAt(part)]=0x40000000u;
+ if(!persistentHome()||!chartOn()||chartSurface()||!cornersCertified()||!partAnchorCanonicalReady(parts)||part>=parts){return;}
+ let metadata=partAnchorCanonicalAt(parts);let record=metadata+PART_ANCHOR_CANONICAL_HEADER_WORDS+part*${TOPOLOGY_PART_CANONICAL_RECORD_WORDS}u;
+ let flags=partAnchorVertices[record+3u];let sampleCount=partAnchorVertices[record+5u];
+ if((flags&${TOPOLOGY_PART_CANONICAL_FLAG_COMPLETE}u)==0u||sampleCount==0u){return;}
+ var nodes:array<vec3i,4>;var valid:array<bool,4>;var seen:array<bool,4>;
+ for(var ordinal=0u;ordinal<4u;ordinal++){nodes[ordinal]=vec3i(0);valid[ordinal]=true;seen[ordinal]=false;}
+ let sampleAt=partAnchorVertices[record+4u];
+ for(var sample=0u;sample<sampleCount;sample++){
+  let at=sampleAt+sample*${TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS}u;let a=partAnchorVertices[at];let b=partAnchorVertices[at+1u];
+  if(a>=arrayLength(&partCodes)||b>=arrayLength(&partCodes)){for(var ordinal=0u;ordinal<4u;ordinal++){valid[ordinal]=false;}break;}
+  let ca=cellOf(a);let cb=cellOf(b);if(any(ca>=partExtent())||any(cb>=partExtent())||faceOf(a)>5u||faceOf(b)>5u||faceMask(vec3i(ca))==0u||faceMask(vec3i(cb))==0u){for(var ordinal=0u;ordinal<4u;ordinal++){valid[ordinal]=false;}break;}
+  let la=voxelRestLatticeCorner(ca,faceOf(a),a%4u);let lb=voxelRestLatticeCorner(cb,faceOf(b),b%4u);let around=segmentClusters(la,lb,1u);
+  for(var ordinal=0u;ordinal<4u;ordinal++){
+   if(!valid[ordinal]){continue;}let block=2u<<ordinal;var nodeSet=seen[ordinal];var node=nodes[ordinal];
+   for(var k=0u;k<8u;k++){
+    if(around[k].w==0){continue;}let c=around[k].xyz;let candidate=c/i32(block);
+    if(any(c<vec3i(0))||any(c>=vec3i(partExtent()))||!levelInside(candidate,block)||clusterBorder(candidate,block)){valid[ordinal]=false;break;}
+    if(!nodeSet){node=candidate;nodeSet=true;}else if(any(node!=candidate)){valid[ordinal]=false;break;}
+   }
+   if(valid[ordinal]){nodes[ordinal]=node;seen[ordinal]=nodeSet;if(!nodeSet){valid[ordinal]=false;}}
+  }
+ }
+ for(var ordinal=0u;ordinal<4u;ordinal++){
+  if(valid[ordinal]&&seen[ordinal]){let block=2u<<ordinal;let slot=clusterSlot(nodes[ordinal],block);valid[ordinal]=slot!=NONE_CLUSTER&&clusterDeclared(nodes[ordinal],block)&&clusterCertified(nodes[ordinal],block);}
+  if(valid[ordinal]){partAnchorVertices[partFrontierCacheAt(part,ordinal)]=0x80000000u|levelIndex(nodes[ordinal],2u<<ordinal);}
+ }
+}
+fn partFrontierMarker(part:u32){
+ let parts=partAnchorVertices[1u];if(part>=parts||!partAnchorCanonicalReady(parts)){return;}
+ var owned=false;
+ if(persistentHome()&&frontierOn()&&!chartSurface()&&cornersCertified()){
+  for(var ordinal=0u;ordinal<4u;ordinal++){
+   let cached=partAnchorVertices[partFrontierCacheAt(part,ordinal)];if((cached&0x80000000u)==0u){continue;}
+   let block=2u<<ordinal;let index=cached&0x7fffffffu;if(index>=levelClusters(block)){continue;}
+   let node=levelCoord(index,block);let slot=clusterSlot(node,block);
+   if(slot!=NONE_CLUSTER&&clusterAtLevel(node,block)&&clusterCertified(node,block)){owned=true;break;}
+  }
+ }
+ let built=partAnchorVertices[partFrontierMarkerAt(part)]&0x40000000u;
+ partAnchorVertices[partFrontierMarkerAt(part)]=built|select(0u,0x80000000u,owned);
+}
+// The post-certification contactVertices stage writes one current-frame marker
+// into the reserved source packet word. The anchor entry reads only that
+// marker, so it needs no contact/home binding and performs no sample walk.
+fn partAnchorCachedFrontierOwned(parts:u32,part:u32)->bool{
+ if(!chartOn()||!persistentHome()||chartSurface()||!cornersCertified()||!partAnchorCanonicalReady(parts)||part>=parts){return false;}
+ return (partAnchorVertices[partFrontierMarkerAt(part)]&0x80000000u)!=0u;
+}
+fn partAnchorCanonicalSample(parts:u32,part:u32,index:u32,destinationBase:u32,instance:u32)->u32{
+ let metadata=partAnchorCanonicalAt(parts);let record=metadata+PART_ANCHOR_CANONICAL_HEADER_WORDS+part*${TOPOLOGY_PART_CANONICAL_RECORD_WORDS}u;
+ let sourceAt=partAnchorVertices[record+4u]+index*${TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS}u;
+ let destination=destinationBase+index*PART_ANCHOR_CANONICAL_WORDS;
+ if(destination+PART_ANCHOR_CANONICAL_WORDS>arrayLength(&partAnchorTable)){return destination;}
+ let a=partAnchorVertices[sourceAt];let b=partAnchorVertices[sourceAt+1u];let t=bitcast<f32>(partAnchorVertices[sourceAt+2u]);
+ let ca=params.clip*vec4f(mix(position(a,instance),position(b,instance),clamp(t,0.0,1.0)),1.0);
+ // Keep homogeneous clip data, not only page x/y.  The consumer can recover
+ // perspective phase through z/w and the exact source u remains independent
+ // of near-plane clipping; a clipped row is marked invalid, never re-anchored.
+ atomicStore(&partAnchorTable[destination],bitcast<u32>(ca.x));atomicStore(&partAnchorTable[destination+1u],bitcast<u32>(ca.y));
+ atomicStore(&partAnchorTable[destination+2u],bitcast<u32>(ca.z));atomicStore(&partAnchorTable[destination+3u],bitcast<u32>(ca.w));
+ atomicStore(&partAnchorTable[destination+4u],partAnchorVertices[sourceAt+3u]);atomicStore(&partAnchorTable[destination+5u],a);
+ atomicStore(&partAnchorTable[destination+6u],b);atomicStore(&partAnchorTable[destination+7u],partAnchorVertices[sourceAt+2u]);
+ // Owner, instance, feature, context and flags are already held ONCE in
+ // this sample range's directory record. The consumer checks that exact
+ // directory before reading any sample. Clip.w supplies the validity bit.
+ return destination;
+}
 // Projection: each thread writes ONLY its own record.
 @compute @workgroup_size(64) fn partAnchors(@builtin(global_invocation_id) gid:vec3u){partAnchorAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn partAnchorAt(id:u32){
  let parts=partAnchorVertices[1];if(parts==0u||id>=partAnchorCount()){return;}
- let part=id%parts;let instance=selectedInstance(id/parts);let at=partAnchorRecord(partAnchorVertices[0]+id);
- var lo=vec2f(3.402823e38);var hi=vec2f(-3.402823e38);var found=false;var owner=vec2u(0u);var owned=false;
+ let ordinal=id/parts;let part=id%parts;let instance=selectedInstance(ordinal);
+ var lo=vec2f(3.402823e38);var hi=vec2f(-3.402823e38);var found=false;var owner=vec2u(0u);var ownerVertex=0xffffffffu;var owned=false;
  for(var k=0u;k<6u;k++){
   let v=partAnchorVertices[2u+part*6u+k];if(v==0xffffffffu||v>=params.vertexCapacity){continue;}
-  if(!owned){owner=edgeOwner(v,instance);owned=true;}
+  if(!owned){owner=edgeOwner(v,instance);ownerVertex=v;owned=true;}
   let c=params.clip*vec4f(position(v,instance),1.0);if(!(c.w>0.00001)){continue;}
   let ndc=c.xy/c.w;lo=min(lo,ndc);hi=max(hi,ndc);found=true;
  }
+ // Do not reserve a table record until this candidate has passed the same
+ // owner/selection/merge/clip predicates that decide whether it contributes
+ // to the current camera frontier. Selection is keyed by the exact owner of
+ // this part's anchor, avoiding the first-mesh-vertex/source-incidence read
+ // that the general relation path needs. The source packet remains complete;
+ // only live projected parts consume the bounded owner table.
+ if(!owned||!found||ownerVertex==0xffffffffu){return;}
+ if(params.selection.z!=0u&&selectedOwners[params.owners[3].z+instance]==0u){return;}
+ if(params.selection.z==0u&&params.selection.y!=0u&&owner.y!=0xffffffffu){
+  var selectedLo=0u;var selectedHi=params.selection.x;
+  loop{if(selectedLo>=selectedHi){break;}let mid=(selectedLo+selectedHi)/2u;let value=selectedOwners[mid];if(value<owner.y){selectedLo=mid+1u;}else{selectedHi=mid;}}
+  if(selectedLo>=params.selection.x||selectedOwners[selectedLo]!=owner.y){return;}
+ }
+ if(ownerUnseen(ownerVertex,instance)||ownerMerged(owner)){return;}
+ // The source-owned cache was built once with complete canonical source
+ // segments. A selected certified ancestor suppresses only the exact part it
+ // covers; every unsupported/mixed/seam part keeps this incumbent fine path.
+ if(partAnchorCachedFrontierOwned(parts,part)){return;}
+ let metadata=partAnchorCanonicalAt(parts);let canonical=partAnchorCanonicalReady(parts);
+ var sourceRecord=0u;var sampleCount=0u;
+ if(canonical){sourceRecord=metadata+PART_ANCHOR_CANONICAL_HEADER_WORDS+part*${TOPOLOGY_PART_CANONICAL_RECORD_WORDS}u;sampleCount=partAnchorVertices[sourceRecord+5u];}
+ let allocation=partAnchorReserve(parts,sampleCount);if(allocation.x==0xffffffffu){return;}
+ let at=allocation.x;let destinationBase=allocation.y;
  atomicStore(&partAnchorTable[at],owner.x);atomicStore(&partAnchorTable[at+1u],owner.y);atomicStore(&partAnchorTable[at+2u],select(0u,part+1u,owned&&found));
  atomicStore(&partAnchorTable[at+4u],bitcast<u32>(lo.x));atomicStore(&partAnchorTable[at+5u],bitcast<u32>(lo.y));
  atomicStore(&partAnchorTable[at+6u],bitcast<u32>(hi.x));atomicStore(&partAnchorTable[at+7u],bitcast<u32>(hi.y));
-}
-// Insertion (a later dispatch): link each complete record once per frame.
-@compute @workgroup_size(64) fn partAnchorInsert(@builtin(global_invocation_id) gid:vec3u){partAnchorInsertAt(gid.x+gid.y*params.owners[3].w*64u);}
-fn partAnchorInsertAt(id:u32){
- if(partAnchorVertices[1]==0u||id>=partAnchorCount()||partAnchorHeads()==0u){return;}
- let record=partAnchorVertices[0]+id;let at=partAnchorRecord(record);let part=atomicLoad(&partAnchorTable[at+2u]);if(part==0u){return;}
- var held=atomicLoad(&partAnchorTable[at+3u]);
- loop{if(held!=0u){return;}let claim=atomicCompareExchangeWeak(&partAnchorTable[at+3u],0u,0x80000000u);held=claim.old_value;if(claim.exchanged){break;}}
- let bucket=partAnchorBucket(vec2u(atomicLoad(&partAnchorTable[at]),atomicLoad(&partAnchorTable[at+1u])),part);
- let next=atomicExchange(&partAnchorTable[bucket],record+1u);atomicStore(&partAnchorTable[at+3u],0x80000000u|next);
+ if(canonical){
+  atomicStore(&partAnchorTable[at+8u],select(0u,destinationBase, sampleCount>0u));
+  atomicStore(&partAnchorTable[at+9u],sampleCount);
+  atomicStore(&partAnchorTable[at+10u],PART_ANCHOR_CANONICAL_WORDS);
+  atomicStore(&partAnchorTable[at+11u],partAnchorVertices[sourceRecord+3u]);
+  atomicStore(&partAnchorTable[at+12u],instance);atomicStore(&partAnchorTable[at+13u],partAnchorVertices[sourceRecord+1u]);
+  atomicStore(&partAnchorTable[at+14u],partAnchorVertices[sourceRecord]);atomicStore(&partAnchorTable[at+15u],sourceRecord);
+  for(var sample=0u;sample<sampleCount;sample++){partAnchorCanonicalSample(parts,part,sample,destinationBase,instance);}
+ }else{
+  atomicStore(&partAnchorTable[at+8u],0u);atomicStore(&partAnchorTable[at+9u],0u);atomicStore(&partAnchorTable[at+10u],0u);atomicStore(&partAnchorTable[at+11u],0u);
+  atomicStore(&partAnchorTable[at+12u],instance);atomicStore(&partAnchorTable[at+13u],0u);atomicStore(&partAnchorTable[at+14u],0u);atomicStore(&partAnchorTable[at+15u],0u);
+ }
+ let bucket=partAnchorBucket(owner,part,instance);let record=(at-atomicLoad(&partAnchorTable[1]))/PART_ANCHOR_RECORD_WORDS;let next=atomicExchange(&partAnchorTable[bucket],record+1u);atomicStore(&partAnchorTable[at+3u],0x80000000u|next);
 }
 // Stale invalidation: zero every head and link word once per frame before the
-// first insertion (a record of a source not drawn this frame is unreachable).
+// first projection (a record of a source not drawn this frame is unreachable).
 @compute @workgroup_size(64) fn partAnchorClear(@builtin(global_invocation_id) gid:vec3u){partAnchorClearAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn partAnchorClearAt(id:u32){
  let heads=partAnchorHeads();let total=arrayLength(&partAnchorTable);
@@ -732,13 +1343,32 @@ fn chartCornerAt(v:u32){
 // POSE certificate: every draw (voxelHome resets it in a retained home).
 @compute @workgroup_size(64) fn chartCertify(@builtin(global_invocation_id) gid:vec3u){chartCertifyAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn chartCertifyAt(i:u32){
- if(!posedContacts()||native[0]==0u||!chartOn()||!chartSurface()){return;}
- let block=voxelChunkBlock();if(block<=1.0){return;}let b=u32(block);
- let n=(partExtent()+vec3u(b-1u))/b;if(i>=min(n.x*n.y*n.z,clusterCapacity())){return;}
- let s=homeBase()+4u+i*4u;let c=vec3i(i32(i%n.x),i32((i/n.x)%n.y),i32(i/(n.x*n.y)));
- if((atomicLoad(&contactWork[s+3u])&CLUSTER_NEAR_DONE)==0u){atomicOr(&contactWork[s+3u],CLUSTER_NEAR_DONE|select(0u,CLUSTER_NEAR_KNOWN,nearKnown(c,b)));}
- let w=atomicLoad(&contactWork[s]);
- if(w!=0u){let k=~w;let e=partExtent();let ok=cellFrame(vec3u(k%e.x,(k/e.x)%e.y,k/(e.x*e.y))).ok;atomicOr(&contactWork[s+2u],CLUSTER_FRAME_DONE|select(0u,CLUSTER_FRAME_OK,ok));}
+ if(!posedContacts()||native[0]==0u||!chartOn()){return;}
+
+ // level once per home build (closed and surface charts alike), after
+ // voxelBin/chartCorners completed occupancy and classification; a retained
+ // level keeps it (CLUSTER_EDGES_DONE). Level 2 has the most clusters, so the
+ // dispatch over chart.clusters covers every level's index range.
+ for(var lb=2u;lb<=16u;lb*=2u){
+  if(!levelHomed(lb)){continue;}
+  let ln=(partExtent()+vec3u(lb-1u))/lb;if(i>=min(ln.x*ln.y*ln.z,levelCapacity(lb))){continue;}
+  let s=levelHomeBase(lb)+4u+i*4u;let c=vec3i(i32(i%ln.x),i32((i/ln.x)%ln.y),i32(i/(ln.x*ln.y)));
+  compileClusterEdges(s,c,lb);
+
+  if(lb==2u&&frontierOn()){storeHeld(s,c);}
+  if(!chartSurface()){continue;}
+  // TOPOLOGY certificate (any cluster a segment of this level may read; kept with the home).
+  if((atomicLoad(&contactWork[s+3u])&CLUSTER_NEAR_DONE)==0u){atomicOr(&contactWork[s+3u],CLUSTER_NEAR_DONE|select(0u,CLUSTER_NEAR_KNOWN,nearKnown(c,lb)));}
+  // POSE certificate: declared clusters whose OWN node admits this level, a
+
+  // the parent's FORCED bit, which another thread of this same pass stamps,
+  // so on a home-rebuild draw a selected cluster could miss its certificate
+  // (a one-draw gap after every content change). The own node's bit was
+  // stamped by this thread just above. An extra certificate is never emitted:
+  // every reader (segment ownership, clusterEmit) also requires clusterLevelOk.
+  let w=atomicLoad(&contactWork[s]);
+  if(w!=0u&&clusterOwnLevel(c,lb)){let k=~w;let e=partExtent();let ok=cellFrame(vec3u(k%e.x,(k/e.x)%e.y,k/(e.x*e.y))).ok;atomicOr(&contactWork[s+2u],CLUSTER_FRAME_DONE|select(0u,CLUSTER_FRAME_OK,ok));}
+ }
 }
 
 // KEPT when the home's stored token equals this source's generation token
@@ -751,22 +1381,49 @@ fn chartCertifyAt(i:u32){
 @compute @workgroup_size(64) fn voxelHome(@builtin(global_invocation_id) gid:vec3u){voxelHomeAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn voxelHomeAt(id:u32){
  if(!posedContacts()||native[0]==0u||!persistentHome()||!chartOn()){return;}
- let h=homeBase();let slots=clusterCapacity();if(id>=4u+slots*4u){return;}
- let block=atomicLoad(&contactWork[chunkBlockWord()]);let token=params.selection.w;
- let kept=token>1u&&block!=0u&&atomicLoad(&contactWork[h+1u])==token&&atomicLoad(&contactWork[h+2u])==block;
- if(id==0u){atomicStore(&contactWork[retainedWord()],select(0u,1u,kept));return;}
- if(id<4u){return;}
- if(kept){if((id-4u)%4u==2u){atomicAnd(&contactWork[h+id],~15u);}return;}
- atomicStore(&contactWork[h+id],0u);
+
+ // dispatches chartHomeWords(levels)). Each level home is kept or rebuilt
+ // under its OWN header (token and its level code), whatever this frame's vote,
+ // so every level is built when content changes and is resident before a
+ // transition selects it.
+ var lb=0u;var local=id;
+ for(var b=2u;b<=16u;b*=2u){let size=4u+levelClusters(b)*4u;if(local<size){lb=b;break;}local-=size;}
+ if(lb==0u){return;}
+ let h=levelHomeBase(lb);if(local>=4u+levelCapacity(lb)*4u){return;}
+ let token=params.selection.w;
+ let kept=token>1u&&atomicLoad(&contactWork[h+1u])==token&&atomicLoad(&contactWork[h+2u])==levelCode(lb);
+ if(local==0u){
+  atomicStore(&contactWork[levelRetainedWord(lb)],select(0u,1u,kept));
+  if(lb==votedClusterBlock()){atomicStore(&contactWork[retainedWord()],select(0u,1u,kept));}
+  return;
+ }
+ if(local<4u){return;}
+ if(kept){if((local-4u)%4u==2u){atomicAnd(&contactWork[h+local],~15u);}return;}
+ atomicStore(&contactWork[h+local],0u);
 }
 @compute @workgroup_size(64) fn contactVertices(@builtin(global_invocation_id) gid:vec3u){contactVertexAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn contactVertexAt(v:u32){
+ // This dispatch follows chartCertify, so current-frame forced bits and
+ // certificates are complete before the marker is read by partAnchors. Its
+ // extra threads are source-part markers, not topology/instance records.
+ if(v<partAnchorVertices[1u]){
+  if(persistentHome()&&(!levelRetained(2u)||(partAnchorVertices[partFrontierMarkerAt(v)]&0x40000000u)==0u)){partFrontierCacheBuild(v);}
+  partFrontierMarker(v);
+ }
  if(!posedContacts()||v>=min(sourceFaceCount()*2u,native[0]/6u*4u)){return;}
 
  // this content token and block, or nothing after an overflow (never kept).
  if(v==0u&&persistentHome()){
-  let h=homeBase();let complete=atomicLoad(&contactWork[overflowWord()])==0u;
-  atomicStore(&contactWork[h+1u],select(0u,params.selection.w,complete));atomicStore(&contactWork[h+2u],atomicLoad(&contactWork[chunkBlockWord()]));
+  let vote=atomicLoad(&contactWork[chunkBlockWord()]);
+
+  atomicStore(&contactWork[params.owners[0].w+3u],vote);
+
+  // of which voxelBin built or kept this draw; an overflow certifies none.
+  let complete=atomicLoad(&contactWork[overflowWord()])==0u;
+  for(var b=2u;b<=16u;b*=2u){
+   let h=levelHomeBase(b);
+   atomicStore(&contactWork[h+1u],select(0u,params.selection.w,complete));atomicStore(&contactWork[h+2u],levelCode(b));
+  }
  }
  // Owned by the selected coarse representation: no fine port is ever read.
  if(voxelVertexCoarse(v)){return;}
@@ -916,12 +1573,12 @@ fn emitLevel(a:vec3f,b:vec3f,t:Triangle,kind:u32,address:u32,ports:vec4u,coordin
  if(kind==0u||kind==2u){let owner=vec2u(params.domain,t.owner);chart.w+=f32((contactCorner(owner,ports.x)<<3u)|(contactCorner(owner,ports.y)<<13u));}
  relations[at]=Relation(vec4f(a,gradient.x),vec4f(b,gradient.y),vec4u(params.domain,t.owner,tag,address),ports,detail,chart);
 }
-@compute @workgroup_size(1) fn prepare(){
+fn prepareIn(){
  let invalid=native[5]!=0u||sourceVertexCount()>params.vertexCapacity||native[2]<params.indexBase||native[2]-params.indexBase+native[0]>sourceFaceCount()*3u||(native[2]-params.indexBase)%3u!=0u||native[0]%3u!=0u;
  // A source/instance range is not capped at one dispatch dimension. Use
  // the device's actual X extent, then continue the SAME source IDs in Y.
  let limit=params.owners[3].w;
- let edges=select((sourceEdgeCount()*selectedCount()+63u)/64u,0u,invalid);let faces=select((sourceFaceCount()*selectedCount()+63u)/64u,0u,invalid);
+ let edges=select((sourceBoundarySlots()*selectedCount()+63u)/64u,0u,invalid);let faces=select((sourceFaceCount()*selectedCount()+63u)/64u,0u,invalid);
  dispatch[0]=min(edges,limit);dispatch[1]=max(1u,(edges+limit-1u)/limit);dispatch[2]=1u;
  dispatch[3]=min(faces,limit);dispatch[4]=max(1u,(faces+limit-1u)/limit);dispatch[5]=1u;
  // Native GPU visibility/counts own the contact frontier too. Previously
@@ -934,30 +1591,158 @@ fn emitLevel(a:vec3f,b:vec3f,t:Triangle,kind:u32,address:u32,ports:vec4u,coordin
  // chunk level vote would persist into the next frame.
  let words=columnEnd();
  let clearGroups=select(0u,(words+63u)/64u,contactActive);
- let vertexGroups=select(0u,(min(sourceFaceCount()*2u,native[0]/6u*4u)+63u)/64u,contactActive);
+ let vertexWork=max(min(sourceFaceCount()*2u,native[0]/6u*4u),prepareAnchorParts());
+ let vertexGroups=select(0u,(vertexWork+63u)/64u,contactActive);
  let edgeGroups=select(0u,(min(sourceEdgeCount(),native[0]/6u*5u)+63u)/64u,contactActive);
  dispatch[6]=min(clearGroups,limit);dispatch[7]=max(1u,(clearGroups+limit-1u)/limit);dispatch[8]=1u;
  dispatch[9]=min(vertexGroups,limit);dispatch[10]=max(1u,(vertexGroups+limit-1u)/limit);dispatch[11]=1u;
  dispatch[12]=min(edgeGroups,limit);dispatch[13]=max(1u,(edgeGroups+limit-1u)/limit);dispatch[14]=1u;
+ // The anchor passes use the same native count and workgroup limit.  The
+ // source input is bound even when this draw has no declared part bank, so a
+ // missing registration cannot read an unbound storage slot.
+ let anchorCount=select(0u,prepareAnchorParts()*selectedCount(),!invalid);
+ let anchorGroups=(anchorCount+63u)/64u;
+ dispatch[18]=min(anchorGroups,limit);dispatch[19]=max(1u,(anchorGroups+limit-1u)/limit);dispatch[20]=1u;
+ // The admitted frontier is the only live source extent.  Publish the
+ // remaining relation/contact arguments from that same count so consumers do
+ // not launch the old host reservation and then clear holes.
+ let voxelWork=select(0u,min(sourceFaceCount()*2u,native[0]/6u*4u),contactActive);
+ let edgeWork=select(0u,min(sourceEdgeCount(),native[0]/6u*5u),contactActive);
+ let homeWork=select(0u,4u+levelClusters(2u)*4u+4u+levelClusters(4u)*4u+4u+levelClusters(8u)*4u+4u+levelClusters(16u)*4u,contactActive&&persistentHome()&&chartOn());
+ let chartWork=select(0u,max(chartClusters(),prepareAnchorParts()),contactActive);
+ dispatch[21]=min((voxelWork+63u)/64u,limit);dispatch[22]=max(1u,((voxelWork+63u)/64u+limit-1u)/limit);dispatch[23]=1u;
+ dispatch[24]=min((homeWork+63u)/64u,limit);dispatch[25]=max(1u,((homeWork+63u)/64u+limit-1u)/limit);dispatch[26]=1u;
+ dispatch[27]=min((edgeWork+63u)/64u,limit);dispatch[28]=max(1u,((edgeWork+63u)/64u+limit-1u)/limit);dispatch[29]=1u;
+ dispatch[30]=min((voxelWork+63u)/64u,limit);dispatch[31]=max(1u,((voxelWork+63u)/64u+limit-1u)/limit);dispatch[32]=1u;
+ dispatch[33]=min((chartWork+63u)/64u,limit);dispatch[34]=max(1u,((chartWork+63u)/64u+limit-1u)/limit);dispatch[35]=1u;
  if(invalid){atomicOr(&status.overflow,1u);}
 }
+@compute @workgroup_size(1) fn prepare(){prepareIn();}
 @compute @workgroup_size(64) fn boundaries(@builtin(global_invocation_id) gid:vec3u){boundaryAt(gid.x+gid.y*params.owners[3].w*64u);}
+// Planar construction is compiled from actual panel boundary walks. Unlike a
+// hull it retains inner openings and unmatched join tails. Only the engine's
+// explicit ordinary (affine) vertex path can reuse those straight source
+// spans; arbitrary material deformation keeps the complete fine producer.
+fn sourceBoundarySlots()->u32{return sourceEdgeCount();}
+
+// TASK,23:49UTC"). Reads the SOURCE_PATH level section (compileSourcePathProgram).
+// Each site resolves against the ACTUAL posed source: a vertex, or the posed
+// face's corners with its authored barycentric weights. Path segment g is drawn
+// by the boundary thread of source edge g mod E (the principal-chain pattern);
+// no dispatch, binding or host extent changes. Pair B flagged reversed is
+// emitted from A's start, so both rails progress in one source phase. Ends use
+// the authored port table (a shared port is one authored join); interior sites
+// own their site port. Only faces inside an authored covered range give up
+// their fine edges (authoredOwnsEdge); every other face keeps its incumbent.
+fn authoredSitePoint(k:u32,instance:u32)->vec3f{
+ let s=sourcePathSite(k);if(s[0]==0u){return position(s[1],instance);}
+ let f=s[1]*3u;
+ return position(halfedge(f).x,instance)*bitcast<f32>(s[2])+position(halfedge(f+1u).x,instance)*bitcast<f32>(s[3])+position(halfedge(f+2u).x,instance)*bitcast<f32>(s[4]);
+}
+fn authoredSitePort(p:array<u32,9>,local:u32)->u32{
+ let last=p[5]-1u;
+ if(local==0u||local==last){let port=select(p[1],p[2],local==last);return 0xd8000000u|(sourcePathPortFirst(port)&0x07ffffffu);}
+ return 0xd0000000u|((p[4]+local)&0x07ffffffu);
+}
+fn authoredPathAt(g:u32,instance:u32){
+ let k=sourcePathOfSegment(g);let p=sourcePath(k);let s=g-(p[4]-k);let last=p[5]-1u;
+ if(s>=last||p[6]==0xffffffffu){return;}
+ let face=p[6]*3u;if(!inDraw(face)||!validFace(face)){return;}
+ let v=halfedge(face).x;if(ownerUnseen(v,instance)||ownerMerged(edgeOwner(v,instance))){return;}
+ let t=triangle(face,instance);if(dot(t.face,t.face)<0.1||(!front(t)&&params.direction.w!=1.0)){return;}
+ let reversed=(p[8]&${SOURCE_PATH_REVERSED}u)!=0u;
+ let head=select(s,last-s,reversed);let tail=select(s+1u,last-s-1u,reversed);
+
+ // ONE source phase to the run stage (which binds no source packet):
+ // 0xb0000000 | role<<26 (0 unpaired, 1 pair A, 2 pair B) | group<<13 (the
+ // pair, or the unpaired path) | phase (segment index from A's start). A
+ // group or phase beyond 13 bits keeps a unique plain address (role 3, g).
+ let paired=p[7]!=0xffffffffu;let role=select(0u,select(1u,2u,(p[8]&${SOURCE_PATH_PAIR_B}u)!=0u),paired);
+ let group=select(k,p[7],paired);
+ var address=0xbc000000u|(g&0x03ffffffu);
+ if(group<8192u&&s<8192u){address=0xb0000000u|(role<<26u)|(group<<13u)|s;}
+ emitLevel(authoredSitePoint(p[4]+head,instance),authoredSitePoint(p[4]+tail,instance),t,0u,address,
+  vec4u(authoredSitePort(p,head),authoredSitePort(p,tail),p[6],0xffffffffu),vec4f(0),false,false);
+}
+fn authoredPathsAt(ordinal:u32,instance:u32){
+ let total=sourcePathSegmentCount();let stride=sourceBoundarySlots();if(total==0u||stride==0u){return;}
+ var g=ordinal;loop{if(g>=total){break;}authoredPathAt(g,instance);g+=stride;}
+}
+// An incidence (halfedge index) is replaced only when its face lies in an
+// authored covered range whose path is emitted by this same draw.
+fn authoredOwnsFace(incidence:u32)->bool{
+ if(incidence==0xffffffffu){return true;}
+ let k=sourcePathCoveredBy(incidence/3u);if(k==0xffffffffu){return false;}
+ let owner=sourcePath(k)[6];return owner!=0xffffffffu&&inDraw(owner*3u);
+}
+fn authoredOwnsEdge(a:u32,b:u32,c:u32,d:u32)->bool{
+ if(sourcePathCoverCount()==0u||(a==0xffffffffu&&b==0xffffffffu&&c==0xffffffffu&&d==0xffffffffu)){return false;}
+ return authoredOwnsFace(a)&&authoredOwnsFace(b)&&authoredOwnsFace(c)&&authoredOwnsFace(d);
+}
+fn planarProgramLevel(instance:u32)->bool{
+ if((params.owners[1].z&32u)==0u||native[0]==0u||sourcePlanarSpanAt()==0u||!sourcePlanarComplete()){return false;}
+ // Both direct and batched dispatches own one slot per original source edge.
+ // An unusually fragmented replacement that needs more slots keeps its
+ // complete fine producer; it must never truncate the final instance.
+ if(sourcePlanarSpanCount()+sourcePanelJoinCount()>sourceBoundarySlots()){return false;}
+ if(native[2]!=params.indexBase||native[0]!=sourceFaceCount()*3u){return false;}
+ let owner=edgeOwner(halfedge(0u).x,instance);
+ // A producer draw may contain several owners inside one source. Its
+// independently posed owners cannot borrow the first entity's coarse level.
+ if((owner.x&0x80000000u)!=0u){return false;}
+ return formLevel(owner)>=1u;
+}
+fn planarSpanAt(k:u32,instance:u32){
+ if(k>=sourcePlanarSpanCount()){return;}
+ let s=sourcePlanarSpan(k);let face=s[2]*3u;
+
+ if(sourcePathCoveredBy(s[2])!=0xffffffffu){return;}
+ if(!inDraw(face)||!validFace(face)){return;}
+ let t=triangle(face,instance);if(dot(t.face,t.face)<0.1||(!front(t)&&params.direction.w!=1.0)){return;}
+ let a=position(s[0],instance);let b=position(s[1],instance);
+ emitLevel(a,b,t,0u,0xa0000000u|k,vec4u(boundaryPort(s[0],instance),boundaryPort(s[1],instance),s[2],0xffffffffu),vec4f(0),false,true);
+}
+fn planarJoinAt(k:u32,instance:u32){
+ if(k>=sourcePanelJoinCount()){return;}
+ let j=sourcePanelJoin(k);let fa=j[2]*3u;let fb=j[3]*3u;
+ if(sourcePathCoveredBy(j[2])!=0xffffffffu&&sourcePathCoveredBy(j[3])!=0xffffffffu){return;}
+ if(!inDraw(fa)||!validFace(fa)||!inDraw(fb)||!validFace(fb)){return;}
+ let a=triangle(fa,instance);let b=triangle(fb,instance);
+ if(dot(a.face,a.face)<0.1||dot(b.face,b.face)<0.1){return;}
+ let af=front(a);let bf=front(b);var t=a;var kind=0u;
+ if(af==bf){
+  if(!af&&params.direction.w!=1.0){return;}
+  // A coplanar shared border is interior paper, not two false silhouettes.
+  // A genuine plane turn keeps the same crease threshold as boundaryAt.
+  if(dot(a.face,b.face)>=0.70710678){return;}kind=2u;
+ }else if(!af){t=b;}
+ emitLevel(position(j[0],instance),position(j[1],instance),t,kind,0xa8000000u|k,vec4u(boundaryPort(j[0],instance),boundaryPort(j[1],instance),j[2],j[3]),vec4f(0),false,true);
+}
 fn boundaryAt(id:u32){
- if(id>=sourceEdgeCount()*selectedCount()){return;}
- chartEmitAt(id,sourceEdgeCount()*selectedCount());let instance=selectedInstance(id/sourceEdgeCount());if(!selected(instance)){return;}let e=edge(id%sourceEdgeCount());if(ownerUnseen(halfedge(e.x).x,instance)||ownerMerged(edgeOwner(halfedge(e.x).x,instance))){return;}
+ let slots=sourceBoundarySlots();if(id>=slots*selectedCount()||native[0]==0u){return;}
+ let ordinal=id%slots;let instance=selectedInstance(id/slots);if(!selected(instance)){return;}
+
+ authoredPathsAt(ordinal,instance);
+ if(planarProgramLevel(instance)){
+  let v=halfedge(0u).x;if(ownerUnseen(v,instance)||ownerMerged(edgeOwner(v,instance))){return;}
+  if(ordinal<sourcePlanarSpanCount()){planarSpanAt(ordinal,instance);}else{planarJoinAt(ordinal-sourcePlanarSpanCount(),instance);}return;
+ }
+ if(ordinal>=sourceEdgeCount()){return;}
+ let sourceId=(id/slots)*sourceEdgeCount()+ordinal;
+ chartEmitAt(sourceId,sourceEdgeCount()*selectedCount());let e=edge(ordinal);if(ownerUnseen(halfedge(e.x).x,instance)||ownerMerged(edgeOwner(halfedge(e.x).x,instance))){return;}
  // L2 (outlineLevel): this owner is drawn by its COMPILED outline construction
  // only. The thread of source edge k draws hull edge k; no fine boundary,
  // crease, fold or contour of the owner is produced.
- if(outlineLevel(edgeOwner(halfedge(e.x).x,instance))){hullOutlineAt(id%sourceEdgeCount(),instance);return;}
+ if(outlineLevel(edgeOwner(halfedge(e.x).x,instance))){hullOutlineAt(ordinal,instance);return;}
  // L1 (principalLevel): the thread of source edge k also draws chain k.
  let principal=principalLevel(edgeOwner(halfedge(e.x).x,instance));
- if(principal){principalChainAt(id%sourceEdgeCount(),instance);}
- if(!edgeInDraw(id%sourceEdgeCount())){return;}
+ if(principal){principalChainAt(ordinal,instance);}
+ if(!edgeInDraw(ordinal)){return;}
 
  // representation; this fine edge is then owned by it (not expanded), BEFORE
 
- if(posedContacts()){let inc=sourceEdgeCorner(halfedge(e.x).z,0u);if(inDraw(inc)&&validFace(inc)&&voxelColumnEdge(id%sourceEdgeCount(),triangle(inc,0u),inc/3u)){return;}}
- let contact=posedEdgeSlot(id%sourceEdgeCount());var canonical=canonicalEdge(id%sourceEdgeCount(),instance);
+ if(posedContacts()){let inc=sourceEdgeCorner(halfedge(e.x).z,0u);if(inDraw(inc)&&validFace(inc)&&voxelColumnEdge(ordinal,triangle(inc,0u),inc/3u)){return;}}
+ let contact=posedEdgeSlot(ordinal);var canonical=canonicalEdge(ordinal,instance);
  if(contact!=NO_CONTACT){canonical=edge(atomicLoad(&contactWork[contactSlots()+contact])-1u).x;}
  if(e.x!=canonical){return;}
  var first=0xffffffffu;var second=0xffffffffu;var anyFace=0xffffffffu;var faces=0u;var frontCount=0u;var backCount=0u;var allSmooth=true;var crease=false;var firstNormal=vec3f(0.0);var nonzeroField=false;
@@ -968,7 +1753,7 @@ fn boundaryAt(id:u32){
  var member=0u;var contactHead=0u;var lastContact=NO_CONTACT;if(contact!=NO_CONTACT){contactHead=atomicLoad(&contactWork[contactSlots()*2u+contact]);}
  var samePart=true;var ownPart=0u;var smallPart=false;
  if(cellParts()){
-  ownPart=atomicLoad(&contactWork[edgePartBase()+id%sourceEdgeCount()]);
+  ownPart=atomicLoad(&contactWork[edgePartBase()+ordinal]);
   let at=partSlot(ownPart);if(ownPart!=0u&&at!=NO_CONTACT){smallPart=(atomicLoad(&contactWork[partFlagsBase()+at])&3u)==1u;}
  }
  loop{
@@ -995,6 +1780,9 @@ fn boundaryAt(id:u32){
   }
  }
  if(faces>2u){atomicAdd(&status.nonmanifold,1u);}
+
+ // drawn by its path construction (authoredPathAt), not as a fine edge.
+ if(faces<=2u&&authoredOwnsEdge(first,second,backFirst,backSecond)){return;}
  let edgeA=position(start.x,instance);let edgeB=position(start.y,instance);
  // A normal-zero curve may run exactly through a source vertex or along a
  // source edge. Give that event its VERTEX ports and emit the edge once;
@@ -1060,6 +1848,8 @@ fn boundaryAt(id:u32){
 fn hullOutlineAt(k:u32,instance:u32){
  if(k>=sourceHullEdgeCount()){return;}
  let w=sourceHullEdge(k);let face=sourceHullFace(k);
+
+ if(sourcePathCoveredBy(face)!=0xffffffffu){return;}
  if(!inDraw(face*3u)||!validFace(face*3u)){return;}
  let a=position(w.x,instance);let b=position(w.y,instance);
  let n0=cross(b-a,position(w.z,instance)-a);let n1=cross(a-b,position(w.w,instance)-b);
@@ -1071,7 +1861,7 @@ fn hullOutlineAt(k:u32,instance:u32){
 }
 @compute @workgroup_size(64) fn contours(@builtin(global_invocation_id) gid:vec3u){contourAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn contourAt(id:u32){
- if(id>=sourceFaceCount()*selectedCount()){return;}let instance=selectedInstance(id/sourceFaceCount());if(!selected(instance)){return;}let face=id%sourceFaceCount();if(ownerUnseen(halfedge(face*3u).x,instance)||ownerMerged(edgeOwner(halfedge(face*3u).x,instance))||outlineLevel(edgeOwner(halfedge(face*3u).x,instance))){return;}if(!inDraw(face*3u)||!validFace(face*3u)){return;}
+ if(id>=sourceFaceCount()*selectedCount()){return;}let instance=selectedInstance(id/sourceFaceCount());if(!selected(instance)||planarProgramLevel(instance)){return;}let face=id%sourceFaceCount();if(ownerUnseen(halfedge(face*3u).x,instance)||ownerMerged(edgeOwner(halfedge(face*3u).x,instance))||outlineLevel(edgeOwner(halfedge(face*3u).x,instance))){return;}if(!inDraw(face*3u)||!validFace(face*3u)){return;}
  let t=triangle(face*3u,instance);var points:array<vec3f,3>;var ports:array<u32,3>;var parameters:array<f32,3>;var count=0u;var zeros=0u;
  var values:array<f32,3>;
  for(var k=0u;k<3u;k++){
@@ -1152,7 +1942,12 @@ fn levelDrops(address:u32,a:vec3f,b:vec3f,instance:u32,silhouette:bool)->bool{
  if((flags&1u)==0u||(flags&2u)!=0u||params.eye.w==0.0||native[0]==0u){return false;}
  if(!formOpen()){return false;}
  let owner=edgeOwner(halfedge(address).x,instance);
- let form=formExtent(owner);let extent=vec2f(f32(params.owners[1].w),f32(params.owners[2].x));
+
+ // measured by THAT extent (the form-table writer's, the same one its held
+ // level came from), never by the pixels that survive the foreground. No
+ // bound: the visible extent, as before.
+ var form=formExtent(owner);let sourceExtent=formSourceExtent(owner);if(sourceExtent.found){form=sourceExtent;}
+ let extent=vec2f(f32(params.owners[1].w),f32(params.owners[2].x));
  if(!form.found||formCut(form.box,extent)||formSpansDepth(form.near,form.far,extent,detailWorldFromClip)){return false;}
  let row=bitcast<f32>(params.owners[1].y);
  // The L1 subset applies from the held principal level (formLevel).
@@ -1161,8 +1956,11 @@ fn levelDrops(address:u32,a:vec3f,b:vec3f,instance:u32,silhouette:bool)->bool{
  if(!(unit>0.0)){return false;}
  return length(b-a)*f32(code&${EDGE_LEVEL_DETAIL-1}u)/${EDGE_LEVEL_UNIT}.0<unit*${FACET_CREASE_LEAST_ROWS*LOD_TIER_HOLD};
 }
-fn interiorInstances()->u32{return min(params.owners[0].y,native[1]-min(native[1],params.owners[0].x));}
-fn interiorCandidates()->u32{if(params.owners[3].x!=0u){return params.owners[2].z;}return interiorInstances();}
+fn interiorInstances()->u32{
+ let available=min(params.owners[0].y,native[1]-min(native[1],params.owners[0].x));
+ return select(available,selectedCount(),params.owners[3].x!=0u);
+}
+fn interiorCandidates()->u32{if(params.owners[3].x!=0u){return selectedCount();}return interiorInstances();}
 fn interiorCandidate(ordinal:u32)->u32{if(params.owners[3].x!=0u){return selectedInstance(ordinal);}return params.owners[0].x+ordinal;}
 fn detailBase()->u32{return (sourceFaceCount()*3u+sourceVertexCount()*3u)*interiorInstances();}
 fn viewInteriorInstances()->u32{if((params.owners[1].z&8u)!=0u){return bitcast<u32>(differentials[detailBase()].x);}return interiorCandidates();}
@@ -1172,6 +1970,7 @@ fn radialBase()->u32{return sourceFaceCount()*interiorInstances()*3u;}
 // compact-form rule and hysteresis boundary. Unknown/cut/spanning forms,
 // terrain and enclosed/parallel views keep the complete interior producer.
 fn needsViewCurvature(instance:u32)->bool{
+ if(planarProgramLevel(instance)){return false;}
  if(selected(instance)&&native[0]!=0u){
   let first=halfedge(native[2]-params.indexBase).x;let at=slot(first,instance);
   let entity=positions[at].w;let producer=entity==0xffffffffu;
@@ -1205,6 +2004,13 @@ fn levelRows(owner:vec2u)->f32{
 
 fn formLodActive()->bool{return textureLoad(formDepths,vec2i(0,${FORM_DEPTH_HEADER_ROW}),0).w!=0u;}
 fn formLevel(owner:vec2u)->u32{
+
+ // complete posed source bound (form-depths resolveSource/resolveLod) takes
+ // that held level as is; its surviving pixel box (levelRows' visible extent,
+ // cut and depth span) never re-sizes the representation. A cut or spanning
+ // source holds level 0 there. Every other owner keeps the incumbent read.
+ let flags=params.owners[1].z;
+ if(formLodActive()&&(flags&1u)!=0u&&(flags&2u)==0u&&params.eye.w!=0.0&&formOpen()&&(formSourceFlags(owner)&1u)!=0u){return formHeldLod(owner,true);}
  let rows=levelRows(owner);if(rows<0.0){return 0u;}
  if(formLodActive()){return formHeldLod(owner,true);}
  return select(select(1u,2u,rows<${FAR_STRIP_BELOW_ROWS*LOD_TIER_HOLD}),0u,!(rows<${NEAR_FROM_ROWS*LOD_TIER_HOLD}));
@@ -1223,6 +2029,8 @@ fn principalLevel(owner:vec2u)->bool{
 fn principalChainAt(k:u32,instance:u32){
  if(k>=sourceChainCount()){return;}
  let c=sourceChain(k);
+
+ if(sourcePathCoveredBy(c[2])!=0xffffffffu&&sourcePathCoveredBy(c[3])!=0xffffffffu){return;}
  if(!inDraw(c[2]*3u)||!validFace(c[2]*3u)||!inDraw(c[3]*3u)||!validFace(c[3]*3u)){return;}
  let t0=triangle(c[2]*3u,instance);let t1=triangle(c[3]*3u,instance);
  // The same crease rule as boundaryAt: both planes turned to the eye and
@@ -1286,7 +2094,7 @@ fn prepareInteriorIn(local:u32){
 @compute @workgroup_size(64) fn faceDifferentials(@builtin(global_invocation_id) gid:vec3u){faceDifferentialAt(gid.x+gid.y*params.owners[0].z*64u);}
 fn faceDifferentialAt(id:u32){
  if(id>=sourceFaceCount()*interiorInstances()){return;}
- let instance=params.owners[0].x+id/sourceFaceCount();let face=id%sourceFaceCount();let at=id*3u;
+ let ordinal=id/sourceFaceCount();let instance=interiorCandidate(ordinal);let face=id%sourceFaceCount();let at=id*3u;
  differentials[at]=vec4f(0);differentials[at+1u]=vec4f(0);differentials[at+2u]=vec4f(0);
  if((params.selection.w==0u&&!selected(instance))||!inDraw(face*3u)||!validFace(face*3u)){return;}
  let tri=triangle(face*3u,instance);
@@ -1314,7 +2122,7 @@ fn faceDifferentialAt(id:u32){
 @compute @workgroup_size(64) fn radialCurvature(@builtin(global_invocation_id) gid:vec3u){radialCurvatureAt(gid.x+gid.y*params.owners[0].z*64u);}
 fn radialCurvatureAt(id:u32){
  if(id>=sourceVertexCount()*viewInteriorInstances()){return;}
- let instance=viewInteriorInstance(id/sourceVertexCount());let local=instance-params.owners[0].x;let vertex=id%sourceVertexCount();let out=radialBase()+local*sourceVertexCount()+vertex;
+ let ordinal=id/sourceVertexCount();let instance=viewInteriorInstance(ordinal);let local=ordinal;let vertex=id%sourceVertexCount();let out=radialBase()+local*sourceVertexCount()+vertex;
  differentials[out]=vec4f(0);
  if(!selected(instance)||!vertexInDraw(vertex)){return;}
  let P=position(vertex,instance);let N=normal(vertex,instance);
@@ -1345,7 +2153,7 @@ fn radialCurvatureAt(id:u32){
 @compute @workgroup_size(64) fn suggestiveContours(@builtin(global_invocation_id) gid:vec3u){suggestiveAt(gid.x+gid.y*params.owners[0].z*64u);}
 fn suggestiveAt(id:u32){
  if(id>=sourceFaceCount()*viewInteriorInstances()){return;}
- let instance=viewInteriorInstance(id/sourceFaceCount());let local=instance-params.owners[0].x;let face=id%sourceFaceCount();
+ let ordinal=id/sourceFaceCount();let instance=viewInteriorInstance(ordinal);let local=ordinal;let face=id%sourceFaceCount();
  if(!selected(instance)||!inDraw(face*3u)||!validFace(face*3u)){return;}
  let tri=triangle(face*3u,instance);if(!front(tri)&&params.direction.w!=1.0){return;}
  var values:array<f32,3>;
@@ -1403,7 +2211,7 @@ const RIDGE_ANISOTROPY=1.5;
 @compute @workgroup_size(64) fn principalCurvature(@builtin(global_invocation_id) gid:vec3u){principalCurvatureAt(gid.x+gid.y*params.owners[0].z*64u);}
 fn principalCurvatureAt(id:u32){
  if(id>=sourceVertexCount()*interiorInstances()){return;}
- let local=id/sourceVertexCount();let instance=params.owners[0].x+local;let vertex=id%sourceVertexCount();
+ let local=id/sourceVertexCount();let instance=interiorCandidate(local);let vertex=id%sourceVertexCount();
  differentials[principalBase()+id]=vec4f(0);differentials[ridgeBase()+id]=vec4f(0);
  // Like faceDifferentials, retained shape data is initialized for every
  // instance of this revision, not only those this camera happens to see.
@@ -1431,7 +2239,7 @@ fn principalCurvatureAt(id:u32){
 @compute @workgroup_size(64) fn ridgeDerivative(@builtin(global_invocation_id) gid:vec3u){ridgeDerivativeAt(gid.x+gid.y*params.owners[0].z*64u);}
 fn ridgeDerivativeAt(id:u32){
  if(id>=sourceVertexCount()*interiorInstances()){return;}
- let local=id/sourceVertexCount();let vertex=id%sourceVertexCount();let instance=params.owners[0].x+local;
+ let local=id/sourceVertexCount();let vertex=id%sourceVertexCount();let instance=interiorCandidate(local);
  let principal=differentials[principalBase()+id];if(principal.w==0.0){return;}
  let incidence=sourceVertexRecord(vertex);var gradient=vec3f(0);var area=0.0;
  for(var k=0u;k<incidence.w;k++){
@@ -1450,7 +2258,7 @@ fn ridgeDerivativeAt(id:u32){
 @compute @workgroup_size(64) fn ridgeLines(@builtin(global_invocation_id) gid:vec3u){ridgeLineAt(gid.x+gid.y*params.owners[0].z*64u);}
 fn ridgeLineAt(id:u32){
  if(id>=sourceFaceCount()*viewInteriorInstances()){return;}
- let instance=viewInteriorInstance(id/sourceFaceCount());let local=instance-params.owners[0].x;let face=id%sourceFaceCount();
+ let ordinal=id/sourceFaceCount();let instance=viewInteriorInstance(ordinal);let local=ordinal;let face=id%sourceFaceCount();
  if(!selected(instance)||!inDraw(face*3u)||!validFace(face*3u)){return;}
  let tri=triangle(face*3u,instance);if(!front(tri)&&params.direction.w!=1.0){return;}
  var e:array<f32,3>;var k1:array<f32,3>;var k2:array<f32,3>;var dirs:array<vec3f,3>;var reach=0.0;
@@ -1498,7 +2306,7 @@ fn ridgeLineAt(id:u32){
 // surfaceLines: boundaries over edges x instances, then contours over faces x
 // instances, as one id range (workgroup g covers ids 64g..64g+63).
 @compute @workgroup_size(64) fn surfaceLines(@builtin(workgroup_id) wid:vec3u,@builtin(local_invocation_index) local:u32){
- let id=(wid.x+wid.y*params.owners[3].w)*64u+local;let edges=sourceEdgeCount()*selectedCount();
+ let id=(wid.x+wid.y*params.owners[3].w)*64u+local;let edges=sourceBoundarySlots()*selectedCount();
  if(id<edges){boundaryAt(id);}else{contourAt(id-edges);}
 }
 // viewFaceLines: suggestive contours and ridge lines over the same view faces
@@ -1517,7 +2325,7 @@ fn ridgeLineAt(id:u32){
 // its whole storage page and indexed at base + the same index. A thread finds
 // its source in a uniform table by its id (sources are contiguous id ranges,
 // one thread per relation candidate exactly as in the per-source dispatch).
-export const SURFACE_RELATION_BATCH_ITEMS=256;
+export const SURFACE_RELATION_BATCH_ITEMS=255;
 const BATCH_BASES:Record<string,string>={source:'B0.x',positions:'B0.y',attributes:'B0.z',native:'B0.w',contactWork:'B1.x',differentials:'B1.y',dispatch:'B1.z'};
 function stripWgslComments(code:string):string{return code.replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/[^\n]*/g,'');}
 /** `name[index]` becomes `name[BASE+(index)]` for the source-range arrays. */
@@ -1533,7 +2341,51 @@ function rebaseSourceArrays(code:string):string{
 const PARAMS_BINDING='@group(0) @binding(0) var<uniform> params:Params;';
 if(!SURFACE_RELATIONS_SHADER.includes(PARAMS_BINDING))throw Error('Surface relation params binding changed');
 const batchEntry=(name:string,body:string)=>`@compute @workgroup_size(64) fn ${name}(@builtin(workgroup_id) wid:vec3u,@builtin(local_invocation_index) local:u32){let id=batchLocal(wid,local);if(id==BATCH_NONE){return;}${body}}\n`;
-export const SURFACE_RELATIONS_BATCH_SHADER=rebaseSourceArrays(stripWgslComments(SURFACE_RELATIONS_SHADER).replace(PARAMS_BINDING,''))+/* wgsl */`
+/** Replace one WGSL function body without changing its signature or any other
+ * declaration. This is used only to build the explicit physical-host shader;
+ * generic and GPU-indexed sources keep the original bodies byte-for-byte. */
+function replaceWgslFunctionBody(source:string,name:string,body:string):string{
+ const marker=`fn ${name}(`,start=source.indexOf(marker);if(start<0)throw Error(`Missing WGSL function ${name}`);
+ const open=source.indexOf('{',start);if(open<0)throw Error(`Missing WGSL body ${name}`);
+ let depth=1,lineComment=false,blockComment=false,close=-1;
+ for(let i=open+1;i<source.length;i++){
+  const c=source[i]!,next=source[i+1];
+  if(lineComment){if(c==='\n')lineComment=false;continue;}
+  if(blockComment){if(c==='*'&&next==='/'){blockComment=false;i++;}continue;}
+  if(c==='/'&&next==='/'){lineComment=true;i++;continue;}
+  if(c==='/'&&next==='*'){blockComment=true;i++;continue;}
+  if(c==='{')depth++;
+  else if(c==='}'&&--depth===0){close=i;break;}
+ }
+ if(close<0)throw Error(`Unbalanced WGSL function ${name}`);
+ return source.slice(0,open+1)+body+source.slice(close);
+}
+/** PhysicalSourceTransport's source packet has no GPU-indexed voxel chart.
+ * Remove the chart/frontier hooks from only the physical batch shader so
+ * isolateComputeEntry cannot retain their cave/frontier call graph. The
+ * generic shader remains the producer-capable implementation. */
+function physicalSurfaceRelationsShader(source:string):string{
+ let specialized=replaceWgslFunctionBody(source,'smallClosedPart','return false;');
+ specialized=replaceWgslFunctionBody(specialized,'partAnchorCachedFrontierOwned','return false;');
+ specialized=replaceWgslFunctionBody(specialized,'prepareAnchorParts','return params.frontier.z;');
+ for(const hook of [
+  'chartEmitAt(sourceId,sourceEdgeCount()*selectedCount());',
+  'if(posedContacts()){let inc=sourceEdgeCorner(halfedge(e.x).z,0u);if(inDraw(inc)&&validFace(inc)&&voxelColumnEdge(ordinal,triangle(inc,0u),inc/3u)){return;}}',
+  'if(posedContacts()&&voxelClusterEmit(position(h.x,instance),position(h.y,instance),t,kind,e.x,vec2u(first/3u,select(0xffffffffu,second/3u,second!=0xffffffffu)),smallPart&&samePart)){return;}',
+ ]){
+  const next=specialized.replace(hook,'');if(next===specialized)throw Error('Physical relation shader hook changed');specialized=next;
+ }
+ // isolateComputeEntry intentionally preserves global declarations for the
+ // generic source ABI. These three resources have no physical producer and
+ // are unreachable after the hook replacements, so remove their declarations
+ // from the specialized module before its per-entry isolation.
+ specialized=specialized.replace(/@group\(0\) @binding\((13|14|18)\)[^\n]*\n/g,'');
+ return specialized;
+}
+const SURFACE_RELATIONS_PHYSICAL_SHADER=physicalSurfaceRelationsShader(SURFACE_RELATIONS_SHADER);
+function makeBatchShader(source:string,disableChartStages=false):string{
+ const chartEntry=(name:string,body:string)=>batchEntry(name,disableChartStages?'return;':body);
+ return rebaseSourceArrays(stripWgslComments(source).replace(PARAMS_BINDING,''))+/* wgsl */`
 struct BatchItem {p:Params,base:vec4u,base2:vec4u,span:vec4u}
 struct BatchTable {head:vec4u,items:array<BatchItem,${SURFACE_RELATION_BATCH_ITEMS}>}
 @group(0) @binding(0) var<uniform> table:BatchTable;
@@ -1551,33 +2403,71 @@ fn batchLocal(wid:vec3u,local:u32)->u32{
 // The per-source path sizes these three tensor stages from prepareInterior's
 // dispatch words (zero when the source is invalid or its tensor is skipped).
 fn batchGate(word:u32)->bool{return B1.w==0u||dispatch[B1.z+word]!=0u;}
-${batchEntry('batchContactClear','contactClearAt(id);')}
-${batchEntry('batchVoxelVote','voxelVoteAt(id);')}
-${batchEntry('batchVoxelBin','voxelBinAt(id);')}
-${batchEntry('batchChartCorners','chartCornerAt(id);')}
-${batchEntry('batchChartCertify','chartCertifyAt(id);')}
+${chartEntry('batchContactClear','contactClearAt(id);')}
+${chartEntry('batchVoxelVote','voxelVoteAt(id);')}
+${chartEntry('batchVoxelBin','voxelBinAt(id);')}
+${chartEntry('batchChartCorners','chartCornerAt(id);')}
+${chartEntry('batchChartCertify','chartCertifyAt(id);')}
 ${batchEntry('batchPartAnchorClear','partAnchorClearAt(id);')}
 ${batchEntry('batchPartAnchors','partAnchorAt(id);')}
-${batchEntry('batchPartAnchorInsert','partAnchorInsertAt(id);')}
-${batchEntry('batchContactVertices','contactVertexAt(id);')}
-${batchEntry('batchContactEdges','contactEdgeAt(id);')}
-${batchEntry('batchSurfaceLines','let edges=sourceEdgeCount()*selectedCount();if(id<edges){boundaryAt(id);}else{contourAt(id-edges);}')}
+${batchEntry('batchPrepareFrontier','if(local==0u){prepareIn();}')}
+${chartEntry('batchContactVertices','contactVertexAt(id);')}
+${chartEntry('batchContactEdges','contactEdgeAt(id);')}
+${batchEntry('batchBoundaryLines','boundaryAt(id);')}
+${batchEntry('batchContourLines','contourAt(id);')}
 @compute @workgroup_size(64) fn batchPrepareInterior(@builtin(workgroup_id) wid:vec3u,@builtin(local_invocation_index) local:u32){batchEnter(wid.x);prepareInteriorIn(local);}
-${batchEntry('batchFaceDifferentials','if(batchGate(6u)){faceDifferentialAt(id);}')}
+${batchEntry('batchFaceDifferentials','faceDifferentialAt(id);')}
 ${batchEntry('batchRadialCurvature','radialCurvatureAt(id);')}
 ${batchEntry('batchSuggestiveContours','suggestiveAt(id);')}
-${batchEntry('batchPrincipalCurvature','if(batchGate(9u)){principalCurvatureAt(id);}')}
-${batchEntry('batchRidgeDerivative','if(batchGate(9u)){ridgeDerivativeAt(id);}')}
+${batchEntry('batchPrincipalCurvature','principalCurvatureAt(id);')}
+${batchEntry('batchRidgeDerivative','ridgeDerivativeAt(id);')}
 ${batchEntry('batchRidgeLines','ridgeLineAt(id);')}
 ${batchEntry('batchViewFaceLines','suggestiveAt(id);ridgeLineAt(id);')}
 `;
-type BatchStage='partAnchorClear'|'partAnchors'|'partAnchorInsert'|'contactClear'|'voxelVote'|'voxelBin'|'chartCorners'|'chartCertify'|'contactVertices'|'contactEdges'|'surfaceLines'|'prepareInterior'|'faceDifferentials'|'radialCurvature'|'suggestiveContours'|'principalCurvature'|'ridgeDerivative'|'ridgeLines'|'viewFaceLines';
+}
+export const SURFACE_RELATIONS_BATCH_SHADER=makeBatchShader(SURFACE_RELATIONS_SHADER);
+/** Physical batches retain the stage entry ABI, but the chart/contact stage
+ * bodies are inert because the guarded physical source contract cannot supply
+ * their producer-owned chart. No chart or cave/frontier helper is reachable
+ * from the line or anchor stages. */
+export const SURFACE_RELATIONS_PHYSICAL_BATCH_SHADER=makeBatchShader(SURFACE_RELATIONS_PHYSICAL_SHADER,true);
+type BatchStage='partAnchorClear'|'partAnchors'|'prepareFrontier'|'contactClear'|'voxelVote'|'voxelBin'|'chartCorners'|'chartCertify'|'contactVertices'|'contactEdges'|'boundaryLines'|'contourLines'|'prepareInterior'|'faceDifferentials'|'radialCurvature'|'suggestiveContours'|'principalCurvature'|'ridgeDerivative'|'ridgeLines'|'viewFaceLines';
 /** Global stage order. Per source it is the per-source order (contacts, lines,
  * prepareInterior, tensor, view lines); sources write disjoint ranges. */
-const BATCH_ORDER:readonly BatchStage[]=['partAnchorClear','partAnchors','partAnchorInsert','contactClear','voxelVote','voxelBin','chartCorners','chartCertify','contactVertices','contactEdges','surfaceLines','prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'];
+const BATCH_ORDER:readonly BatchStage[]=['partAnchorClear','prepareFrontier','contactClear','voxelVote','voxelBin','chartCorners','chartCertify','contactVertices','contactEdges','boundaryLines','contourLines','partAnchors','prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'];
 const batchEntryName=(stage:BatchStage)=>'batch'+stage[0]!.toUpperCase()+stage.slice(1);
-const BATCH_BINDINGS:Record<BatchStage,readonly number[]>={partAnchorClear:[0,17],partAnchors:[0,2,3,4,8,16,17],partAnchorInsert:[0,4,16,17],contactClear:[0,1,4,12],voxelVote:[0,1,2,4,12,13],voxelBin:[0,1,2,4,12,13],chartCorners:[0,1,2,4,12,13],chartCertify:[0,1,4,12],contactVertices:[0,1,2,4,12],contactEdges:[0,1,2,4,12,13,14],surfaceLines:[0,1,2,3,4,5,6,8,10,11,12,15],prepareInterior:[0,1,2,3,4,6,7,8,9,10,11],faceDifferentials:[0,1,2,3,4,6,7,8,9],radialCurvature:[0,1,2,3,4,8,9],suggestiveContours:[0,1,2,3,4,5,6,8,9,15],principalCurvature:[0,1,2,3,4,7,8,9],ridgeDerivative:[0,1,2,4,7,9],ridgeLines:[0,1,2,3,4,5,6,8,9,15],viewFaceLines:[0,1,2,3,4,5,6,8,9,15]};
-const BATCH_ITEM_WORDS=60,BATCH_TABLE_BYTES=16+SURFACE_RELATION_BATCH_ITEMS*BATCH_ITEM_WORDS*4,BATCH_DISPATCH_WORDS=18;
+// Direct and batched anchor dispatches execute the same projection body. It
+// links each complete record atomically; there is no second insertion owner.
+export const SURFACE_PART_ANCHOR_BINDINGS={
+ partAnchorClear:[0,17],
+ // The generation-owned cache and current-frame marker live in the source
+ // packet. Projection reads that marker and never re-walks canonical samples.
+ partAnchors:[0,2,3,4,8,10,16,17,19],
+} as const;
+// Direct and batched stages share their bodies and resource contract. Frontier
+// compilation moved partCodes/anchor input from certification to vertex marking.
+export const SURFACE_CONTACT_BINDINGS={
+ contactClear:[0,1,4,8,12],voxelVote:[0,1,2,4,8,12,13],voxelHome:[0,1,4,8,12],
+ voxelBin:[0,1,2,4,8,12,13],chartCorners:[0,1,2,4,8,12,13],
+ chartCertify:[0,1,4,8,12,18],contactVertices:[0,1,2,4,8,12,13,16],
+ contactEdges:[0,1,2,4,8,12,13,14],
+} as const;
+const BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,prepareFrontier:[0,1,4,6,7,8,16],...SURFACE_CONTACT_BINDINGS,boundaryLines:[0,1,2,3,4,5,6,8,10,11,12,15],contourLines:[0,1,2,3,4,5,6,8,10,11,15],prepareInterior:[0,1,2,3,4,6,7,8,9,10,11],faceDifferentials:[0,1,2,3,4,6,8,9],radialCurvature:[0,1,2,3,4,8,9],suggestiveContours:[0,1,2,3,4,5,6,8,9,15],principalCurvature:[0,1,2,3,4,8,9],ridgeDerivative:[0,1,2,4,8,9],ridgeLines:[0,1,2,3,4,5,6,8,9,15],viewFaceLines:[0,1,2,3,4,5,6,8,9,15]};
+const BATCH_INDIRECT_OFFSETS:Partial<Record<BatchStage,number>>={boundaryLines:0,contourLines:12,contactClear:24,contactVertices:36,contactEdges:48,partAnchors:72,voxelVote:84,voxelBin:108,chartCorners:120,chartCertify:132,faceDifferentials:24,radialCurvature:36,suggestiveContours:48,principalCurvature:36,ridgeDerivative:36,ridgeLines:48,viewFaceLines:48};
+/** The physical shader's boundary no longer reaches partCodes or the chart;
+ * binding 13 is therefore omitted from its host bind group. Generic and
+ * GPU-indexed stages keep the producer-capable map above. */
+const PHYSICAL_BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...BATCH_BINDINGS,prepareFrontier:[0,1,4,6,7,8],contactClear:[0],voxelVote:[0],voxelBin:[0],chartCorners:[0],chartCertify:[0],contactVertices:[0],contactEdges:[0],boundaryLines:BATCH_BINDINGS.boundaryLines.filter(binding=>binding!==13)};
+const BATCH_ITEM_WORDS=64,BATCH_DISPATCH_WORDS=36;
+/** The header is part of the uniform binding too. Select a complete table
+ * once per device, then use its identical item count in WGSL and host splits.
+ * Smaller devices get more batches, never fewer source constructions. */
+function relationBatchItems(device:GPUDevice):number{
+ const limit=device.limits?.maxUniformBufferBindingSize??16384;
+ const count=Math.min(SURFACE_RELATION_BATCH_ITEMS,Math.floor((limit-16)/(BATCH_ITEM_WORDS*4)));
+ if(count<1)throw Error(`MAIN relation table cannot fit one complete source in ${limit}-byte uniform binding`);
+ return count;
+}
 /** Retained posed tensors of batched sources, as ranges of a few large pages
  * (every source of one page shares one dispatch). Pages grow 32 MB, 64 MB ...
  * up to the device binding limit; a retired range is reused only after the
@@ -1608,7 +2498,7 @@ class TensorPages{
  }
  dispose():void{for(const page of this.pages)page.buffer.destroy();this.pages.length=0;this.retiring=[];}
 }
-interface BatchItem{readonly stage:BatchStage;readonly threads:number;readonly words:Uint32Array;readonly base:readonly number[];readonly base2:readonly number[];readonly bound:RelationBinding[]}
+interface BatchItem{readonly stage:BatchStage;readonly threads:number;readonly words:Uint32Array;readonly base:readonly number[];readonly base2:readonly number[];readonly bound:RelationBinding[];readonly dynamic?:boolean}
 interface BatchQueue{readonly items:BatchItem[];readonly clears:GPUBufferBinding[];readonly seen:Set<object>;contactWords:number;dispatchItems:number}
 
 /** A physical batch's static draw extent: index count and instance count
@@ -1650,17 +2540,68 @@ function planarRest(geometry:{readonly positions:Float32Array;readonly indices:U
 
 export const CHART_CELLS=32768;
 
-export const PART_ANCHOR_RECORD_WORDS=8;
+
+
+
+
+export const PART_ANCHOR_RECORD_WORDS=16;
+
+
+
+
+/** Homogeneous clip(4), source parameter, original edge endpoints and t.
+ * The exact directory owns the repeated owner/instance/feature/context. */
+export const PART_ANCHOR_CANONICAL_WORDS=8;
 
 
 
 
 
-export interface SourcePartAnchorTable {readonly buffer:GPUBuffer;readonly headSlots:number;readonly headBase:number;readonly recordBase:number;readonly recordWords:number}
+
+
+
+
+/** The prepared row table is packed into the articulation counts arena.  The
+ * relation owner publishes only its immutable layout; GPU storage is owned by
+ * the articulation job so no ninth bind-group storage slot is needed. */
+export interface SourcePartRowTable {readonly touchedRows:number}
+export interface SourcePartAnchorTable {readonly buffer:GPUBuffer;readonly headSlots:number;readonly headBase:number;readonly recordBase:number;readonly recordWords:number;readonly canonicalBase?:number;readonly canonicalRecords?:number;readonly canonicalWords?:number;readonly rowTable?:SourcePartRowTable}
+/** Same-submission live anchor demand. The GPU cursor is copied after the
+ * relation pass and read only after that submission's fence; it never drives
+ * a partial publication or a previous-frame estimate. */
+export interface PartAnchorDemand {readonly records:number;readonly canonicalRows:number;readonly overflow:boolean;readonly selected:number}
+export interface PartAnchorDemandReadback {collect():Promise<PartAnchorDemand>;dispose():void}
 const samePartAnchorVertices=(a:Uint32Array|undefined,b:Uint32Array|undefined):boolean=>a===b||(!!a&&!!b&&a.length===b.length&&a.every((value,index)=>value===b[index]));
+interface PartAnchorCanonicalLayout {readonly parts:number;readonly meta:number;readonly recordAt:number;readonly sampleAt:number;readonly sampleWords:number;readonly sampleCount:number;readonly instanceStride:number}
+/** Find the source packet's trailing canonical table without interpreting an
+ * old six-word anchor array as metadata. This is residency-time parsing only;
+ * no topology scan occurs on a camera frame. */
+const partAnchorCanonicalLayout=(vertices:Uint32Array|undefined):PartAnchorCanonicalLayout|undefined=>{
+ if(!vertices)return;
+ for(let parts=1;parts*6+TOPOLOGY_PART_CANONICAL_HEADER_WORDS<=vertices.length;parts++){
+  const meta=parts*6;
+  if(vertices[meta]!==TOPOLOGY_PART_CANONICAL_MAGIC||vertices[meta+1]!==TOPOLOGY_PART_CANONICAL_VERSION||vertices[meta+3]!==parts||vertices[meta+6]!==TOPOLOGY_PART_CANONICAL_RECORD_WORDS||vertices[meta+7]!==TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS)continue;
+  const recordAt=vertices[meta+2]!,sampleAt=vertices[meta+4]!,sampleWords=vertices[meta+5]!;
+  if(recordAt<meta+TOPOLOGY_PART_CANONICAL_HEADER_WORDS||recordAt+parts*TOPOLOGY_PART_CANONICAL_RECORD_WORDS>vertices.length||sampleWords%TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS!==0||sampleAt+sampleWords>vertices.length)continue;
+  let sampleCount=0;for(let part=0;part<parts;part++){const at=recordAt+part*TOPOLOGY_PART_CANONICAL_RECORD_WORDS;sampleCount+=vertices[at+5]!;}
+  return {parts,meta,recordAt,sampleAt,sampleWords,sampleCount,instanceStride:sampleCount};
+ }
+ return;
+};
+const partAnchorPartCount=(vertices:Uint32Array|undefined):number=>{
+ const canonical=partAnchorCanonicalLayout(vertices);
+ return canonical?.parts??(vertices&&vertices.length>=6&&vertices.length%6===0?vertices.length/6:0);
+};
 
 export function currentRestCellChart(indexed:{readonly generation:number;readonly restCellChart?:GpuIndexedRestCellChart}|undefined):GpuIndexedRestCellChart|undefined{
   const chart=indexed?.restCellChart;return chart&&chart.kind==='voxel-rest-cell-chart'&&chart.sourceGeneration===indexed!.generation?chart:undefined;
+}
+
+
+
+export function chartOccupancy(indexed:{readonly generation:number;readonly restCellChart?:GpuIndexedRestCellChart}|undefined,extent:readonly [number,number,number]):GpuIndexedCellOccupancy|undefined{
+  const chart=currentRestCellChart(indexed),occupancy=chart?.occupancy;
+  return occupancy?.kind==='voxel-column-occupancy-v1'&&chart!.extent.every((n,i)=>n===extent[i])?occupancy:undefined;
 }
 export function cellChart(extent:readonly [number,number,number]):{cells:number;corners:number;clusters:number}|undefined{
   const [x,y,z]=extent;if(![x,y,z].every(n=>Number.isInteger(n)&&n>=1&&n<=256))return undefined;
@@ -1676,7 +2617,17 @@ export function chartToken(batch:{readonly source:{readonly posedRevision?:numbe
   if(generation===undefined||!Number.isSafeInteger(generation)||generation<0||generation>POSED_CONTENT_MAX)return 1;
   return generation+2;
 }
-interface ColumnHome {readonly offset:number;readonly slots:number;source:unknown;fresh:boolean}
+interface ColumnHome {readonly offset:number;readonly slots:number;readonly levels:readonly number[];readonly anchorParts:number;source:unknown;fresh:boolean}
+
+
+export function chartLevelClusters(extent:readonly [number,number,number]):readonly number[]{
+  return [2,4,8,16].map(b=>extent.reduce((n,e)=>n*Math.ceil(e/b),1));
+}
+/** Words of one source's four contiguous level homes (each: 4 header words + 4 words per cluster). */
+export function chartHomeWords(levels:readonly number[]):number{return levels.reduce((n,clusters)=>n+4+clusters*4,0);}
+
+
+export function chartRequirementWords(extent:readonly [number,number,number]):number{return chartLevelClusters(extent).reduce((n,clusters)=>n+clusters,0);}
 /** Home words of all chunks together; past it every home restarts (bounded memory, 16 MB). */
 const COLUMN_HOME_WORDS=1<<22;
 /** The largest posed content revision with its own token (POSED_CONTENT_MAX+2 = 0xffffffff). */
@@ -1697,33 +2648,58 @@ export function posedContentToken(batch:{readonly source:{readonly posedRevision
 
 
 
-export function tensorRevision(batch:{readonly source:{readonly posedRevision?:number};readonly gpuPose?:{readonly posedContentRevision?:number}}):number|undefined{
+
+
+export function tensorRevision(batch:{readonly source:{readonly posedRevision?:number;readonly visibleInstanceFrontier?:unknown;readonly nativeVisibleInstanceFrontier?:unknown};readonly gpuPose?:{readonly posedContentRevision?:number}},frontierAdmitted=false):number|undefined{
   if(batch.source.posedRevision===undefined)return undefined;
+  // Parent admission compacts the GPU frontier after form-depth resolution;
+  // its final membership is not available to the CPU cache key. Rebuild the
+  // selected tensor layout rather than reusing a buffer indexed by a prior
+  // camera's compacted ordinals.
+ if(frontierAdmitted&&(batch.source.visibleInstanceFrontier!==undefined||batch.source.nativeVisibleInstanceFrontier!==undefined))return undefined;
   if(!batch.gpuPose)return batch.source.posedRevision;
   const token=posedContentToken(batch);return token>1?token:undefined;
 }
-const SURFACE_RELATION_ENTRIES=['prepare','partAnchorClear','partAnchors','partAnchorInsert','contactClear','voxelVote','voxelHome','voxelBin','chartCorners','chartCertify','contactVertices','contactEdges','boundaries','contours','surfaceLines'] as const;
+const SURFACE_RELATION_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','voxelVote','voxelHome','voxelBin','chartCorners','chartCertify','contactVertices','contactEdges','boundaries','contours','surfaceLines'] as const;
 const SURFACE_RELATION_INTERIOR_ENTRIES=['prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'] as const;
 // The batched entries exist only with the interior stages (the physical path).
 const SURFACE_RELATION_BATCH_ENTRIES=BATCH_ORDER.map(batchEntryName);
 type SurfaceRelationEntry=typeof SURFACE_RELATION_ENTRIES[number]|typeof SURFACE_RELATION_INTERIOR_ENTRIES[number]|string;
-const surfaceRelationEntries=(interior:boolean):readonly SurfaceRelationEntry[]=>interior?[...SURFACE_RELATION_ENTRIES,...SURFACE_RELATION_INTERIOR_ENTRIES,...SURFACE_RELATION_BATCH_ENTRIES]:SURFACE_RELATION_ENTRIES;
+/** Preparation contract for the shared relation owner. `generic` remains the
+ * public compatibility profile for consumers that may use both direct and
+ * batched append contracts. MAIN's ordinary example caller uses
+ * `generic-direct`: it retains every direct GPU-indexed, voxel/contact and
+ * interior producer, but has no extent/frontier batch contract and therefore
+ * must not compile the batch-only entry points. The compiled physical host
+ * supplies the complete batch contract (extent + visibility frontier + posed
+ * revision) and queues every source into flushBatched(), so it uses the
+ * physical profile instead of guessing from a scene name. */
+export type SurfaceRelationPreparation='generic'|'generic-direct'|'physical-batched';
+const surfaceRelationEntries=(interior:boolean,preparation:SurfaceRelationPreparation='generic'):readonly SurfaceRelationEntry[]=>
+ preparation==='physical-batched'?(interior?['admitFrontier',...SURFACE_RELATION_BATCH_ENTRIES]:['admitFrontier']):
+ preparation==='generic-direct'?(interior?[...SURFACE_RELATION_ENTRIES,...SURFACE_RELATION_INTERIOR_ENTRIES]:SURFACE_RELATION_ENTRIES):
+ interior?[...SURFACE_RELATION_ENTRIES,...SURFACE_RELATION_INTERIOR_ENTRIES,...SURFACE_RELATION_BATCH_ENTRIES]:SURFACE_RELATION_ENTRIES;
 interface PreparedSurfaceRelations{
  readonly plans:ReadonlyMap<SurfaceRelationEntry,ComputePipelinePlan>;
  readonly pipelines:ReadonlyMap<SurfaceRelationEntry,GPUComputePipeline>;
+ readonly preparation:SurfaceRelationPreparation;
 }
-function surfaceRelationPipelinePlans(device:GPUDevice,interior:boolean):ReadonlyMap<SurfaceRelationEntry,ComputePipelinePlan>{
+function surfaceRelationPipelinePlans(device:GPUDevice,interior:boolean,preparation:SurfaceRelationPreparation='generic'):ReadonlyMap<SurfaceRelationEntry,ComputePipelinePlan>{
  const plans=new Map<SurfaceRelationEntry,ComputePipelinePlan>();
- for(const entry of surfaceRelationEntries(interior)){
+ const batchSource=(preparation==='physical-batched'?SURFACE_RELATIONS_PHYSICAL_BATCH_SHADER:SURFACE_RELATIONS_BATCH_SHADER).replace(`items:array<BatchItem,${SURFACE_RELATION_BATCH_ITEMS}>`,`items:array<BatchItem,${relationBatchItems(device)}>`);
+ for(const entry of surfaceRelationEntries(interior,preparation)){
   const batched=entry.startsWith('batch');
-  plans.set(entry,()=>{const module=device.createShaderModule({label:'MAIN attributed source relations '+entry,code:isolateComputeEntry(batched?SURFACE_RELATIONS_BATCH_SHADER:SURFACE_RELATIONS_SHADER,entry)});
+  const code=batched?isolateComputeEntry(batchSource,entry):isolateComputeEntry(SURFACE_RELATIONS_SHADER,entry);
+  plans.set(entry,()=>{const module=device.createShaderModule({label:'MAIN attributed source relations '+entry,code});
    return {layout:'auto',compute:{module,entryPoint:entry}};});
  }
  return plans;
 }
 export class SurfaceRelations {
+  private readonly batchItems:number;
   lines:GPUBuffer;readonly status:GPUBuffer;
   private readonly dispatch:GPUBuffer;
+  private readonly preparation:SurfaceRelationPreparation;
   private readonly pipelines:Record<string,GPUComputePipeline>={};
   private pending:GPUBuffer[]=[];
   private retired:GPUBuffer[]=[];
@@ -1732,34 +2708,80 @@ export class SurfaceRelations {
 
 
 
-  private readonly partAnchorSources=new Map<unknown,{source:unknown;vertices:Uint32Array;input:GPUBuffer;base:number;parts:number;instances:number}>();
+  private readonly partAnchorSources=new Map<unknown,{source:unknown;vertices:Uint32Array;input:GPUBuffer;base:number;parts:number;instances:number;canonicalBase:number;canonicalSamples:number;canonicalStride:number}>();
+  /** Per-frame live anchor cursors: [records, canonical words, overflow, selected]. */
+  private readonly partAnchorAlloc:GPUBuffer;
   private partAnchorBuffer?:GPUBuffer;private partAnchorHeadSlots=0;private partAnchorRecords=0;private partAnchorRecordCapacity=0;
-  private partAnchorFrameCleared=false;private partAnchorGrowTo=0;
+  private partAnchorCanonicalBase=0;private partAnchorCanonicalSamples=0;private partAnchorCanonicalCapacity=0;
+  private partAnchorRowLayout?:SourcePartRowTable;
+  /** Exact maximum demand observed from the producer, separate from the
+   * rounded payload reserve used by the next articulation job. */
+  private partAnchorRowRequired=0;private partAnchorRowCapacity=0;
+  private partAnchorFrameCleared=false;private partAnchorGrowTo=0;private partAnchorGrowCanonicalTo=0;
   /** The owner-keyed extent table (undefined until a source registers). Consumers re-read it each frame. */
   get partAnchorTable():SourcePartAnchorTable|undefined{
-    return this.partAnchorBuffer?{buffer:this.partAnchorBuffer,headSlots:this.partAnchorHeadSlots,headBase:2,recordBase:2+this.partAnchorHeadSlots,recordWords:PART_ANCHOR_RECORD_WORDS}:undefined;
+    return this.partAnchorBuffer?{buffer:this.partAnchorBuffer,headSlots:this.partAnchorHeadSlots,headBase:2,recordBase:2+this.partAnchorHeadSlots,recordWords:PART_ANCHOR_RECORD_WORDS,canonicalBase:this.partAnchorCanonicalBase,canonicalRecords:this.partAnchorCanonicalSamples,canonicalWords:PART_ANCHOR_CANONICAL_WORDS,rowTable:this.partAnchorRowLayout}:undefined;
+  }
+  /** Allocate the prepared row arena alongside the existing owner-keyed
+   * anchor arena. Its descriptor/bitset space is sized from the live source
+   * records and page rows; its payload is sized only from the exact touched-row
+   * demand returned by the native producer. A zero-demand first attempt is a
+   * measured grow probe, not a permanent quota or incumbent replacement. */
+  private ensurePartAnchorRowTable():void{
+    // Candidate anchor records are NOT native source programmes. In
+    // particular, a GPU voxel source can declare millions of legacy anchors
+    // with no canonical passage. Carry only reserve demand here; articulation
+    // owns the selected source-run domain and sizes its row metadata there.
+    this.partAnchorRowLayout=this.partAnchorBuffer&&this.detailPage&&this.partAnchorCanonicalSamples>0?{touchedRows:this.partAnchorRowCapacity}:undefined;
   }
   /** Register (or keep) a batch's declared anchors from its residency source; returns the entry, or undefined. */
   private partAnchorsFor(batch:PosedSourceBatch,source:ResidentRelationSource):{input:GPUBuffer;parts:number;instances:number}|undefined{
     const vertices=(source as {partAnchorVertices?:Uint32Array}).partAnchorVertices;const key=posedBatchIdentity(batch);
-    const instances=Math.max(1,batch.source.instanceCapacity??1);
+    const instances=partAnchorInstanceCount(batch);
+    // An empty prepared frontier is a valid no-draw result. Do not allocate a
+    // source registration or canonical side table for a dispatch with no
+    // selected ordinals; an older entry remains fenced by the existing expiry
+    // path so an in-flight retry keeps its range valid.
+    if(instances===0)return undefined;
     const held=this.partAnchorSources.get(key);
 
-    if(held&&samePartAnchorVertices(held.vertices,vertices)&&held.instances===instances){held.source=source;this.expiry.use(held);return held;}
+    // CONTENTS + demand. A batched producer may expose a shorter final slice
+    // under the same identity; its existing larger range remains safe because
+    // the GPU count check exits before visiting the unused records.
+    const retainedDemand=held&&samePartAnchorVertices(held.vertices,vertices)&&
+      (held.instances===instances||(batch.source.visibleInstanceFrontier===undefined&&held.instances>instances));
+    if(retainedDemand){held.source=source;this.expiry.use(held);return held;}
     if(held){this.partAnchorSources.delete(key);this.retired.push(held.input);}
-    if(!vertices||vertices.length<6||vertices.length%6!==0)return undefined;
-    const parts=vertices.length/6;
-    if(this.partAnchorRecords+parts*instances>this.partAnchorRecordCapacity){
-
-      // the first table has no references yet. Otherwise skip this source until the frame boundary.
-      if(this.partAnchorBuffer){this.partAnchorGrowTo=Math.max(this.partAnchorGrowTo,this.livePartAnchorRecords()+parts*instances);return undefined;}
-      this.growPartAnchorTable(parts*instances);
+    const canonical=partAnchorCanonicalLayout(vertices);
+    const parts=canonical?.parts??(vertices&&vertices.length>=6&&vertices.length%6===0?vertices.length/6:0);
+    if(!vertices||parts===0)return undefined;
+    const canonicalSamples=canonical?.sampleCount??0,canonicalStride=canonical?.instanceStride??0;
+    if(!this.partAnchorBuffer)this.growPartAnchorTable(parts*instances,canonicalSamples*instances);
+    // Canonical rows are compacted by the GPU live cursor. A source may have
+    // more candidate samples than the current device-sized table can hold;
+    // that is reported by partAnchorAlloc and retried at the same pose, not
+    // by refusing this source during registration.
+    const base=this.partAnchorRecords;this.partAnchorRecords+=parts*instances;this.partAnchorCanonicalSamples+=canonicalSamples*instances;
+    // Four level-cache words plus one current-frame marker per source part
+    // follow the immutable packet. The
+    // chart-certify producer writes them only on a content-generation rebuild;
+    // camera frames only read them, so the packet remains the source-owned
+    // lifetime rather than a per-frame topology allocation.
+    // Word 0 used to carry the unused candidate-prefix offset. Live records
+    // are cursor-allocated; use that word for the SAME directory boundary in
+    // canonical and legacy packets, without growing either packet/header ABI.
+    const data=new Uint32Array(2+vertices.length+parts*5);data[0]=this.partAnchorCanonicalBase;data[1]=parts;data.set(vertices,2);
+    if(canonical){
+      const meta=2+canonical.meta,recordAt=2+canonical.recordAt,sampleAt=2+canonical.sampleAt;
+      // The GPU allocator assigns compact rows after live owner/LOD tests;
+      // The shared packet header owns the directory boundary; metadata keeps
+      // only immutable source addresses and its instance stride.
+      data[meta+2]=recordAt;data[meta+4]=sampleAt;data[meta+9]=canonicalStride;
+      for(let part=0;part<parts;part++){const record=recordAt+part*TOPOLOGY_PART_CANONICAL_RECORD_WORDS;if(data[record+5]!>0)data[record+4]=data[record+4]!+2;}
     }
-    const base=this.partAnchorRecords;this.partAnchorRecords+=parts*instances;
-    const data=new Uint32Array(2+vertices.length);data[0]=base;data[1]=parts;data.set(vertices,2);
     const input=this.device.createBuffer({label:'MAIN source-declared part anchors',size:data.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
     this.device.queue.writeBuffer(input,0,data);
-    const entry={source,vertices,input,base,parts,instances};this.partAnchorSources.set(key,entry);
+    const entry={source,vertices,input,base,parts,instances,canonicalBase:0,canonicalSamples,canonicalStride};this.partAnchorSources.set(key,entry);
     this.expiry.use(entry,()=>{if(this.partAnchorSources.get(key)!==entry)return;this.partAnchorSources.delete(key);this.retired.push(entry.input);});
     return entry;
   }
@@ -1768,41 +2790,95 @@ export class SurfaceRelations {
 
 
   reservePartAnchors(batches:Iterable<{readonly batch:PosedSourceBatch;readonly source:ResidentRelationSource}>):void{
-    let additional=0,replaced=0;const seen=new Set<object>();
+    let additional=0,canonicalAdditional=0;const seen=new Set<object>();
     for(const {batch,source}of batches){
       const key=posedBatchIdentity(batch);if(seen.has(key))continue;seen.add(key);
-      const vertices=(source as {partAnchorVertices?:Uint32Array}).partAnchorVertices;if(!vertices||vertices.length<6||vertices.length%6!==0)continue;
-      const instances=Math.max(1,batch.source.instanceCapacity??1),held=this.partAnchorSources.get(key);
-      if(held&&samePartAnchorVertices(held.vertices,vertices)&&held.instances===instances)continue;
-      additional+=vertices.length/6*instances;replaced+=held?held.parts*held.instances:0;
+      const vertices=(source as {partAnchorVertices?:Uint32Array}).partAnchorVertices,canonical=partAnchorCanonicalLayout(vertices);const parts=canonical?.parts??(vertices&&vertices.length>=6&&vertices.length%6===0?vertices.length/6:0);if(!vertices||parts===0)continue;
+      const instances=partAnchorInstanceCount(batch),held=this.partAnchorSources.get(key);
+      if(instances===0)continue;
+      if(held&&samePartAnchorVertices(held.vertices,vertices)&&
+        (held.instances===instances||(batch.source.visibleInstanceFrontier===undefined&&held.instances>instances)))continue;
+      additional+=parts*instances;canonicalAdditional+=(canonical?.sampleCount??0)*instances;
     }
-    const needed=this.partAnchorRecords+additional;
-    if(needed<=this.partAnchorRecordCapacity)return;
-    // Only at exhaustion: compact dead slots instead of growing from the
-    // historical high-water mark. Ordinary frames never scan this cache.
-    const liveNeeded=this.livePartAnchorRecords()+additional-replaced;
-    const referenced=this.partAnchorFrameCleared||(this.queue?.items.some(item=>item.stage==='partAnchors')??false);
-    if(!this.partAnchorBuffer||!referenced)this.growPartAnchorTable(liveNeeded);else this.partAnchorGrowTo=Math.max(this.partAnchorGrowTo,liveNeeded);
+    if(additional===0){this.ensurePartAnchorRowTable();return;}
+    if(this.partAnchorBuffer){this.ensurePartAnchorRowTable();return;}
+    // The first table is only a device-sized arena. Candidate parts do not
+    // reserve one record each; the projection cursor measures selected demand
+    // and schedules an exact same-pose grow/replay if this arena is too small.
+    this.growPartAnchorTable(Math.max(1,additional),Math.max(0,canonicalAdditional));
+    this.ensurePartAnchorRowTable();
   }
   private livePartAnchorRecords():number{
     let records=0;for(const entry of this.partAnchorSources.values())records+=entry.parts*entry.instances;return records;
   }
-  private growPartAnchorTable(records:number):void{
-    let capacity=1024;while(capacity<records*2)capacity*=2;
-    let heads=1024;while(heads<capacity)heads*=2;
-    if(this.partAnchorBuffer)this.retired.push(this.partAnchorBuffer);
-    for(const entry of this.partAnchorSources.values())this.retired.push(entry.input);
-    this.partAnchorSources.clear();this.partAnchorRecords=0;this.partAnchorRecordCapacity=capacity;this.partAnchorHeadSlots=heads;
-    this.partAnchorBuffer=this.device.createBuffer({label:'MAIN owner-keyed part anchor extents',size:(2+heads+capacity*PART_ANCHOR_RECORD_WORDS)*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
-    this.device.queue.writeBuffer(this.partAnchorBuffer,0,new Uint32Array([heads,2+heads]));this.partAnchorFrameCleared=false;
+  private livePartAnchorCanonicalSamples():number{
+    let samples=0;for(const entry of this.partAnchorSources.values())samples+=entry.canonicalSamples*entry.instances;return samples;
+  }
+  private growPartAnchorTable(records:number,canonicalSamples=0):void{
+    const maximum=Math.min(this.device.limits?.maxBufferSize??Infinity,this.device.limits?.maxStorageBufferBindingSize??Infinity);
+    const powerOfTwoAtLeast=(value:number,min:number)=>{let result=Math.max(1,min);while(result<value)result*=2;return result;};
+    // Geometric slack is useful for ordinary churn, but it is not allowed to
+    // turn a complete source demand into a device-limit failure. The record
+    // and canonical extents are independent: only the bucket heads need a
+    // power-of-two extent. Prefer the incumbent 2x growth when it fits, then
+    // retry with the exact complete demand (not a cap or a dropped producer).
+    const exactRecords=Math.max(1,records),exactCanonical=Math.max(0,canonicalSamples);
+    const exactHeads=powerOfTwoAtLeast(exactRecords,1024);
+    const preferredRecords=powerOfTwoAtLeast(exactRecords*2,1024),preferredCanonical=exactCanonical===0?0:powerOfTwoAtLeast(exactCanonical*2,1024),preferredHeads=powerOfTwoAtLeast(preferredRecords,1024);
+    const preferredBytes=partAnchorTableBytes(preferredHeads,preferredRecords,preferredCanonical);
+    const usePreferred=preferredBytes<=maximum;
+    let capacity=usePreferred?preferredRecords:exactRecords;
+    let heads=usePreferred?preferredHeads:exactHeads;
+    const maximumWords=Math.floor(maximum/4);
+    // Initial registration may describe every producer candidate, while the
+    // live camera selects only a subset. Never let that candidate census make
+    // the first table impossible: reserve a device-sized arena and let the
+    // completed cursor demand drive an exact same-pose repartition.
+    if(2+heads+capacity*PART_ANCHOR_RECORD_WORDS>maximumWords){
+      heads=1024;capacity=Math.floor((maximumWords-2-heads)/PART_ANCHOR_RECORD_WORDS);
+      if(capacity<1)throw Error(`Owner-keyed part-anchor record arena cannot fit device binding capacity ${maximum} bytes`);
+    }
+    const canonicalBase=2+heads+capacity*PART_ANCHOR_RECORD_WORDS;
+    // The canonical cursor consumes only live projected rows. Keep the
+    // complete record directory, then use every remaining device-sized word
+    // for canonical rows; an over-demand is surfaced by the GPU overflow
+    // counter for same-pose replay rather than failing before first text.
+    const availableCanonical=Math.max(0,Math.floor((maximumWords-canonicalBase)/PART_ANCHOR_CANONICAL_WORDS));
+    const canonicalCapacity=Math.min(exactCanonical,availableCanonical);
+    const bytes=partAnchorTableBytes(heads,capacity,canonicalCapacity);
+    if(bytes>maximum)throw Error(`Owner-keyed part anchor records (${bytes} bytes; ${records} complete records) exceed device binding capacity ${maximum} bytes`);
+    // Allocate and initialize the replacement before retiring the current
+    // table or clearing its registrations. A device-limit/create/write failure
+    // must leave the old table usable for the existing frame and retry, rather
+    // than multiplying the requested size against an already-cleared cache.
+    const previous=this.partAnchorBuffer,previousInputs=[...this.partAnchorSources.values()];
+    let replacement:GPUBuffer|undefined;
+    try{
+      replacement=this.device.createBuffer({label:'MAIN owner-keyed part anchor extents and source passages',size:bytes,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+      this.device.queue.writeBuffer(replacement,0,new Uint32Array([heads,2+heads]));
+    }catch(error){replacement?.destroy();throw error;}
+    if(previous)this.retired.push(previous);
+    for(const entry of previousInputs)this.retired.push(entry.input);
+    this.partAnchorSources.clear();this.partAnchorRecords=0;this.partAnchorCanonicalSamples=0;
+    this.partAnchorRecordCapacity=capacity;this.partAnchorCanonicalCapacity=canonicalCapacity;this.partAnchorHeadSlots=heads;this.partAnchorCanonicalBase=canonicalBase;
+    this.partAnchorBuffer=replacement;this.partAnchorRowLayout=undefined;this.partAnchorFrameCleared=false;
   }
   private readonly homes=new Map<unknown,ColumnHome>();private homeScratch=0;private homeWords=0;
+  /** Only a certified native owner authority or the legacy physical producer
+   * row may compact a shared instance frontier. Custom/GPU-indexed and
+   * multi-owner sources retain their complete incumbent list. */
+  private readonly admittedFrontiers=new Set<object>();
+  /** Per-frame native compact lists. They are produced before contacts and
+   * reused by every same-pose consumer; the retained binding owns their
+   * submission lifetime. */
+  private readonly frontierSelections=new Map<object,GPUBuffer>();
   private intersections?:SurfaceIntersections;
   private contactsActive=false;
   private detailField?:SurfaceField;
   private detailPage?:readonly [number,number];
   private emptyDetail?:GPUTexture;
   private emptyDetailView?:GPUTextureView;
+  private emptyPartAnchorVertices?:GPUBuffer;
 
 
 
@@ -1814,16 +2890,22 @@ export class SurfaceRelations {
     return this.emptyDetailView??=(this.emptyDetail??=this.device.createTexture({label:'MAIN unselected detail table',size:[1,1],format:'rgba32uint',usage:GPUTextureUsage.TEXTURE_BINDING})).createView();
   }
   private readonly retainedDifferentials=new Map<object,Map<number,{revision:number;buffer:GPUBuffer}>>();
-  static async create(device:GPUDevice,lineCapacity=32768,interior=false,progress?:(fraction:number)=>void):Promise<SurfaceRelations>{
-   const plans=surfaceRelationPipelinePlans(device,interior),pipelines=await prepareComputePipelines(device,plans,progress);
-   return new SurfaceRelations(device,lineCapacity,interior,{plans,pipelines});
+ static async create(device:GPUDevice,lineCapacity=32768,interior=false,progress?:(fraction:number)=>void,preparation:SurfaceRelationPreparation='generic'):Promise<SurfaceRelations>{
+   const plans=surfaceRelationPipelinePlans(device,interior,preparation),pipelines=await prepareComputePipelines(device,plans,progress);
+   return new SurfaceRelations(device,lineCapacity,interior,{plans,pipelines,preparation});
   }
   constructor(private readonly device:GPUDevice,public lineCapacity=32768,private readonly interior=false,prepared?:PreparedSurfaceRelations){
     this.lines=device.createBuffer({size:lineCapacity*RELATION_WORDS*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
     this.status=device.createBuffer({size:16,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
-    this.dispatch=device.createBuffer({size:72,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.INDIRECT});
-    const plans=prepared?.plans??surfaceRelationPipelinePlans(device,interior),pipelines=prepared?.pipelines??compileComputePipelines(device,plans);
-    for(const entryPoint of surfaceRelationEntries(interior))this.pipelines[entryPoint]=pipelines.get(entryPoint)!;
+    // prepare publishes relation/contact arguments through word 35 (the
+    // compact frontier stages), while prepareInterior reuses words 6..17.
+    this.dispatch=device.createBuffer({size:144,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.INDIRECT});
+    this.partAnchorAlloc=device.createBuffer({label:'MAIN live part-anchor allocation cursors',size:16,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+    this.emptyPartAnchorVertices=device.createBuffer({label:'MAIN empty source part anchors',size:8,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+    this.device.queue.writeBuffer(this.emptyPartAnchorVertices,0,new Uint32Array([0,0]));
+    this.preparation=prepared?.preparation??'generic';this.batchItems=relationBatchItems(device);
+    const plans=prepared?.plans??surfaceRelationPipelinePlans(device,interior,this.preparation),pipelines=prepared?.pipelines??compileComputePipelines(device,plans);
+    for(const entryPoint of plans.keys())this.pipelines[entryPoint]=pipelines.get(entryPoint)!;
   }
   /** Grow storage for an already counted, retained source submission. This
    * changes allocation only: it never limits source owners or source ranges.
@@ -1838,7 +2920,7 @@ export class SurfaceRelations {
   }
   /** `contactScale`: passed to SurfaceIntersections.begin (id raster columns per field column). */
   begin(encoder:GPUCommandEncoder,view?:SurfaceGraphView,field?:SurfaceField,contactScale=1):void{
-    encoder.clearBuffer(this.status);this.contactsActive=!!view&&!!field;
+    encoder.clearBuffer(this.status);encoder.clearBuffer(this.partAnchorAlloc);this.admittedFrontiers.clear();this.frontierSelections.clear();this.contactsActive=!!view&&!!field;
     this.detailField=field;this.detailPage=view?.pageExtent;this.fieldDomains=undefined;
     if(view&&field)(this.intersections??=new SurfaceIntersections(this.device)).begin(encoder,view,field,this.status,contactScale);
 
@@ -1846,16 +2928,120 @@ export class SurfaceRelations {
     this.queue=this.interior?{items:[],clears:[],seen:new Set(),contactWords:0,dispatchItems:0}:undefined;
   }
   ensureContactCapacity(count:number):void{(this.intersections??=new SurfaceIntersections(this.device)).ensureCapacity(count);}
-  finish(encoder:GPUCommandEncoder):void{this.flushBatched(encoder);if(this.contactsActive)this.intersections!.finish(encoder,this.lines,this.status,this.lineCapacity);this.contactsActive=false;}
+  finish(encoder:GPUCommandEncoder):PartAnchorDemandReadback{
+    this.flushBatched(encoder);if(this.contactsActive)this.intersections!.finish(encoder,this.lines,this.status,this.lineCapacity);this.contactsActive=false;
+    const readback=this.device.createBuffer({label:'MAIN live part-anchor demand readback',size:16,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+    encoder.copyBufferToBuffer(this.partAnchorAlloc,0,readback,0,16);
+    let consumed=false;
+    return {
+      async collect():Promise<PartAnchorDemand>{
+        if(consumed)throw Error('Part-anchor demand readback was already consumed');consumed=true;
+        await readback.mapAsync(GPUMapMode.READ);
+        const words=new Uint32Array(readback.getMappedRange()).slice();readback.unmap();readback.destroy();
+        return {records:words[0]!,canonicalRows:words[1]!,overflow:words[2]!==0,selected:words[3]!};
+      },
+      dispose():void{if(consumed)return;consumed=true;if(readback.mapState==='mapped')readback.unmap();readback.destroy();},
+    };
+  }
+  /** Grow only after a completed same-pose demand readback. If the complete
+   * selected demand cannot fit the device binding, fail explicitly rather than
+   * publishing a table with missing owners or canonical rows. */
+  ensurePartAnchorDemand(demand:PartAnchorDemand):void{
+    if(!demand.overflow)return;
+    const maximum=Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize);
+    const heads=Math.max(1024,2**Math.ceil(Math.log2(Math.max(1,demand.records))));
+    const bytes=partAnchorTableBytes(heads,Math.max(1,demand.records),demand.canonicalRows);
+    if(bytes>maximum)throw Error(`Complete live part-anchor demand (${bytes} bytes; ${demand.records} records, ${demand.canonicalRows} canonical rows) exceeds device binding capacity ${maximum} bytes`);
+    if(demand.records>this.partAnchorRecordCapacity||demand.canonicalRows>this.partAnchorCanonicalCapacity){
+      this.growPartAnchorTable(Math.max(1,demand.records),demand.canonicalRows);
+    }
+  }
+  /** Grow the counts-arena row payload from the exact source-group demand
+   * reported by the articulation header.  This is metadata only; the next
+   * same-pose articulation job allocates the bytes in its existing scratch. */
+  ensurePartAnchorRowDemand(rows:number):void{
+    if(!Number.isSafeInteger(rows)||rows<0)throw Error('Invalid complete native row demand');
+    if(rows>this.partAnchorRowRequired)this.partAnchorRowRequired=rows;
+    if(rows>this.partAnchorRowCapacity){
+      const maximum=Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize);
+      this.partAnchorRowCapacity=Math.max(this.partAnchorRowCapacity,partAnchorRowCapacity(rows,0,0,1,maximum));
+      this.ensurePartAnchorRowTable();
+    }
+  }
+  /** Current rounded payload reserve and exact source demand are observable so
+   * callers can distinguish a growth hint from a structural source failure. */
+  partAnchorRowCapacityWords():number{return this.partAnchorRowCapacity;}
+  partAnchorRowRequiredWords():number{return this.partAnchorRowRequired;}
   /** The contact producer's passes for one source (append does this itself
    * when it opens its own pass). */
   appendContacts(encoder:GPUCommandEncoder,batch:PosedSourceBatch,source:ResidentRelationSource,domain:number):void{
-    if(this.contactsActive)this.intersections!.append(encoder,batch,source,domain);
+    if(this.contactsActive)this.intersections!.append(encoder,batch,source,domain,this.admittedFrontiers.has(batch),this.frontierSelections.get(batch));
   }
   /** Every source's contact passes as two passes (surface-intersections appendAll). */
 
   appendContactsAll(encoder:GPUCommandEncoder,items:readonly {batch:PosedSourceBatch;source:ResidentRelationSource;domain:number;extent?:SourceDrawExtent}[]):void{
-    if(this.contactsActive){this.intersections!.fieldDomains=this.fieldDomains;this.intersections!.page=this.detailPage;this.intersections!.appendAll(encoder,items);}
+    if(this.contactsActive){this.intersections!.fieldDomains=this.fieldDomains;this.intersections!.page=this.detailPage;this.intersections!.appendAll(encoder,items.map(item=>({...item,frontierAdmitted:this.admittedFrontiers.has(item.batch),selection:this.frontierSelections.get(item.batch)})));}
+  }
+  /** Admit the final GPU parent frontier before contact packing or any source
+   * relation stage. The octree/source selector supplies candidates, while the
+   * same-pose form table is the authority that decides whether a complete
+   * parent group actually replaced its children. The compacted list is reused
+   * by every later consumer through its existing count word. */
+  admitFrontiers(encoder:GPUCommandEncoder,items:readonly {batch:PosedSourceBatch;source:ResidentRelationSource;domain:number}[]):void{
+    if(!this.detailField||!this.detailPage)return;
+    const candidates=items.filter(item=>{
+      if(isGpuIndexedResident(item.source))return false;
+      const batch=item.batch,source=batch.source,native=source.nativeVisibleInstanceFrontier,authority=source.ownerAuthority;
+      const nativeOwner=native?.kind==='native-indirect'&&!!authority&&((authority.kind==='producer-row'&&native.owner==='producer-row')||(authority.kind==='standard-entity'&&native.owner==='entity'));
+      const physical=!!source.visibleInstanceFrontier&&!!source.visibleInstances&&/\/producer-row\//.test(item.source.id);
+      return nativeOwner||physical;
+    });
+    if(!candidates.length)return;
+    const pass=encoder.beginComputePass({label:'MAIN admitted source representation frontiers'});
+    try{
+      for(const {batch,source,domain}of candidates){
+        const native=batch.source.nativeVisibleInstanceFrontier;
+        const frontier=batch.source.visibleInstanceFrontier;
+        this.admittedFrontiers.add(batch);
+        const entry=this.bindings(source,batch),indexed=isGpuIndexedResident(source)?source.gpu:undefined;
+        const floats=new Float32Array(52),u=new Uint32Array(floats.buffer);
+        u.set([this.lineCapacity,domain,batch.source.vertexCapacity,batch.source.indexBase??0],24);
+        u.set([0,0,1,Number(batch.source.posedRevision!==undefined)],28);
+        u[36]=indexed?Number(indexed.constructionKind==='planar'):0;
+        u[38]=Number(!!this.detailField&&!!this.detailPage&&this.detailPage[0]>0&&this.detailPage[1]>0);
+        const nativeOwner=native?.kind==='native-indirect'&&!!batch.source.ownerAuthority&&((batch.source.ownerAuthority.kind==='producer-row'&&native.owner==='producer-row')||(batch.source.ownerAuthority.kind==='standard-entity'&&native.owner==='entity'));
+        let frontierBuffers:RelationBinding[];
+        if(nativeOwner){
+          const capacity=nativeTransportInstanceCapacity(batch),bytes=(capacity+1)*4;
+          if(!entry.selection||entry.ownerKey!=='native-frontier'||entry.selection.size<bytes){
+            if(entry.selection)this.retired.push(entry.selection);
+            entry.selection=this.device.createBuffer({label:'MAIN native admitted instance frontier',size:bytes,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
+            entry.ownerKey='native-frontier';
+          }
+          u[42]=capacity;u[43]=1;u[44]=1;u[45]=64|((batch.source.ownerAuthority!.kind==='producer-row')?128:0);u[46]=0;u[47]=this.device.limits.maxComputeWorkgroupsPerDimension;u[48]=Math.floor(native!.indirectOffset/4);u[49]=0;u[50]=0;u[51]=1;
+          this.frontierSelections.set(batch,entry.selection);
+          frontierBuffers=[entry.selection,native!.members,native!.indirect];
+        }else if(frontier){
+          u[42]=frontier.indices.length;u[43]=frontier.offset;u[44]=1;u[46]=batch.source.visibleInstanceOffset??0;u[47]=this.device.limits.maxComputeWorkgroupsPerDimension;
+          u[48]=frontier.offset-1;u[51]=1;
+          // The legacy branch never reads nativeMembers/nativeIndirect, but
+          // auto-layout still requires their resources. Do not alias the
+          // writable compact frontier (binding 8) as a read-only member buffer
+          // (binding 20) in the same dispatch; metadata is read-only throughout.
+          frontierBuffers=[batch.source.visibleInstances!,batch.metadata,batch.metadata];
+        }else continue;
+        // Admission and the later relation pass are encoded before one submit;
+        // a queue write to the retained relation uniform would otherwise
+        // overwrite the admission parameters before its dispatch executes.
+        const admissionParams=this.device.createBuffer({label:'MAIN native frontier admission parameters',size:208,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+        this.pending.push(admissionParams);this.device.queue.writeBuffer(admissionParams,0,floats);
+        const buffers=[admissionParams,indexed?.incidence.binding??source.bufferBinding??source.buffer,batch.storage?.vertices??batch.vertices,batch.storage?.attributes??batch.attributes,batch.storage?.metadata??batch.metadata,this.lines,this.status,this.dispatch,frontierBuffers[0]] as RelationBinding[];
+        buffers[10]={view:this.lineDetailView(u[38]!==0)};
+        buffers[20]=frontierBuffers[1];buffers[21]=frontierBuffers[2];
+        const pipeline=this.pipelines.admitFrontier!;
+        pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(entry.groups,'admitFrontier',pipeline,[0,1,2,3,4,8,10,20,21],buffers));pass.dispatchWorkgroups(1);
+      }
+    }finally{pass.end();}
   }
   /** `shared`: a compute pass the caller opened for EVERY source of the
    * frame (and ends itself), after calling appendContacts for each source.
@@ -1871,10 +3057,15 @@ export class SurfaceRelations {
    * (HOST-SIZED STAGES below). */
   append(encoder:GPUCommandEncoder,batch:PosedSourceBatch,source:ResidentRelationSource,view:SurfaceGraphView,domain:number,selectedOwners?:readonly number[],shared?:GPUComputePassEncoder,extent?:SourceDrawExtent):void{
     if(!shared)this.appendContacts(encoder,batch,source,domain);
-    const owners=Uint32Array.from([...new Set((selectedOwners??[]).map(owner=>owner>>>0))].sort((a,b)=>a-b));
+    const frontierAdmitted=this.admittedFrontiers.has(batch),nativeFrontier=batch.source.nativeVisibleInstanceFrontier;
+    const nativeAdmitted=frontierAdmitted&&!!nativeFrontier;
+    // Native packed membership is already the engine's live owner list. Do
+    // not rebuild/sort a CPU owner census for that path; the GPU compact list
+    // below is the sole membership input.
+    const owners=nativeAdmitted?new Uint32Array(0):Uint32Array.from([...new Set((selectedOwners??[]).map(owner=>owner>>>0))].sort((a,b)=>a-b));
     // RETAINED PER-SOURCE BINDINGS (frame cost, 2026-11-11): the parameter
     // block, owner selection and bind groups of a source are kept between
-    // frames; only the 192 parameter bytes are rewritten. Rebuilding them was
+    // frames; only the 208 parameter bytes are rewritten. Rebuilding them was
     // ~4300 bind groups and ~1900 buffers per Y8 text frame, each validated in
     // the GPU process, which held a frame ~130 ms from submit to completion
     // while the GPU itself was busy 29% of the time.
@@ -1883,24 +3074,31 @@ export class SurfaceRelations {
     // dispatches every queued source's stage at once. A second use of the same
     // batch in one frame keeps the per-source path (its tensor would be shared).
     const batched=!!shared&&!!extent&&this.interior&&!!this.queue&&!!batch.source.visibleInstances&&batch.source.posedRevision!==undefined&&!this.queue.seen.has(posedBatchIdentity(batch));
+    if(this.preparation==='generic-direct'&&batched)throw Error('Generic-direct relation preparation does not accept a batched extent');
+    if(this.preparation==='physical-batched'&&(isGpuIndexedResident(source)||!batched))throw Error('Physical-batched relation preparation requires a non-GPU-indexed host batch with extent, visibility frontier and posed revision');
     const entry=batched?undefined:this.bindings(source,batch);
-    const ownerKey=selectedOwners===undefined?'':owners.join(',');
-    let selection=batch.source.visibleInstances;
+    const ownerKey=nativeAdmitted?'native-frontier':selectedOwners===undefined?'':owners.join(',');
+    let selection=batch.source.visibleInstances??(nativeAdmitted?this.frontierSelections.get(batch):undefined);
     if(!selection&&entry){
       if(!entry.selection||entry.ownerKey!==ownerKey){if(entry.selection)this.retired.push(entry.selection);entry.selection=this.device.createBuffer({size:Math.max(4,owners.byteLength),usage:GPUBufferUsage.STORAGE,mappedAtCreation:true});new Uint32Array(entry.selection.getMappedRange()).set(owners);entry.selection.unmap();entry.ownerKey=ownerKey;}
       selection=entry.selection;
     }
-    const floats=new Float32Array(48);floats.set(view.clipFromWorld);floats.set([...view.eye.slice(0,3),Number(view.perspective)],16);floats.set([...view.direction.slice(0,3),batch.source.cullMode??0],20);
-    new Uint32Array(floats.buffer).set([this.lineCapacity,domain,batch.source.vertexCapacity,batch.source.indexBase??0],24);new Uint32Array(floats.buffer).set([owners.length,Number(selectedOwners!==undefined),Number(!!batch.source.visibleInstances),Number(batch.source.posedRevision!==undefined)],28);
+    const floats=new Float32Array(52);floats.set(view.clipFromWorld);floats.set([...view.eye.slice(0,3),Number(view.perspective)],16);floats.set([...view.direction.slice(0,3),batch.source.cullMode??0],20);
+    new Uint32Array(floats.buffer).set([this.lineCapacity,domain,batch.source.vertexCapacity,batch.source.indexBase??0],24);new Uint32Array(floats.buffer).set(nativeAdmitted?[0,0,0,Number(batch.source.posedRevision!==undefined)]:[owners.length,Number(selectedOwners!==undefined),Number(!!batch.source.visibleInstances),Number(batch.source.posedRevision!==undefined)],28);
     new Uint32Array(floats.buffer)[46]=batch.source.visibleInstances?(batch.source.visibleInstanceOffset??0):0;new Uint32Array(floats.buffer)[47]=this.device.limits.maxComputeWorkgroupsPerDimension;
     new Uint32Array(floats.buffer)[36]=isGpuIndexedResident(source)?Number(source.gpu.constructionKind==='planar'):planarRest(source.geometry)?1:0;
+    const anchorParts=partAnchorPartCount((source as {partAnchorVertices?:Uint32Array}).partAnchorVertices);
     const page=this.detailPage,field=this.detailField;
     const terrain=isGpuIndexedResident(source)?source.gpu.constructionKind==='terrain':source.geometry.surface==='heightfield'||('analysis' in source&&(source.analysis as {type?:string}).type==='terrain');
     const earlyDetail=!!field&&!!page&&page[0]>0&&page[1]>0;
     if(earlyDetail){floats[37]=17*field!.height/page![1];new Uint32Array(floats.buffer)[39]=field!.width;new Uint32Array(floats.buffer)[40]=field!.height;}
-    new Uint32Array(floats.buffer)[38]=Number(earlyDetail)|(Number(terrain)<<1)|(Number(tensorRevision(batch)!==undefined)<<2)|(Number(earlyDetail&&!terrain)<<3)|(Number(earlyDetail&&!!this.fieldDomains?.has(domain))<<4);
+    new Uint32Array(floats.buffer)[38]=Number(earlyDetail)|(Number(terrain)<<1)|(Number(tensorRevision(batch,frontierAdmitted)!==undefined)<<2)|(Number(earlyDetail&&!terrain)<<3)|(Number(earlyDetail&&!!this.fieldDomains?.has(domain))<<4)|(Number(!isGpuIndexedResident(source)&&sourceMaterialIsAffine(batch.source.material))<<5);
     const frontier=batch.source.visibleInstanceFrontier;
-    if(frontier){const u=new Uint32Array(floats.buffer);u[42]=frontier.indices.length;u[43]=frontier.offset;u[44]=1;}
+    if(frontier){const u=new Uint32Array(floats.buffer);u[42]=frontier.indices.length;u[43]=frontier.offset;u[44]=1;u[48]=frontier.offset-1;u[49]=0;u[50]=frontierAdmitted?anchorParts:0;u[51]=Number(frontierAdmitted);}
+    if(nativeAdmitted){
+      const u=new Uint32Array(floats.buffer),capacity=nativeTransportInstanceCapacity(batch);
+      u[42]=capacity;u[43]=1;u[44]=1;u[45]=64|((batch.source.ownerAuthority?.kind==='producer-row')?128:0);u[46]=0;u[47]=this.device.limits.maxComputeWorkgroupsPerDimension;u[48]=Math.floor(nativeFrontier!.indirectOffset/4);u[49]=0;u[50]=anchorParts;u[51]=1;
+    }
     const indexed=isGpuIndexedResident(source)?source.gpu:undefined;
     const posedContacts=indexed?.edgeContactClass==='posed-coincident'&&indexed.topology.indexPattern==='independent-quads'&&batch.source.instanceCapacity===1;
     const contactEdges=posedContacts?sourceResidencyEdgeCount(source):0;
@@ -1911,20 +3109,23 @@ export class SurfaceRelations {
     const surfaceChart=posedContacts&&earlyDetail&&!parts?currentRestCellChart(indexed):undefined;
     const chart=posedContacts?(parts?cellChart(parts.extent):surfaceChart?cellChart(surfaceChart.extent):undefined):undefined;
     const chartCodes:SourceStorageBinding|undefined=parts?.cellCodes??(chart?surfaceChart?.vertexCellCodes:undefined);
+    const occupancy=chart?chartOccupancy(indexed,(parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]):undefined;
     new Uint32Array(floats.buffer)[31]=chartToken(batch,source,!!chart);
     if(posedContacts){
       contactSlots=2**Math.ceil(Math.log2(Math.max(2,contactEdges*2,sourceResidencyFaceCount(source)*4)));
 
 
-      contactWords=(parts?contactSlots*7+contactEdges*2:contactSlots*3+contactEdges)+contactSlots+4+(chart?chart.cells*19+chart.corners*4+4+chart.clusters*4+sourceResidencyFaceCount(source)*2:4);
+      contactWords=(parts?contactSlots*7+contactEdges*2:contactSlots*3+contactEdges)+contactSlots+4+(chart?chart.cells*19+chart.corners*4+4+chart.clusters*4+sourceResidencyFaceCount(source)*2+2+chart.clusters+4+chartRequirementWords((parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]):4);
       const words=new Uint32Array(floats.buffer);words[41]=contactSlots;words[45]=1;
       if(parts){const [x,y,z]=parts.extent;words[45]=3|(chart?4:0)|((x-1)<<8)|((y-1)<<16)|((z-1)<<24);}
       // Surface: the chart (4) with explicit surface semantics (8); NEVER the closed-cell part bit (2).
       else if(chart&&surfaceChart){const [x,y,z]=surfaceChart.extent;words[45]=1|4|8|((x-1)<<8)|((y-1)<<16)|((z-1)<<24);}
 
       if(chart&&currentRestCellChart(indexed)?.cornerOrder===VOXEL_REST_CORNER_ORDER)words[45]|=16;
+
+      if(occupancy)words[45]|=32;
     }
-    if(batched){this.queueBatched(batch,source,new Uint32Array(floats.buffer),extent!,{posedContacts,contactWords,contactEdges,parts,chartCodes,chartClusters:chart?.clusters??0,earlyDetail,terrain,selection:selection!});return;}
+    if(batched){this.queueBatched(batch,source,new Uint32Array(floats.buffer),extent!,{posedContacts,contactWords,contactEdges,parts,chartCodes,occupancy,chartClusters:chart?.clusters??0,anchorParts,earlyDetail,terrain,selection:selection!,frontierAdmitted});return;}
     const held=entry!,params=held.params;
 
     // grow-only) | homes]. A source whose producer certifies its posed content
@@ -1936,12 +3137,21 @@ export class SurfaceRelations {
     let home:ColumnHome|undefined;
     if(posedContacts&&contactWords>this.homeScratch){this.homeScratch=Math.ceil(contactWords*1.25);this.homes.clear();this.homeWords=0;}
     if(chart&&chartToken(batch,source,true)>1){
-      const slots=chart.clusters,key=posedBatchIdentity(batch);
+
+      // home.offset, each sized for its own level and retained under its own (generation token, block)
+      // header. A level transition selects that level's retained home instead of rebuilding one shared home.
+      const slots=chart.clusters,levels=chartLevelClusters((parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]),key=posedBatchIdentity(batch);
+      const words=chartHomeWords(levels);
       home=this.homes.get(key);
-      if(home&&(home.source!==source||home.slots!==slots)){if(home.slots===slots){home.source=source;home.fresh=true;}else home=undefined;}
+
+      // level-2 slots can carry different 4/8/16 sizes and hence different level-home offsets). A changed
+      // layout never reuses the old offsets: it gets a fresh allocation appended after them, so storage still
+      // referenced by in-flight GPU work keeps its old contents until the bounded home space restarts.
+      const sameLayout=!!home&&home.anchorParts===anchorParts&&home.levels.length===levels.length&&home.levels.every((clusters,i)=>clusters===levels[i]);
+      if(home&&(home.source!==source||!sameLayout)){if(sameLayout){home.source=source;home.fresh=true;}else home=undefined;}
       if(!home){
-        if(this.homeWords+4+slots*4>COLUMN_HOME_WORDS){this.homes.clear();this.homeWords=0;}
-        home={offset:this.homeScratch+this.homeWords,slots,source,fresh:true};this.homeWords+=4+slots*4;this.homes.set(key,home);
+        if(this.homeWords+words>COLUMN_HOME_WORDS){this.homes.clear();this.homeWords=0;}
+        home={offset:this.homeScratch+this.homeWords,slots,levels,anchorParts,source,fresh:true};this.homeWords+=words;this.homes.set(key,home);
       }
     }
     const required=Math.max(contactWords,this.homes.size?this.homeScratch+this.homeWords:0);
@@ -1952,16 +3162,28 @@ export class SurfaceRelations {
       // A new buffer is zero: every home's header is written again before use.
       for(const record of this.homes.values())record.fresh=true;
     }
-    if(home?.fresh){this.device.queue.writeBuffer(this.contactWork,home.offset*4,new Uint32Array([home.slots,0,0,0]));home.fresh=false;}
+    if(home?.fresh){
+      // Every level home gets a fresh header [capacity, no token, no block, held level 0].
+      let at=home.offset;for(const clusters of home.levels){this.device.queue.writeBuffer(this.contactWork,at*4,new Uint32Array([clusters,0,0,0]));at+=4+clusters*4;}
+      home.fresh=false;
+    }
     new Uint32Array(floats.buffer)[35]=home?.offset??0;
     const parameterWords=this.interior?new Uint32Array(floats.buffer).slice():undefined;this.device.queue.writeBuffer(params,0,floats);
+    if(!selection)throw Error('Admitted source frontier has no compact selection buffer');
     const buffers=[params,indexed?.incidence.binding??source.bufferBinding??source.buffer,batch.storage?.vertices??batch.vertices,batch.storage?.attributes??batch.attributes,batch.storage?.metadata??batch.metadata,this.lines,this.status,this.dispatch,selection] as SourceStorageBinding[];
     buffers[12]=this.contactWork;
     buffers[13]=chartCodes??batch.storage?.metadata??batch.metadata;
     buffers[14]=parts?.levels??this.status;
-    const used:Record<string,number[]>={prepare:[0,1,4,6,7],partAnchorClear:[0,17],partAnchors:[0,2,3,4,8,16,17],partAnchorInsert:[0,4,16,17],contactClear:[0,1,4,12],voxelVote:[0,1,2,4,12,13],voxelHome:[0,1,4,12],voxelBin:[0,1,2,4,12,13],chartCorners:[0,1,2,4,12,13],chartCertify:[0,1,4,12],contactVertices:[0,1,2,4,12],contactEdges:[0,1,2,4,12,13,14],boundaries:[0,1,2,3,4,5,6,8,10,11,12,15],contours:[0,1,2,3,4,5,6,8,10,11,15]};
+    buffers[18]=occupancy?.columns??this.status;
+    buffers[19]=this.partAnchorAlloc;
+    (buffers as RelationBinding[])[17]=this.partAnchorBuffer??this.partAnchorAlloc;
+    const used:Record<string,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,...SURFACE_CONTACT_BINDINGS,prepare:[0,1,4,6,7,8,16],boundaries:[0,1,2,3,4,5,6,8,10,11,12,15],contours:[0,1,2,3,4,5,6,8,10,11,15]};
     (buffers as RelationBinding[])[10]={view:this.lineDetailView(earlyDetail)};
     (buffers as RelationBinding[])[15]={view:this.contactPatchView()};
+    const anchors=this.partAnchorsFor(batch,source);
+    this.ensurePartAnchorRowTable();
+    (buffers as RelationBinding[])[16]=anchors?.input??this.emptyPartAnchorVertices!;
+    if(anchors&&this.partAnchorBuffer)(buffers as RelationBinding[])[17]=this.partAnchorBuffer;
 
     (buffers as RelationBinding[])[11]=earlyDetail?formDepths(this.device).matrix(field!):params;
     // ONE PASS PER SOURCE (frame cost, 2026-11-10): the seven stages of one
@@ -1988,31 +3210,36 @@ export class SurfaceRelations {
       pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(groups,stage,pipeline,bindings,bound));pass.dispatchWorkgroups(Math.min(count,limit),Math.ceil(count/limit));
     };
     const indirect=(stage:string,offset?:number)=>{const pipeline=this.pipelines[stage]!;pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(held.groups,stage,pipeline,used[stage]!,buffers));if(offset===undefined)pass.dispatchWorkgroups(1);else pass.dispatchWorkgroupsIndirect(this.dispatch,offset);};
-    if(posedContacts&&!host){
-      indirect('prepare');indirect('contactClear',24);indirect('voxelVote',36);direct('voxelHome',home?4+home.slots*4:0,held.groups,used.voxelHome!,buffers);indirect('voxelBin',48);indirect('chartCorners',36);direct('chartCertify',chart?chart.clusters:0,held.groups,used.chartCertify!,buffers);indirect('contactVertices',36);indirect('contactEdges',48);
+    if((posedContacts&&!host)||frontierAdmitted){
+      indirect('prepare');
+      if(posedContacts){
+        indirect('contactClear',24);indirect('voxelVote',84);indirect('voxelHome',96);indirect('voxelBin',108);indirect('chartCorners',120);indirect('chartCertify',132);indirect('contactVertices',36);indirect('contactEdges',48);
+      }
     }else if(posedContacts){
       direct('contactClear',contactWords,held.groups,used.contactClear!,buffers);
       direct('voxelVote',faces*2,held.groups,used.voxelVote!,buffers);
-      direct('voxelHome',home?4+home.slots*4:0,held.groups,used.voxelHome!,buffers);
+      direct('voxelHome',home?chartHomeWords(home.levels):0,held.groups,used.voxelHome!,buffers);
       direct('voxelBin',contactEdges,held.groups,used.voxelBin!,buffers);
       direct('chartCorners',faces*2,held.groups,used.chartCorners!,buffers);
-      direct('chartCertify',chart?chart.clusters:0,held.groups,used.chartCertify!,buffers);
-      direct('contactVertices',faces*2,held.groups,used.contactVertices!,buffers);
+      direct('chartCertify',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartCertify!,buffers);
+      direct('contactVertices',Math.max(faces*2,anchorParts),held.groups,used.contactVertices!,buffers);
       direct('contactEdges',contactEdges,held.groups,used.contactEdges!,buffers);
-    }
-
-    const anchors=this.partAnchorsFor(batch,source);
-    if(anchors&&this.partAnchorBuffer){
-      (buffers as RelationBinding[])[16]=anchors.input;(buffers as RelationBinding[])[17]=this.partAnchorBuffer;
-      if(!this.partAnchorFrameCleared){direct('partAnchorClear',this.partAnchorHeadSlots+this.partAnchorRecordCapacity,held.groups,used.partAnchorClear!,buffers);this.partAnchorFrameCleared=true;}
-      direct('partAnchors',anchors.parts*anchors.instances,held.groups,used.partAnchors!,buffers);
-      direct('partAnchorInsert',anchors.parts*anchors.instances,held.groups,used.partAnchorInsert!,buffers);
     }
 
     // and contours are ONE dispatch (WGSL surfaceLines: the same per-id bodies
     // over one id range, edges x instances then faces x instances).
-    if(host){const instances=frontier?.indices.length??host.instances;direct('surfaceLines',(edges+faces)*instances,held.groups,used.boundaries!,buffers);}
-    else{if(!posedContacts)indirect('prepare');indirect('boundaries',0);indirect('contours',12);}
+    if(host&&!frontierAdmitted){const instances=frontier?.indices.length??host.instances;direct('surfaceLines',(edges+faces)*instances,held.groups,used.boundaries!,buffers);}
+    else{if(!posedContacts&&!frontierAdmitted)indirect('prepare');indirect('boundaries',0);indirect('contours',12);}
+    // A host-sized posed-contact source skips prepare above; run it here so
+    // its anchor dispatch uses the same native count and no capacity-derived
+    // direct extent. All other paths already issued prepare before lines.
+    if(host&&posedContacts&&!frontierAdmitted)indirect('prepare');
+
+    // link each complete record from the prepare-written indirect extent.
+    if(anchors&&this.partAnchorBuffer){
+      if(!this.partAnchorFrameCleared){direct('partAnchorClear',this.partAnchorHeadSlots+this.partAnchorRecordCapacity,held.groups,used.partAnchorClear!,buffers);this.partAnchorFrameCleared=true;}
+      indirect('partAnchors',72);
+    }
     if(!this.interior){end();return;}
     // A producer may certify its MATERIAL'S posed normal field as constant
     // inside every face. Its normal differences and therefore all smooth
@@ -2038,8 +3265,8 @@ export class SurfaceRelations {
     // Reuse scratch only across ORDERED GPU passes. Source instances are
     // chunked to the device binding extent, never silently capped or dropped.
     // Only emitted source relations survive these passes; no tensor readback.
-    const interiorUsed:Record<string,number[]>={prepareInterior:[0,1,2,3,4,6,7,8,9,10,11],faceDifferentials:[0,1,2,3,4,6,8,9],radialCurvature:[0,1,2,3,4,8,9],suggestiveContours:[0,1,2,3,4,5,6,8,9,15],principalCurvature:[0,1,2,3,4,8,9],ridgeDerivative:[0,1,2,4,9],ridgeLines:[0,1,2,3,4,5,6,8,9,15],viewFaceLines:[0,1,2,3,4,5,6,8,9,15]};
-    const hostInterior=host&&(!earlyDetail||terrain);
+    const interiorUsed:Record<string,number[]>={prepareInterior:[0,1,2,3,4,6,7,8,9,10,11],faceDifferentials:[0,1,2,3,4,6,8,9],radialCurvature:[0,1,2,3,4,8,9],suggestiveContours:[0,1,2,3,4,5,6,8,9,15],principalCurvature:[0,1,2,3,4,8,9],ridgeDerivative:[0,1,2,4,8,9],ridgeLines:[0,1,2,3,4,5,6,8,9,15],viewFaceLines:[0,1,2,3,4,5,6,8,9,15]};
+    const hostInterior=host&&(!earlyDetail||terrain)&&!frontierAdmitted;
     const detailView=earlyDetail?formDepths(this.device).view(field!):(this.emptyDetail??=this.device.createTexture({label:'MAIN unselected detail table',size:[1,1],format:'rgba32uint',usage:GPUTextureUsage.TEXTURE_BINDING})).createView();
     const detailMatrix=earlyDetail?formDepths(this.device).matrix(field!):params;
     for(let first=0;first<capacity;first+=chunk){
@@ -2048,15 +3275,16 @@ export class SurfaceRelations {
         let chunks=this.retainedDifferentials.get(posedBatchIdentity(batch));if(!chunks){chunks=new Map();this.retainedDifferentials.set(posedBatchIdentity(batch),chunks);}
         let cached=chunks.get(first);
         if(!cached||cached.buffer.size<bytes){if(cached)this.retired.push(cached.buffer);cached={revision:-1,buffer:this.device.createBuffer({label:'MAIN retained posed shape tensor',size:bytes,usage:GPUBufferUsage.STORAGE})};chunks.set(first,cached);}
-        differential=cached.buffer;const key=tensorRevision(batch);refresh=key===undefined||cached.revision!==key;cached.revision=key??-1;
+        differential=cached.buffer;const key=tensorRevision(batch,frontierAdmitted);refresh=key===undefined||cached.revision!==key;cached.revision=key??-1;
       }
       let range=held.ranges.get(first);
-      if(!range){range={uniform:this.device.createBuffer({label:'MAIN posed differential instance range',size:192,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),groups:new Map()};held.ranges.set(first,range);}
+      if(!range){range={uniform:this.device.createBuffer({label:'MAIN posed differential instance range',size:208,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),groups:new Map()};held.ranges.set(first,range);}
       const uniform=range.uniform;
       const localCount=Math.min(chunk,capacity-first),data=parameterWords!.slice();data.set([first,localCount,this.device.limits.maxComputeWorkgroupsPerDimension],32);
       if(frontier){
-        const lower=(value:number)=>{let lo=0,hi=frontier.indices.length;while(lo<hi){const mid=(lo+hi)>>>1;if(frontier.indices[mid]!<value)lo=mid+1;else hi=mid;}return lo;};
-        const from=lower(first),to=lower(first+localCount);data[42]=to-from;data[43]=frontier.offset+from;
+        // The admission pass compacts the frontier by ordinal. Chunk tensor
+        // ranges therefore use compacted-list offsets, not old source values.
+        data[42]=Math.min(frontier.indices.length-first,localCount);data[43]=frontier.offset+first;data[48]=frontier.offset-1;data[49]=first;data[50]=localCount;data[51]=1;
       }
       this.device.queue.writeBuffer(uniform,0,data);
       const interiorBuffers:RelationBinding[]=[uniform,...buffers.slice(1,9),differential!,{view:detailView},detailMatrix];interiorBuffers[15]={view:this.contactPatchView()};
@@ -2107,7 +3335,7 @@ export class SurfaceRelations {
    * same thread counts (host-sized, or prepareInterior's upper bound with its
    * GPU count read by the stage body), the same parameter words, and word
    * bases in place of binding offsets. */
-  private queueBatched(batch:PosedSourceBatch,source:ResidentRelationSource,words:Uint32Array,host:SourceDrawExtent,{posedContacts,contactWords,contactEdges,parts,chartCodes,chartClusters,earlyDetail,terrain,selection}:{posedContacts:boolean;contactWords:number;contactEdges:number;parts:{readonly cellCodes:SourceStorageBinding;readonly levels:SourceStorageBinding}|undefined;chartCodes:SourceStorageBinding|undefined;chartClusters:number;earlyDetail:boolean;terrain:boolean;selection:GPUBuffer}):void{
+  private queueBatched(batch:PosedSourceBatch,source:ResidentRelationSource,words:Uint32Array,host:SourceDrawExtent,{posedContacts,contactWords,contactEdges,parts,chartCodes,occupancy,chartClusters,anchorParts,earlyDetail,terrain,selection,frontierAdmitted}:{posedContacts:boolean;contactWords:number;contactEdges:number;parts:{readonly cellCodes:SourceStorageBinding;readonly levels:SourceStorageBinding}|undefined;chartCodes:SourceStorageBinding|undefined;occupancy:GpuIndexedCellOccupancy|undefined;chartClusters:number;anchorParts:number;earlyDetail:boolean;terrain:boolean;selection:GPUBuffer;frontierAdmitted:boolean}):void{
     const q=this.queue!;q.seen.add(posedBatchIdentity(batch));
     const indexed=isGpuIndexedResident(source)?source.gpu:undefined;
     const whole=(value:SourceStorageBinding,unit:number):[GPUBuffer,number]=>{const b=storageBinding(value),offset=b.offset??0;if(offset%unit)throw Error('Batched source relation range is not word aligned');return [b.buffer,offset/unit];};
@@ -2118,19 +3346,38 @@ export class SurfaceRelations {
     const contactBase=posedContacts?q.contactWords:0;if(posedContacts)q.contactWords+=contactWords;
     const base=[incidenceBase,vertexBase,attributeBase,metadataBase];
     // Bindings 5, 6, 7 and 12 are this object's shared buffers, bound at flush.
-    const bound:RelationBinding[]=[];bound[1]=incidence;bound[2]=vertices;bound[3]=attributes;bound[4]=metadata;bound[8]=selection;
-    bound[13]=chartCodes??metadata;bound[14]=parts?.levels??this.status;bound[15]={view:this.contactPatchView()};
-    const push=(stage:BatchStage,threads:number,itemWords:Uint32Array,base2:readonly number[],itemBound:RelationBinding[])=>{if(threads>0)q.items.push({stage,threads,words:itemWords,base,base2,bound:itemBound});};
+    const bound:RelationBinding[]=[];bound[1]=incidence;bound[2]=vertices;bound[3]=attributes;bound[4]=metadata;bound[8]=selection;bound[17]=this.partAnchorBuffer??this.partAnchorAlloc;bound[19]=this.partAnchorAlloc;
+    // Anchor projection and source lines consume the SAME camera detail
+    // view. Publish it before copying anchorBound; setting only lineBound
+    // later leaves binding10 undefined in the actual batched anchor stage.
+    bound[10]={view:this.lineDetailView(earlyDetail)};
+    bound[11]=earlyDetail?formDepths(this.device).matrix(this.detailField!):(this.emptyMatrix??=this.device.createBuffer({label:'MAIN unselected detail matrix',size:64,usage:GPUBufferUsage.UNIFORM}));
+    bound[13]=chartCodes??metadata;bound[14]=parts?.levels??this.status;bound[15]={view:this.contactPatchView()};bound[18]=occupancy?.columns??this.status;
+    const push=(stage:BatchStage,threads:number,itemWords:Uint32Array,base2:readonly number[],itemBound:RelationBinding[],dynamic=false)=>{if(threads>0)q.items.push({stage,threads,words:itemWords,base,base2,bound:itemBound,dynamic});};
     const vertexCount=sourceResidencyVertexCount(source),faces=sourceResidencyFaceCount(source),edges=sourceResidencyEdgeCount(source);
-    const lineBase2=[contactBase,0,0,0];
 
     const anchorEntry=this.partAnchorsFor(batch,source);
-    if(anchorEntry&&this.partAnchorBuffer){const anchorBound=[...bound];anchorBound[16]=anchorEntry.input;anchorBound[17]=this.partAnchorBuffer;push('partAnchors',anchorEntry.parts*anchorEntry.instances,words,lineBase2,anchorBound);push('partAnchorInsert',anchorEntry.parts*anchorEntry.instances,words,lineBase2,anchorBound);}
-    if(posedContacts){push('contactClear',contactWords,words,lineBase2,bound);push('voxelVote',faces*2,words,lineBase2,bound);push('voxelBin',contactEdges,words,lineBase2,bound);push('chartCorners',faces*2,words,lineBase2,bound);push('chartCertify',chartClusters,words,lineBase2,bound);push('contactVertices',faces*2,words,lineBase2,bound);push('contactEdges',contactEdges,words,lineBase2,bound);}
-    const frontier=batch.source.visibleInstanceFrontier;
-    const lineBound=[...bound];lineBound[10]={view:this.lineDetailView(earlyDetail)};
+    this.ensurePartAnchorRowTable();
+    const frontierDispatchBase=frontierAdmitted?q.dispatchItems++*BATCH_DISPATCH_WORDS:0;
+    if(frontierAdmitted){words[49]=0;words[50]=anchorParts;push('prepareFrontier',64,words,[contactBase,0,frontierDispatchBase,1],bound);}
+    // Registration may grow the shared table; refresh the chart-certify
+    // binding after that transaction before queueing any stage that writes the
+    // current-frame suppression marker.
+    bound[17]=this.partAnchorBuffer??this.partAnchorAlloc;
+    bound[16]=anchorEntry?.input??this.emptyPartAnchorVertices!;
+    const relationBase2=[contactBase,0,frontierDispatchBase,Number(frontierAdmitted)];
+    if(anchorEntry&&this.partAnchorBuffer){const anchorBound=[...bound];anchorBound[16]=anchorEntry.input;anchorBound[17]=this.partAnchorBuffer;push('partAnchors',anchorEntry.parts*anchorEntry.instances,words,relationBase2,anchorBound,frontierAdmitted);}
+    if(posedContacts){push('contactClear',contactWords,words,relationBase2,bound,frontierAdmitted);push('voxelVote',faces*2,words,relationBase2,bound,frontierAdmitted);push('voxelBin',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartCorners',faces*2,words,relationBase2,bound,frontierAdmitted);push('chartCertify',Math.max(chartClusters,anchorParts),words,relationBase2,bound,frontierAdmitted);push('contactVertices',Math.max(faces*2,anchorParts),words,relationBase2,bound,frontierAdmitted);push('contactEdges',contactEdges,words,relationBase2,bound,frontierAdmitted);}
+    const frontier=batch.source.visibleInstanceFrontier,selectedInstances=frontier?.indices.length??host.instances;
+    const lineBound=[...bound];
     lineBound[11]=earlyDetail?formDepths(this.device).matrix(this.detailField!):(this.emptyMatrix??=this.device.createBuffer({label:'MAIN unselected detail matrix',size:64,usage:GPUBufferUsage.UNIFORM}));
-    push('surfaceLines',(edges+faces)*(frontier?.indices.length??host.instances),words,lineBase2,lineBound);
+    // Keep the original fused operation's boundary-before-contour order, but
+    // give each body its own entry so physical startup does not compile the
+    // large combined batchSurfaceLines call graph. Each stage still groups the
+    // same queued source items; only one additional dispatch per existing group
+    // is introduced, never one dispatch per source.
+    push('boundaryLines',edges*selectedInstances,words,relationBase2,lineBound,frontierAdmitted);
+    push('contourLines',faces*selectedInstances,words,relationBase2,lineBound,frontierAdmitted);
     if(indexed?.posedNormalClass==='face-constant'||!vertexCount||!faces)return;
     const capacity=Math.min(batch.source.instanceCapacity??Infinity,batch.gpuPose?.singleInstanceVertexCount!==undefined?1:Math.floor((batch.storage?.vertices.size??batch.vertices.size)/16/batch.source.vertexCapacity));
     if(!capacity)return;
@@ -2152,22 +3399,21 @@ export class SurfaceRelations {
         // A new range starts zeroed, as a new retained tensor buffer did.
         q.clears.push({buffer:cached.range.page.buffer,offset:cached.range.offset,size:cached.range.size});
       }
-      const key=tensorRevision(batch),refresh=key===undefined||cached.revision!==key;cached.revision=key??-1;
+      const key=tensorRevision(batch,frontierAdmitted),refresh=key===undefined||cached.revision!==key;cached.revision=key??-1;
       const tensor={buffer:cached.range.page.buffer,offset:cached.range.offset};
       const localCount=Math.min(chunk,capacity-first),data=words.slice();data.set([first,localCount,this.device.limits.maxComputeWorkgroupsPerDimension],32);
       if(frontier){
-        const lower=(value:number)=>{let lo=0,hi=frontier.indices.length;while(lo<hi){const mid=(lo+hi)>>>1;if(frontier.indices[mid]!<value)lo=mid+1;else hi=mid;}return lo;};
-        const from=lower(first),to=lower(first+localCount);data[42]=to-from;data[43]=frontier.offset+from;
+        data[42]=Math.min(frontier.indices.length-first,localCount);data[43]=frontier.offset+first;data[48]=frontier.offset-1;data[49]=first;data[50]=localCount;data[51]=1;
       }
       const interiorBound=[...bound];interiorBound[9]=tensor.buffer;interiorBound[10]={view:detailView};interiorBound[11]=detailMatrix;
       // WGSL interiorInstances and interiorCandidates for this chunk.
       const local=Math.min(localCount,host.instances-Math.min(host.instances,first)),visible=frontier?data[42]!:local;
-      const gated=!hostInterior,dispatchBase=gated?q.dispatchItems++*BATCH_DISPATCH_WORDS:0;
+      const gated=!hostInterior||frontierAdmitted,dispatchBase=gated?q.dispatchItems++*BATCH_DISPATCH_WORDS:0;
       const base2=[contactBase,(tensor.offset??0)/16,dispatchBase,Number(gated)];
-      if(gated)q.items.push({stage:'prepareInterior',threads:64,words:data,base,base2,bound:interiorBound});
+      if(gated)q.items.push({stage:'prepareInterior',threads:64,words:data,base,base2,bound:interiorBound,dynamic:true});
       const counts:Partial<Record<BatchStage,number>>={faceDifferentials:faces*local,radialCurvature:vertexCount*visible,suggestiveContours:faces*visible,principalCurvature:vertexCount*local,ridgeDerivative:vertexCount*local,ridgeLines:faces*visible,viewFaceLines:faces*visible};
       const stages:BatchStage[]=refresh?['faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines']:['radialCurvature','viewFaceLines'];
-      for(const stage of stages)push(stage,counts[stage]!,data,base2,interiorBound);
+      for(const stage of stages)push(stage,counts[stage]!,data,base2,interiorBound,gated);
     }
   }
   /** Every queued source's stages: one dispatch per stage per group of sources
@@ -2176,34 +3422,44 @@ export class SurfaceRelations {
     const q=this.queue;this.queue=undefined;if(!q||!q.items.length)return;
     if(!this.batchContact||this.batchContact.size<Math.max(4,q.contactWords*4)){if(this.batchContact)this.retired.push(this.batchContact);this.batchContact=this.device.createBuffer({label:'MAIN batched posed quad contacts',size:Math.max(4,Math.ceil(q.contactWords*1.25)*4),usage:GPUBufferUsage.STORAGE});}
     const dispatchBytes=Math.max(1,q.dispatchItems)*BATCH_DISPATCH_WORDS*4;
-    if(!this.batchDispatch||this.batchDispatch.size<dispatchBytes){if(this.batchDispatch)this.retired.push(this.batchDispatch);this.batchDispatch=this.device.createBuffer({label:'MAIN batched source dispatch words',size:dispatchBytes*2,usage:GPUBufferUsage.STORAGE});}
+    if(!this.batchDispatch||this.batchDispatch.size<dispatchBytes){if(this.batchDispatch)this.retired.push(this.batchDispatch);this.batchDispatch=this.device.createBuffer({label:'MAIN batched source dispatch words',size:dispatchBytes*2,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.INDIRECT});}
     for(const clear of q.clears)encoder.clearBuffer(clear.buffer,clear.offset,clear.size);
 
     // header [head slots, record base] survives).
-    if(!this.partAnchorFrameCleared&&this.partAnchorBuffer&&q.items.some(item=>item.stage==='partAnchorInsert')){encoder.clearBuffer(this.partAnchorBuffer,8);this.partAnchorFrameCleared=true;}
+    if(!this.partAnchorFrameCleared&&this.partAnchorBuffer&&q.items.some(item=>item.stage==='partAnchors')){encoder.clearBuffer(this.partAnchorBuffer,8);this.partAnchorFrameCleared=true;}
     const limit=this.device.limits.maxComputeWorkgroupsPerDimension;
     const pass=encoder.beginComputePass({label:'MAIN source relations'});
     try{
       for(const stage of BATCH_ORDER){
         const items=q.items.filter(item=>item.stage===stage);if(!items.length)continue;
-        const bindings=BATCH_BINDINGS[stage],groups=new Map<string,BatchItem[]>();
+        const bindings=(this.preparation==='physical-batched'?PHYSICAL_BATCH_BINDINGS:BATCH_BINDINGS)[stage],groups=new Map<string,BatchItem[]>();
         for(const item of items){
           item.bound[5]=this.lines;item.bound[6]=this.status;item.bound[7]=this.batchDispatch;item.bound[12]=this.batchContact;
           const key=bindings.filter(b=>b!==0).map(b=>this.bindingId(item.bound[b]!)).join('|');
           let list=groups.get(key);if(!list){list=[];groups.set(key,list);}list.push(item);
         }
-        const pipeline=this.pipelines[batchEntryName(stage)]!;
-        for(const list of groups.values())for(let at=0;at<list.length;at+=SURFACE_RELATION_BATCH_ITEMS){
-          const part=list.slice(at,at+SURFACE_RELATION_BATCH_ITEMS),data=new Uint32Array(4+part.length*BATCH_ITEM_WORDS);let total=0;
-          part.forEach((item,k)=>{const o=4+k*BATCH_ITEM_WORDS;data.set(item.words,o);data.set(item.base,o+48);data.set(item.base2,o+52);data.set([total,item.threads],o+56);total+=item.threads;});
-          data.set([part.length,limit,total,0],0);
-          let table=this.batchTables[this.batchCursor];
-          if(!table){table={buffer:this.device.createBuffer({label:'MAIN batched source relation table',size:BATCH_TABLE_BYTES,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),groups:new Map()};this.batchTables.push(table);}
-          this.batchCursor++;this.device.queue.writeBuffer(table.buffer,0,data);
-          const bound=[...part[0]!.bound];bound[0]=table.buffer;
-          pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(table.groups,stage,pipeline,bindings,bound));
-          if(stage==='prepareInterior')pass.dispatchWorkgroups(part.length);
-          else{const count=Math.ceil(total/64);pass.dispatchWorkgroups(Math.min(count,limit),Math.ceil(count/limit));}
+        const pipeline=this.pipelines[batchEntryName(stage)]!,indirectOffset=BATCH_INDIRECT_OFFSETS[stage];
+        for(const list of groups.values()){
+          // An admitted source owns its compact dispatch arguments. Keep the
+          // existing page-grouped path for incumbent sources, but never put a
+          // compact source back into a capacity-sized aggregate dispatch.
+          const parts:BatchItem[][]=[];
+          const staticItems=list.filter(item=>!item.dynamic||indirectOffset===undefined);
+          for(let at=0;at<staticItems.length;at+=this.batchItems)parts.push(staticItems.slice(at,at+this.batchItems));
+          if(indirectOffset!==undefined)for(const item of list)if(item.dynamic)parts.push([item]);
+          for(const part of parts){
+            const data=new Uint32Array(4+part.length*BATCH_ITEM_WORDS);let total=0;
+            part.forEach((item,k)=>{const o=4+k*BATCH_ITEM_WORDS;data.set(item.words,o);data.set(item.base,o+52);data.set(item.base2,o+56);data.set([total,item.threads],o+60);total+=item.threads;});
+            data.set([part.length,limit,total,0],0);
+            let table=this.batchTables[this.batchCursor];
+            if(!table){table={buffer:this.device.createBuffer({label:'MAIN batched source relation table',size:16+this.batchItems*BATCH_ITEM_WORDS*4,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),groups:new Map()};this.batchTables.push(table);}
+            this.batchCursor++;this.device.queue.writeBuffer(table.buffer,0,data);
+            const bound=[...part[0]!.bound];bound[0]=table.buffer;
+            pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(table.groups,stage,pipeline,bindings,bound));
+            if(stage==='prepareInterior')pass.dispatchWorkgroups(part.length);
+            else if(part.length===1&&part[0]!.dynamic&&indirectOffset!==undefined)pass.dispatchWorkgroupsIndirect(this.batchDispatch!,part[0]!.base2[2]!+indirectOffset);
+            else{const count=Math.ceil(total/64);pass.dispatchWorkgroups(Math.min(count,limit),Math.ceil(count/limit));}
+          }
         }
       }
     }finally{pass.end();}
@@ -2217,7 +3473,7 @@ export class SurfaceRelations {
   private bindings(source:ResidentRelationSource,batch:PosedSourceBatch):RetainedBindings{
     let byBatch=this.retained.get(source);if(!byBatch){byBatch=new Map();this.retained.set(source,byBatch);}
     const key=posedBatchIdentity(batch);let entry=byBatch.get(key);
-    const fresh=():RetainedBindings=>({params:this.device.createBuffer({label:'MAIN source relation parameters',size:192,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),ownerKey:'',groups:new Map(),ranges:new Map(),serial:this.serial});
+    const fresh=():RetainedBindings=>({params:this.device.createBuffer({label:'MAIN source relation parameters',size:208,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}),ownerKey:'',groups:new Map(),ranges:new Map(),serial:this.serial});
     if(entry&&entry.serial===this.serial){const once=fresh();this.oneFrame.push(once);return once;}
     if(!entry){
       entry=fresh();byBatch.set(key,entry);const owned=entry;
@@ -2250,7 +3506,7 @@ export class SurfaceRelations {
   private group(groups:RelationGroups,stage:string,pipeline:GPUComputePipeline,bindings:readonly number[],buffers:readonly RelationBinding[]):GPUBindGroup{
     const named=bindings.map(binding=>buffers[binding]!);const held=groups.get(stage);
     if(held&&held.buffers.every((buffer,index)=>{const other=named[index]!;return 'view' in buffer?'view' in other&&buffer.view===other.view:!('view' in other)&&sameStorageBinding(buffer,other);}))return held.group;
-    const group=this.device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:bindings.map((binding,index)=>{const resource=named[index]!;return {binding,resource:'view' in resource?resource.view:storageBinding(resource)};})});
+    const group=this.device.createBindGroup({label:'MAIN surface relations/'+stage,layout:pipeline.getBindGroupLayout(0),entries:bindings.map((binding,index)=>{const resource=named[index]!;return {binding,resource:'view' in resource?resource.view:storageBinding(resource)};})});
     groups.set(stage,{buffers:named,group});return group;
   }
   private release(entry:RetainedBindings):void{this.retired.push(entry.params);if(entry.selection)this.retired.push(entry.selection);for(const range of entry.ranges.values())this.retired.push(range.uniform);}
@@ -2260,7 +3516,8 @@ export class SurfaceRelations {
   }
   submitted():void{
     this.partAnchorFrameCleared=false;
-    if(this.partAnchorGrowTo>0){const records=this.partAnchorGrowTo;this.partAnchorGrowTo=0;this.growPartAnchorTable(records);}
+    this.frontierSelections.clear();
+    if(this.partAnchorGrowTo>0||this.partAnchorGrowCanonicalTo>0){const records=this.partAnchorGrowTo,canonical=this.partAnchorGrowCanonicalTo;this.partAnchorGrowTo=0;this.partAnchorGrowCanonicalTo=0;this.growPartAnchorTable(records,canonical);}
     this.intersections?.submitted();
     // Batched tables are rewritten by queue writes ordered after this submission.
     this.batchCursor=0;this.tensors?.submitted();
@@ -2271,5 +3528,5 @@ export class SurfaceRelations {
     this.expiry.submitted();
     for(const buffer of [...this.pending,...this.retired])buffer.destroy();this.pending=[];this.retired=[];
   }
-  dispose():void{this.homes.clear();this.homeWords=0;this.expiry.clear();for(const byBatch of this.retained.values())for(const entry of byBatch.values())this.release(entry);this.retained.clear();this.retainPosedBatches(new Set());this.partAnchorGrowTo=0;if(this.partAnchorBuffer)this.retired.push(this.partAnchorBuffer);this.partAnchorBuffer=undefined;this.partAnchorRecords=0;this.partAnchorRecordCapacity=0;this.partAnchorHeadSlots=0;this.submitted();this.intersections?.dispose();this.lines.destroy();this.status.destroy();this.dispatch.destroy();this.differentials?.destroy();this.contactWork?.destroy();this.emptyDetail?.destroy();this.emptyMatrix?.destroy();this.tensors?.dispose();this.batchContact?.destroy();this.batchDispatch?.destroy();for(const table of this.batchTables)table.buffer.destroy();}
+  dispose():void{this.homes.clear();this.homeWords=0;this.expiry.clear();for(const byBatch of this.retained.values())for(const entry of byBatch.values())this.release(entry);this.retained.clear();this.retainPosedBatches(new Set());this.partAnchorGrowTo=0;if(this.partAnchorBuffer)this.retired.push(this.partAnchorBuffer);this.partAnchorBuffer=undefined;this.partAnchorRowLayout=undefined;this.partAnchorRowRequired=0;this.partAnchorRowCapacity=0;this.partAnchorRecords=0;this.partAnchorRecordCapacity=0;this.partAnchorHeadSlots=0;this.submitted();this.intersections?.dispose();this.lines.destroy();this.status.destroy();this.dispatch.destroy();this.partAnchorAlloc.destroy();this.differentials?.destroy();this.contactWork?.destroy();this.emptyDetail?.destroy();this.emptyMatrix?.destroy();this.emptyPartAnchorVertices?.destroy();this.tensors?.dispose();this.batchContact?.destroy();this.batchDispatch?.destroy();for(const table of this.batchTables)table.buffer.destroy();}
 }

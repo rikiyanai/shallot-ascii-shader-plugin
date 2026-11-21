@@ -1,0 +1,39 @@
+{
+  "schema": "shallot.source-material-classes.v1",
+  "families": {
+    "tree-1": {
+      "240": "wood",
+      "241": "foliage",
+      "242": "foliage",
+      "243": "foliage",
+      "244": "turf",
+      "245": "foliage"
+    },
+    "tree-2": {
+      "240": "wood",
+      "241": "foliage",
+      "242": "foliage",
+      "243": "foliage",
+      "244": "turf",
+      "245": "foliage"
+    },
+    "tree-3": {
+      "240": "wood",
+      "241": "foliage",
+      "242": "foliage",
+      "243": "foliage",
+      "244": "turf",
+      "245": "foliage"
+    },
+    "bush-1": "foliage",
+    "terrain-y8-a3d": {
+      "0": "turf",
+      "1": "turf",
+      "2": "unknown",
+      "3": "turf",
+      "4": "unknown",
+      "5": "rock"
+    }
+  },
+  "gltfMaterials": {}
+}

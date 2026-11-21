@@ -10,7 +10,7 @@ import {GpuIndexedSourceResidency,type GpuIndexedSourceDescriptor,type GpuIndexe
 import {GpuSourceNumerics,type NumericSourceReady,type NumericSourceCompilation} from './gpu-source-numerics.ts';
 import {decodeSourceSemanticResidual,semanticProfileSafe,type SourceSemanticResidual} from './source-semantic-residual.ts';
 import {sourcePartAnchorVertices} from './compiled-construction-topology.ts';
-import {bindSourceWholeConstruction,type SourceLodSelection,type SourceWholeConstructionTemplate} from './source-lod.ts';
+import {bindSourceWholeConstruction,sourceWholeConstructionProductHash,type SourceLodSelection,type SourceWholeConstructionTemplate} from './source-lod.ts';
 import type {SourceCornerIndexData} from './source-contact-corners.ts';
 import type {SourceSmallParent} from './source-small-parent.ts';
 
@@ -47,6 +47,8 @@ export interface ResidentCompiledFarForm {
  readonly semantic?:SourceSemanticResidual;readonly complex?:never;
  readonly analysis:Pick<PlaybackSourceAnalysis,'type'|'styleWord'|'foliage'|'organic'|'toneRegions'>;
  readonly wholeConstruction?:SourceWholeConstructionTemplate;
+ /** Hash of the immutable parent product, including geometry/relations. */
+ readonly wholeConstructionHash?:number;
  readonly smallParent?:SourceSmallParent;
 }
 export function isCompiledFarForm(source:unknown):source is ResidentCompiledFarForm{return !!source&&typeof source==='object'&&'kind' in source&&source.kind==='compiled-far-form';}
@@ -88,6 +90,10 @@ export class MeshSourceCache<R extends SourceComplexRetention='full'> {
  private readonly gpuResidency?:GpuIndexedSourceResidency;
  private numerics?:GpuSourceNumerics;
  private readonly numericSources=new WeakMap<ResidentRelationSource,NumericSourceReady>();
+ /** Full semantic packets are immutable for a source revision. `form()` can
+  * inspect one before registration, and the numeric start path can then need
+  * the same packet; retain that decoded view instead of parsing it twice. */
+ private readonly semanticResiduals=new WeakMap<object,{readonly bytes:Uint8Array;readonly revision:number;readonly value:SourceSemanticResidual}>();
  private readonly sourceForms=new WeakMap<object,ResidentCompiledFarForm>();
  private readonly meshForms=new Map<number,{data:object;form:ResidentCompiledFarForm}>();
  /** Host-selected solver meshes. This set is intentionally independent of LOD. */
@@ -118,6 +124,14 @@ export class MeshSourceCache<R extends SourceComplexRetention='full'> {
  }
  private numericPath(data:SourceData):boolean{
   return this.retention==='summary'&&!!this.storage&&!!this.incidence&&!!data.semantic&&!data.lineage?.adjacency;
+ }
+ private semanticFor(data:SourceData|undefined):SourceSemanticResidual|undefined{
+  const bytes=data?.semantic;if(!data||!bytes)return;
+  const prior=this.semanticResiduals.get(data);
+  if(prior&&prior.bytes===bytes&&prior.revision===data.revision)return prior.value;
+  const value=decodeSourceSemanticResidual(bytes);
+  this.semanticResiduals.set(data,{bytes,revision:data.revision,value});
+  return value;
  }
  /** Both baked and worker-compiled sources feed the same parent adequacy
   * contract. This lookup never compiles geometry on the camera/draw path. */
@@ -172,18 +186,22 @@ export class MeshSourceCache<R extends SourceComplexRetention='full'> {
  farForm(draw:MaterialGeometryDraw):ResidentCompiledFarForm|undefined{return this.form(draw);}
  private form(draw:MaterialGeometryDraw):ResidentCompiledFarForm|undefined{
   const data=draw.sourceGeometry as SourceData|undefined;if(this.retention!=='summary'||!data||data.surface||data.lineage?.adjacency)return;
-  const prior=this.sourceForms.get(data);if(prior?.revision===data.revision)return prior;
-  const semantic=data.semantic?decodeSourceSemanticResidual(data.semantic):undefined;
-  const registered=this.resident(draw);
+  const prior=this.sourceForms.get(data);const registered=this.resident(draw);const semantic=this.semanticFor(data);
+  const wholeConstruction=registered&&!isGpuIndexedResident(registered)&&registered.wholeConstruction?registered.wholeConstruction:semantic?.wholeConstruction;
+  // The product object is immutable for one source generation. A retained
+  // reference is the hot-path token: do not walk every part/point merely to
+  // prove the same product is still present. A newly published same-revision
+  // object deliberately misses this identity check and is hashed once below.
+  if(prior?.revision===data.revision&&prior.wholeConstruction===wholeConstruction)return prior;
+  const wholeConstructionHash=sourceWholeConstructionProductHash(wholeConstruction);
   // Ordinary imported examples reach the same frontier after their one
   // source-revision worker compilation. Never compile or scan on acquire.
   const analysis=semantic??(registered&&!isGpuIndexedResident(registered)?registered.analysis:undefined);
   if(!analysis||semantic?.publishedAdjacency||analysis.type==='terrain'||analysis.type==='paper'||analysis.type==='far-strip')return;
   const job=draw.mesh===undefined?this.unregisteredWork.get(data):this.meshWork.get(draw.mesh);
   const domain=registered?.domain??job?.id??++this.serial;if(domain>=0x20000000)throw Error('Source identity capacity exhausted');
- const wholeConstruction=registered&&!isGpuIndexedResident(registered)&&registered.wholeConstruction?registered.wholeConstruction:semantic?.wholeConstruction;
  const smallParent=registered&&!isGpuIndexedResident(registered)&&registered.smallParent?registered.smallParent:semantic?.smallParent;
- const form:ResidentCompiledFarForm={kind:'compiled-far-form',id:`mesh-source-${domain}`,domain,revision:data.revision,geometry:registered&&!isGpuIndexedResident(registered)?registered.geometry:data,...(wholeConstruction?{wholeConstruction}:{}),...(smallParent?{smallParent}:{}),...(semantic?{semantic}:{}),
+  const form:ResidentCompiledFarForm={kind:'compiled-far-form',id:`mesh-source-${domain}`,domain,revision:data.revision,geometry:registered&&!isGpuIndexedResident(registered)?registered.geometry:data,...(wholeConstruction?{wholeConstruction}:{}),...(wholeConstructionHash!==undefined?{wholeConstructionHash}:{}),...(smallParent?{smallParent}:{}),...(semantic?{semantic}:{}),
    analysis:{type:analysis.type,styleWord:analysis.styleWord,foliage:analysis.foliage,organic:analysis.organic}};
   this.sourceForms.set(data,form);this.domains.add(domain);
   if(draw.mesh!==undefined){const previous=this.meshForms.get(draw.mesh);if(previous&&previous.form.domain!==domain&&!this.byDomain.has(previous.form.domain))this.domains.delete(previous.form.domain);this.meshForms.set(draw.mesh,{data,form});}
@@ -218,13 +236,23 @@ export class MeshSourceCache<R extends SourceComplexRetention='full'> {
    if(job&&wantsCorners&&!job.contactCorners){this.cancel(job);job=undefined;}
    if(resident&&!cornerMissing&&!job)continue;
    if(job?.error)throw job.error;
-   if(!job)job=this.register(draw,data,!!defer&&!!form,resident?.domain,wantsCorners);
-   else if(job.deferred&&!(defer&&form))this.start(job);
-   waits.add(job.promise);
+   // Pending bounds may postpone a rebuild only while a complete resident
+   // still draws this source. Before first publication there is no incumbent
+   // to draw, so start the real producer and wait for it rather than awaiting
+   // an intentionally unstarted job (or skipping visible geometry).
+   const canDefer=!!defer&&!!form&&!!resident;
+   if(!job)job=this.register(draw,data,canDefer,resident?.domain,wantsCorners);
+   else if(job.deferred&&!canDefer)this.start(job);
+   if(!job.deferred)waits.add(job.promise);
   }
   if(!waits.size){if(this.preparation)for(const job of this.work.values()){job.compilation?.prioritize(1);job.numeric?.setRequired(false);}this.preparation=undefined;return;}
   const previous=this.preparation;
-  if(previous&&previous.waits.size===waits.size&&[...waits].every(wait=>previous.waits.has(wait)))return previous.promise;
+  if(previous&&previous.waits.size===waits.size&&[...waits].every(wait=>previous.waits.has(wait))){
+   // Reassert current demand even when the barrier itself is retained; a
+   // different camera cohort may have released queued numeric work.
+   for(const job of this.work.values()){const required=waits.has(job.promise);job.compilation?.prioritize(required?1_000_000:1);job.numeric?.setRequired(required);}
+   return previous.promise;
+  }
   // Match the physical adapter's required cohort. A small weight difference
   // lets every untouched background generator overtake a required source
   // after its first expensive phase under the worker's service fairness.
@@ -281,7 +309,8 @@ export class MeshSourceCache<R extends SourceComplexRetention='full'> {
    // before the first displayed page. Full inspection and uncompiled live
    // sources retain their original worker producer.
    if(this.retention==='summary'&&this.storage&&this.incidence&&data.semantic&&!adjacency){
-    const semantic=decodeSourceSemanticResidual(data.semantic);
+    const semantic=this.semanticFor(data);
+    if(!semantic)throw Error('Source semantic packet disappeared during registration');
     if(!semantic.publishedAdjacency){
      this.numerics??=new GpuSourceNumerics(this.device,this.storage,this.incidence);
      const identity=new Uint32Array(data.semantic.buffer,data.semantic.byteOffset+40*4,8);

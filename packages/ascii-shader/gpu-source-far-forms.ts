@@ -1,6 +1,6 @@
 import type {SurfaceField} from './surface-fields.ts';
-import {PARENT_MAX_COLUMNS,sourceWholeConstructionRenderable,type FarFormInstance,type SourceWholeConstruction,type SourceWholePartRole} from './source-lod.ts';
-import {DeviceComputePrograms} from './gpu-pipeline-preparation.ts';
+import {PARENT_MAX_COLUMNS,sourceWholeConstructionRenderable,type FarFormInstance,type SourceWholeConstruction,type SourceWholeOpening,type SourceWholePartRef,type SourceWholePartRole} from './source-lod.ts';
+import {DeviceComputePrograms,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {CONSTRUCTION_POINT_WGSL} from './source-coordinates.ts';
 import {FORM_DEPTH_WGSL,LOD_TIER_HOLD,formDepths} from './form-depths.ts';
 import {inverseMatrix} from './composition.ts';
@@ -46,8 +46,13 @@ const PARENT_PROFILE_COLUMNS=PARENT_MAX_COLUMNS+2;
 export const FAR_AGGREGATE_MEMBER_WGSL=/* wgsl */`
 fn farAggregateMember(owner:vec2u,form:FormExtent,extent:vec2f,row:f32)->bool{
  if(formParentSelected(owner)){return false;}
- if((owner.x&0x80000000u)==0u||!form.found||!(row>0.0)||!formOpen()||formCut(form.box,extent)){return false;}
- return form.box.y-form.box.x<row*${LOD_TIER_HOLD}&&form.box.w-form.box.z<row*${16*LOD_TIER_HOLD/17};
+
+ // member by THAT extent (the form-table writer's), so a foreground cut that
+ // leaves a few pixels can neither merge a large form into the aggregate nor
+ // split a small one out of it. No bound: the visible extent, as before.
+ var sized=form;let sourceExtent=formSourceExtent(owner);if(sourceExtent.found){sized=sourceExtent;}
+ if((owner.x&0x80000000u)==0u||!sized.found||!(row>0.0)||!formOpen()||formCut(sized.box,extent)){return false;}
+ return sized.box.y-sized.box.x<row*${LOD_TIER_HOLD}&&sized.box.w-sized.box.z<row*${16*LOD_TIER_HOLD/17};
 }
 `;
 export const SOURCE_FAR_FORMS_SHADER=/* wgsl */`
@@ -122,10 +127,18 @@ fn sourcePoint(input:Input,pose:mat4x4f,geometry:u32,index:u32,count:u32,feature
  let ndc=clip.xyz/max(clip.w,1e-5);let xy=p.rect.xy+(vec2f(ndc.x,-ndc.y)*.5+.5)*p.rect.zw;
  return Point(vec4f(xy,ndc.z,f32(index)/f32(max(count-1u,1u))),vec4u(u32(valid),bitcast<u32>(1.0/max(clip.w,1e-5)),0xffffffffu,feature));
 }
+// Relations have their own lineage namespace. A raw contact feature ordinal
+// can equal an ordinary part ordinal; that must never alias the actual memo.
+fn sourcePartLineage(feature:u32,ordinal:u32,relation:bool,contact:bool)->u32{
+ if(!relation){return ordinal;}
+ return feature|select(0x80000000u,0xc0000000u,contact);
+}
 fn sourceParts(input:Input,local:u32){
  for(var i=local;i<input.program.y;i+=64u){
-  let base=4u+i*8u;let feature=programWord(input,base);let entry=programWord(input,base+1u);let context=programWord(input,base+2u);let role=programPartRole(programWord(input,base+3u));
-  let first=programWord(input,base+6u);let packed=programWord(input,base+7u);let contributors=packed&0xffffu;let count=(packed>>16u)&0x7fffu;let closed=(packed&0x80000000u)!=0u;
+  let base=4u+i*8u;let feature=programWord(input,base);let entry=programWord(input,base+1u);let context=programWord(input,base+2u);let roleWord=programWord(input,base+3u);let role=programPartRole(roleWord);
+  // Preserve the original 15-bit geometry-count ABI for ordinary parts. The
+  // relation flags live in the unused high role bits, never in the count.
+  let first=programWord(input,base+6u);let packed=programWord(input,base+7u);let contributors=packed&0xffffu;let count=(packed>>16u)&0x7fffu;let closed=(packed&0x80000000u)!=0u;let relation=(roleWord&0x80000000u)!=0u;let contact=(roleWord&0x40000000u)!=0u;let relationParent=(roleWord&0x20000000u)!=0u;let compoundParent=(roleWord&0x10000000u)!=0u;
   let poseAt=first+contributors*2u;let pose=mat4x4f(sourceVector(input,poseAt),sourceVector(input,poseAt+4u),sourceVector(input,poseAt+8u),sourceVector(input,poseAt+12u));
   let geometry=poseAt+16u;let segments=count-select(1u,0u,closed);let pointCount=segments*2u;
   for(var contributor=0u;contributor<contributors;contributor++){
@@ -139,7 +152,7 @@ fn sourceParts(input:Input,local:u32){
     top=min(top,min(a.position.y,b.position.y));bottom=max(bottom,max(a.position.y,b.position.y));
    }
    let rows=u32(clamp(floor(top)+16384.0,0.0,65535.0))|(u32(clamp(ceil(bottom)+16384.0,0.0,65535.0))<<16u);
-   runs[at.y]=Run(vec4u(at.x,pointCount,${COMPILED_FAR_PROFILE_BIT}u|0x40000002u,(feature<<5u)|(role<<2u)),vec4u(feature,owner,feature),vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(0u,count,rows,role),vec4u(owner,input.program.z,i));
+   runs[at.y]=Run(vec4u(at.x,pointCount,${COMPILED_FAR_PROFILE_BIT}u|0x40000002u,(feature<<5u)|(role<<2u)),vec4u(feature,owner,feature),vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(0u,count,rows,role|select(0u,0x80000000u,relation)|select(0u,0x40000000u,contact)|select(0u,0x20000000u,relationParent)|select(0u,0x10000000u,compoundParent)),vec4u(owner,input.program.z,sourcePartLineage(feature,i,relation,contact)));
   }
  }
 }
@@ -270,9 +283,38 @@ const programs=new DeviceComputePrograms(device=>{
  return {resources:layout,plans:new Map([['emit',()=>({label:'MAIN compiled far aggregates',layout:device.createPipelineLayout({bindGroupLayouts:[layout]}),
   compute:{entryPoint:'emit',module:device.createShaderModule({label:'MAIN source far forms',code:SOURCE_FAR_FORMS_SHADER})}})]])};
 });
-export async function prepareSourceFarForms(device:GPUDevice):Promise<void>{await programs.prepare(device);}
+export async function prepareSourceFarForms(device:GPUDevice,progress?:ComputePipelineProgress):Promise<void>{await programs.prepare(device,progress);}
 const pairLess=(a:readonly [number,number],b:readonly [number,number])=>a[0]-b[0]||a[1]-b[1];
 const roleCode=(role:SourceWholePartRole):number=>role==='cap'?0:role==='turn'?1:role==='flank'?2:3;
+/** A relation is a source-owned boundary, not a screen-space paper mask. It
+ * enters the same native whole-part consumer as ordinary parts, with its
+ * immutable source samples and instance pose. The opening and protected-void
+ * lists intentionally overlap in the compiler; collapse that duplicate here
+ * so the parent is emitted once, never parent plus a second copy of its hole. */
+const RELATION_ROLE_BIT=0x80000000;
+const RELATION_CONTACT_BIT=0x40000000;
+const RELATION_PARENT_BIT=0x20000000;
+/** Explicit source-product marker. RELATION_PARENT_BIT also appears on
+ * legacy ordinary parts whenever a construction has relations. */
+const COMPOUND_PARENT_BIT=0x10000000;
+const relationFloatValue=new Float32Array(1),relationFloatWord=new Uint32Array(relationFloatValue.buffer);
+const relationFloatBits=(value:number):number=>{relationFloatValue[0]=value;return relationFloatWord[0]!;};
+const relationKey=(item:SourceWholeOpening):string=>`${item.feature}:${item.contributors.map(pair=>`${pair[0]}:${pair[1]}`).join(',')}:${item.worldFromSource?Array.from(item.worldFromSource,relationFloatBits).join(','):''}:${item.geometry?.map(point=>point.map(relationFloatBits).join(',')).join(';')??''}`;
+const relationListKey=(kind:SourceWholePartRef['relationKind'],item:SourceWholeOpening):string=>`${kind==='contact'?'contact':'boundary'}:${relationKey(item)}`;
+const relationLists=(value:SourceWholeConstruction):readonly (readonly [readonly SourceWholeOpening[],SourceWholePartRef['relationKind']])[]=>[[value.openings,'opening'],[value.contacts,'contact'],[value.protectedVoids,'protected-void'],[value.paper??[],'paper']];
+function relationParts(value:SourceWholeConstruction):SourceWholePartRef[]|undefined{
+ const seen=new Set<string>(),result:SourceWholePartRef[]=[];
+ for(const [items,relationKind] of relationLists(value))for(const relation of items){
+  const key=relationListKey(relationKind,relation);if(seen.has(key))continue;seen.add(key);
+  // No silent seed turn/pose inheritance. Unsupported relation metadata keeps
+  // the incumbent children instead of drawing a different native passage.
+  if(!relation.geometry||relation.geometry.length<2||relation.entryRef===undefined||relation.context===undefined||relation.role===undefined||!relation.worldFromSource)return undefined;
+  const contributorKeys=new Set<string>(),contributors=relation.contributors.filter(pair=>{const key=`${pair[0]>>>0}:${pair[1]>>>0}`;if(contributorKeys.has(key))return false;contributorKeys.add(key);return true;});
+  if(!contributors.length)return undefined;
+  result.push({feature:relation.feature,entryRef:relation.entryRef,context:relation.context,role:relation.role,ports:[relation.ports[0]??0,relation.ports.at(-1)??relation.ports[0]??0],contributors,geometry:relation.geometry,closed:relation.closed??false,worldFromSource:relation.worldFromSource,relationKind});
+ }
+ return result;
+}
 const floatWord=new Float32Array(1),uintWord=new Uint32Array(floatWord.buffer);
 const floatBits=(value:number):number=>{floatWord[0]=value;return uintWord[0]!;};
 const IDENTITY_POSE=[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1] as const;
@@ -280,7 +322,10 @@ const partCounts=(part:SourceWholeConstruction['parts'][number]):number=>(part.c
 /** Missing pose is older metadata, never permission to project rest geometry
  * at the world origin. Keep the incumbent until the owning adapter is wired. */
 function posedProgram(value:SourceWholeConstruction|undefined):boolean{
- return !!value&&value.parts.every(part=>part.feature<=0x07ffffff&&part.entryRef>0&&typeof part.closed==='boolean'&&!!part.geometry&&part.geometry.length>=2&&part.geometry.length<=0x7fff&&part.contributors.length>0&&part.contributors.length<=0xffff&&!!part.worldFromSource&&part.worldFromSource.length===16);
+ const relations=value?relationParts(value):undefined;
+ const relationKeys=new Set<string>();if(value)for(const [items,kind] of relationLists(value))for(const item of items)if(item.geometry&&item.geometry.length>=2)relationKeys.add(relationListKey(kind,item));
+ const relationCount=relationKeys.size;
+ return !!value&&!!relations&&relations.length===relationCount&&[...value.parts,...relations].every(part=>part.feature<=0x07ffffff&&part.entryRef>0&&typeof part.closed==='boolean'&&!!part.geometry&&part.geometry.length>=2&&part.geometry.length<=0x7fff&&part.contributors.length>0&&part.contributors.length<=0xffff&&!!part.worldFromSource&&part.worldFromSource.length===16);
 }
 /** The compiled aggregate records of one camera: input rows and their sorted
  * member keys. Pure (no device), so the record layout is testable. */
@@ -315,7 +360,7 @@ export function farAggregateRecords(sources:readonly SourceFarForms[],rect:{x:nu
    const kindEnds=packSmallConstructionKindAndEnds(row.smallParent.kind,row.smallParent.positiveEnd,row.smallParent.negativeEnd);
    inputs[base+10]=kindEnds;inputs[base+11]=3;inputs[base+14]=row.sourceRevision??0;
   }
-  if(row.construction){const programOffset=keyList.length;const parts=row.construction.parts;const signature=()=>{let h=2166136261>>>0;const mix=(word:number)=>{h=Math.imul(h^(word>>>0),16777619)>>>0;};mix(row.construction!.revision);mix(parts.length);for(const part of parts){mix(part.feature);mix(part.entryRef);mix(part.context);mix(roleCode(part.role));mix(part.ports[0]);mix(part.ports[1]);const geometry=part.geometry??[],packed=partCounts(part);mix(packed);for(const contributor of part.contributors){mix(contributor[0]);mix(contributor[1]);}for(const point of geometry){mix(floatBits(point[0]));mix(floatBits(point[1]));mix(floatBits(point[2]));}}return h||1;};
+  if(row.construction){const sourceParts=row.construction.parts,relations=relationParts(row.construction);if(!relations)return;const parts=[...sourceParts,...relations],programOffset=keyList.length,hasRelations=relations.length>0,compound=!!row.construction.compound;const signature=()=>{let h=2166136261>>>0;const mix=(word:number)=>{h=Math.imul(h^(word>>>0),16777619)>>>0;};mix(row.construction!.revision);mix(parts.length);for(const [index,part] of parts.entries()){mix(part.feature);mix(part.entryRef);mix(part.context);mix(roleCode(part.role));mix((part.relationKind==='contact'?RELATION_CONTACT_BIT|RELATION_ROLE_BIT:part.relationKind?RELATION_ROLE_BIT:hasRelations?RELATION_PARENT_BIT:0)|(compound?COMPOUND_PARENT_BIT:0));mix(part.ports[0]);mix(part.ports[1]);const geometry=part.geometry??[],packed=partCounts(part);mix(packed);for(const contributor of part.contributors){mix(contributor[0]);mix(contributor[1]);}if(part.worldFromSource)for(const value of Array.from(part.worldFromSource))mix(floatBits(value));for(const point of geometry){mix(floatBits(point[0]));mix(floatBits(point[1]));mix(floatBits(point[2]));}}return h||1;};
    keyList.push(0x50524731,row.construction.revision>>>0,parts.length>>>0,signature());
    // Each part's contributor pairs occupy one contiguous source-owned slice.
    // The shader hashes/reads `count` pairs from `first`; a globally deduped
@@ -323,7 +368,7 @@ export function farAggregateRecords(sources:readonly SourceFarForms[],rect:{x:nu
    // contributor sets differ.
    const contributorOffset=4+parts.length*8;
    let payloadCursor=0;const partWords:number[]=[],payloadWords:number[]=[];
-   for(const part of parts){
+   for(const [index,part] of parts.entries()){
     // programWord adds programOffset exactly once, so payload references
     // here are RELATIVE to the program header, never absolute key addresses.
     const contributorBase=contributorOffset+payloadCursor;
@@ -331,10 +376,12 @@ export function farAggregateRecords(sources:readonly SourceFarForms[],rect:{x:nu
     const geometry=part.geometry??[],packed=partCounts(part);
     const pose=part.worldFromSource??IDENTITY_POSE;
     for(let axis=0;axis<16;axis++){payloadWords.push(floatBits(pose[axis]!));payloadCursor++;}
-    // Pose precedes the immutable rest samples. Pose is deliberately excluded
-    // from the semantic signature: moving a part must not reset its identity.
+    // Pose precedes the immutable rest samples and is part of this posed
+    // contributor's program identity; equal source geometry at a different
+    // pose must not collapse into the same relation record.
     for(const point of geometry){payloadWords.push(floatBits(point[0]),floatBits(point[1]),floatBits(point[2]));payloadCursor+=3;}
-    partWords.push(part.feature>>>0,part.entryRef>>>0,part.context>>>0,roleCode(part.role),part.ports[0]>>>0,part.ports[1]>>>0,contributorBase>>>0,packed>>>0);
+    const relationFlags=(part.relationKind==='contact'?RELATION_ROLE_BIT|RELATION_CONTACT_BIT:part.relationKind?RELATION_ROLE_BIT:hasRelations?RELATION_PARENT_BIT:0)|(compound?COMPOUND_PARENT_BIT:0);
+    partWords.push(part.feature>>>0,part.entryRef>>>0,part.context>>>0,(roleCode(part.role)|relationFlags)>>>0,part.ports[0]>>>0,part.ports[1]>>>0,contributorBase>>>0,packed>>>0);
    }
    // A real octree parent may contain many source parts. Do not use an
    // argument spread whose engine stack limit depends on scene density.

@@ -315,7 +315,9 @@ fn farPartContext(run:Run)->u32{
  return farPartDirection(first-firstEnd)|(farPartDirection(lastEnd-last)<<3u)|(contextClass<<6u);
 }
 fn farPartRowsFit(record:u32,sourceRows:i32,sourceWidth:u32,origin:i32)->bool{
- let width=grammar[record+4u]&0xffffu;if(sourceWidth<width||i32(grammar[record+5u])!=sourceRows){return false;}
+ let width=grammar[record+4u]&0xffffu;let authoredRows=i32(grammar[record+5u]);if(sourceWidth<width||sourceRows<authoredRows||sourceRows<=0){return false;}
+ if(sourceRows>authoredRows){if(nativeWholeRow(record,0)==NONE){return false;}return wholePartHeightRowsFit(record,vec4i(origin,0,i32(sourceWidth),sourceRows));}
+ if(nativeWholeRow(record,0)!=NONE){return nativeWholeRowsFit(record,vec4i(origin,0,i32(sourceWidth),sourceRows));}
  let first=grammar[record];let atoms=grammar[record+1u];
  for(var row=0;row<sourceRows;row++){
   let growth=wholePartRowGrowth(record,row,sourceWidth-width);if(growth.w==NONE||growth.x==NONE){return false;}
@@ -339,7 +341,12 @@ fn farPartRecord(role:u32,context:u32,sourceRows:i32,sourceWidth:u32,origin:i32)
 // Return true only after the complete retained row passage is queued.  Any
 // unsupported context, bad native row, or too-narrow source span returns
 // false so the caller keeps the incumbent connected far skyline.
+// Relation and relation-parent runs are native boundary passages, never a
+// skyline/profile paper fill. Their marker is emitted in the existing role
+// word, so this helper keeps the canonical three-argument consumer ABI while
+// still preventing a global paper mark from erasing an actor through a hole.
 fn farNativePart(runID:u32,run:Run,priority:u32)->bool{
+ let boundaryOnly=(run.paper.w&0xa0000000u)!=0u;
  let feature=run.range.w>>5u;if(feature==0u||run.range.y<2u||run.paper.y==0u){return false;}
  let context=farPartContext(run);if(context==0u){return false;}
  let role=run.paper.w&3u;
@@ -369,17 +376,44 @@ fn farNativePart(runID:u32,run:Run,priority:u32)->bool{
   if(sourceRow>=u32(sourceRows)){break;}
   let pageRow=firstRow+i32(sourceRow);let nativeRow=i32(sourceRow);let growth=wholePartRowGrowth(record,nativeRow,sourceWidth-width);
   let extent=rowPlan[sourceRow];let pair=min(u32(max(0.0,extent.z-1.0)),count-1u);var q=interpolatePoint(points[base+pair*2u],points[base+pair*2u+1u],.5);q.w=points[base+pair*2u].position.w;
+  if(nativeWholeRow(record,0)!=NONE){
+   let whole=vec4i(i32(round(minX)),firstRow,i32(sourceWidth),sourceRows);
+   let words=nativeWholeEmit(record,whole,i32(sourceRow),pageRow,runID,q,priority,points[base+pair*2u],points[base+pair*2u+1u],!boundaryOnly);
+   emitted=emitted||words>0u;continue;
+  }
   for(var atom=0u;atom<atoms;atom++){
    let at=grammar[1]+(first+atom)*4u;if(bitcast<i32>(grammar[at+2u])!=nativeRow){continue;}let x=grammar[at+1u];
    let repeats=select(growth.w+1u,1u,x==growth.x||x==growth.y);
    for(var repeat=0u;repeat<repeats;repeat++){
     let pageX=i32(round(minX))+i32(wholePartAtomX(x,growth,repeat));
-    spanPartWord(runID,u32(sourceRow)*1024u+repeat*atoms+atom,q,pageX,pageRow,grammar[at],1u,grammar[at+3u],priority,pair,1u);emitted=true;
+    // Match the near source-part consumer: the last anchor keeps its member
+    // identity when whole middle rows are inserted above it.
+    let member=wholePartMember(sourceRow,u32(sourceRows),x,growth,repeat,atom,atoms);
+    spanPartWord(runID,member,q,pageX,pageRow,grammar[at],1u,grammar[at+3u],priority,pair,1u);emitted=true;
    }
   }
-  markSoftPartPaper(record,i32(round(minX)),pageRow,nativeRow,growth);
+  if(!boundaryOnly){markSoftPartPaper(record,i32(round(minX)),pageRow,nativeRow,growth);}
  }
  return emitted;
+}
+fn farRelationPart(runID:u32,run:Run,priority:u32)->bool{
+ let relation=(run.paper.w&0x80000000u)!=0u;if(!relation||run.range.y<2u){return false;}
+ // Contacts and protected openings share this boundary-only native path. The
+ // source program has already retained the ordered relation geometry; no
+ // skyline fallback is legal when native lowering fails.
+ return farNativePart(runID,run,priority);
+}
+// A compound parent is one coherent source product: ordinary outer passages
+// carry the parent-paper marker, while opening/contact passages carry their
+// relation marker.  Route both through the native parent consumer before any
+// skyline fallback.  This is deliberately a consumer-side cutover, not a
+// second selector or a per-piece glyph choice; an unsupported product returns
+// false so the source selector's complete child representation remains the
+// legal incumbent.
+fn farCompoundParent(runID:u32,run:Run,priority:u32)->bool{
+ let compound=(run.paper.w&0x10000000u)!=0u;if(!compound){return false;}
+ if((run.paper.w&0x80000000u)!=0u){return farRelationPart(runID,run,priority);}
+ return farNativePart(runID,run,priority);
 }
 `;
  const entry=`fn featurefarStanding(@builtin(workgroup_id) group:vec3u,@builtin(local_invocation_index) lane:u32){
@@ -416,11 +450,30 @@ fn farNativePart(runID:u32,run:Run,priority:u32)->bool{
    if(smallConstructionPlayback(safeRunID,smallRun,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);return;}
   }
  }
+ if((run.paper.w&0x10000000u)!=0u){if(farCompoundParent(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}return;}
+ // Preserve the incumbent relation-only path for older products. The explicit
+ // compound bit above is the only branch that suppresses skyline fallback for
+ // ordinary outer parts; relation-free and legacy relation parents retain the
+ // existing consumer behavior.
+ if((run.paper.w&0x80000000u)!=0u){if(farRelationPart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}return;}
+ let relationParent=(run.paper.w&0x20000000u)!=0u;
  if(farNativePart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);return;}
  if(farSkylineStanding(safeRunID,run,span,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}
 }`;
  standing=replaceFunction(standing,'featurefarStanding',entry);
- const declarations=`var<workgroup> farCachedCells:array<SkyCell,${cells}>;\nvar<workgroup> farWorkgroupKind:u32;\nvar<private> farCacheBase:i32;\n`;
- const canonicalFunctions=retainCanonicalFunctions(canonical,standing,['softPartRecord','markSoftPartPaper','wholePartRowGrowth','wholePartAtomX','spanPartWord','interpolatePoint']);
+ const wordState=[
+  ['wholeGrowthKey','var<private> wholeGrowthKey:u32=NONE;'],
+  ['wholeGrowthCached','var<private> wholeGrowthCached:u32=NONE;'],
+  ['wholeWordBase','var<private> wholeWordBase:u32=NONE;'],
+  ['wholeWordChecked','var<private> wholeWordChecked:bool=false;'],
+  ['wholeHeightCacheKey','var<private> wholeHeightCacheKey:vec3u=vec3u(NONE,NONE,NONE);'],
+  ['wholeHeightCache','var<private> wholeHeightCache:vec4i=vec4i(-1,-1,0,0);'],
+  ['wholeHeightCacheMember','var<private> wholeHeightCacheMember:u32=NONE;'],
+  ['wholeHeightCachePivot','var<private> wholeHeightCachePivot:i32=0;'],
+ ].filter(([name])=>!standing.includes('var<private> '+name+':')).map(([,declaration])=>declaration).join('\n');
+ const wordConstant=standing.includes('const NATIVE_ROW_NONE:')?'':'\nconst NATIVE_ROW_NONE:u32=0xffffffffu;\n';
+ const declarations=`var<workgroup> farCachedCells:array<SkyCell,${cells}>;\nvar<workgroup> farWorkgroupKind:u32;\nvar<private> farCacheBase:i32;\n`+wordState+wordConstant;
+ const canonicalFunctions=retainCanonicalFunctions(canonical,standing,['softPartRecord','markSoftPartPaper','wholePartRowGrowth','wholePartAtomX','wholePartMember','spanPartWord','spanPartSourceWord','interpolatePoint',
+  'wholePartHeightRowsFit','nativeWholeRowsFit','nativeWholeEmit','nativeWholeRow']);
  return isolateComputeEntry(standing+'\n'+nativeBridge+'\n'+SMALL_CONSTRUCTION_WGSL+'\n'+canonicalFunctions+'\n'+base+'\n'+compute+'\n'+declarations+'\n'+WORKGROUP_SCHEDULER_WGSL,'featurefarStanding');
 }

@@ -1,4 +1,4 @@
-import {DeviceComputePrograms,type ComputePipelinePlan} from './gpu-pipeline-preparation.ts';
+import {DeviceComputePrograms,type ComputePipelinePlan,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
 import {storageBinding,sameStorageBinding,type SourceStorageBinding} from './source-storage.ts';
 import {posedBatchIdentity,type PosedSourceBatch,type SurfaceGraphView} from './surface-relations.ts';
@@ -86,7 +86,12 @@ fn instanceAt(ordinal:u32)->u32{if(p.range.w!=0u){return selected[p.range.w+ordi
  args[4]=select(0u,count*3u,fits);args[5]=1u;args[6]=base*3u;args[7]=0u;
 }
 @compute @workgroup_size(64) fn pack(@builtin(global_invocation_id) id:vec3u){
- let k=id.x+id.y*p.source.w*64u;let faces=native[0]/3u;if(k>=faces*instanceCount()||native[5]!=0u){return;}
+ let k=id.x+id.y*p.source.w*64u;let faces=native[0]/3u;let triangleLive=k<faces*instanceCount()&&native[5u]==0u;
+ // Host-sized draws reserve the pre-admission frontier capacity. Overwrite
+ // every now-unused triangle slot so a prior frame cannot be rasterized after
+ // GPU frontier compaction; indirect draws never enter this branch.
+ let disabledOut=select(drawArgs[6]/3u,p.range.x,p.range.y!=0u)+k;
+ if(!triangleLive){if(p.range.y==0u){return;}textureStore(triangles,triangleAddress(disabledOut,0u),vec4u(0));textureStore(triangles,triangleAddress(disabledOut,1u),vec4u(0));textureStore(triangles,triangleAddress(disabledOut,2u),vec4u(0));textureStore(triangles,triangleAddress(disabledOut,3u),vec4u(0));return;}
  let instance=instanceAt(k/faces);let face=(native[2]-p.source.z)/3u+k%faces;
  var positions:array<vec4u,3>;var edges=vec4u(0);var slots:array<u32,3>;
  for(var i=0u;i<3u;i++){
@@ -235,7 +240,7 @@ const contactPrograms=new DeviceComputePrograms(device=>{
  }
  return {resources:undefined,plans};
 });
-export async function prepareSurfaceIntersectionPrograms(device:GPUDevice,progress?:(fraction:number)=>void):Promise<void>{await contactPrograms.prepare(device,progress);}
+export async function prepareSurfaceIntersectionPrograms(device:GPUDevice,progress?:ComputePipelineProgress):Promise<void>{await contactPrograms.prepare(device,progress);}
 
 export class SurfaceIntersections {
  private triangles?:GPUTexture;private triangleBinding?:{readonly view:GPUTextureView};private ids?:GPUTexture;private depth?:GPUTexture;private pairs?:GPUBuffer;
@@ -289,8 +294,8 @@ export class SurfaceIntersections {
   const buffer=this.device.createBuffer({size:128,usage:GPUBufferUsage.UNIFORM,mappedAtCreation:true});
   const data=new Float32Array(buffer.getMappedRange());data.set(this.view!.clipFromWorld);new Uint32Array(data.buffer).set(values,16);new Uint32Array(data.buffer).set(source,20);buffer.unmap();this.pending.push(buffer);return buffer;
  }
- append(encoder:GPUCommandEncoder,batch:PosedSourceBatch,source:ResidentRelationSource,domain:number):void{
-  this.appendAll(encoder,[{batch,source,domain}]);
+ append(encoder:GPUCommandEncoder,batch:PosedSourceBatch,source:ResidentRelationSource,domain:number,frontierAdmitted=false,selection?:GPUBuffer):void{
+  this.appendAll(encoder,[{batch,source,domain,frontierAdmitted,selection}]);
  }
  /** Every source of a frame: all packs in ONE compute pass, then all draws in
   * ONE render pass (frame cost, 2026-11-11; was a compute and a render pass
@@ -299,7 +304,7 @@ export class SurfaceIntersections {
   * starts at that range, so a later source's pack never overwrites an
   * earlier one; the draws keep source order against the same depth test, so
   * the id/depth result is the one the per-source passes made. */
- appendAll(encoder:GPUCommandEncoder,items:readonly {batch:PosedSourceBatch;source:ResidentRelationSource;domain:number;extent?:{readonly indices:number;readonly instances:number}}[]):void{
+ appendAll(encoder:GPUCommandEncoder,items:readonly {batch:PosedSourceBatch;source:ResidentRelationSource;domain:number;extent?:{readonly indices:number;readonly instances:number};frontierAdmitted?:boolean;selection?:GPUBuffer}[]):void{
   if(!this.field||!items.length)return;
   // HOST RESERVATION (frame cost, 2026-11-12). When every source states its
   // static draw extent, the host reserves each source's triangle range in
@@ -308,10 +313,10 @@ export class SurfaceIntersections {
   // prepare, and the id raster is one draw per run of one cull mode over
   // those contiguous ranges (primitive order is draw order). A frame whose
   // triangles exceed the buffer grows it here instead of failing for a retry.
-  let host=items.every(item=>item.extent);const bases:number[]=[];let total=this.reserved;
-  if(host){
+  let host=items.every(item=>item.extent);const dynamicHost=host&&items.some(item=>item.frontierAdmitted===true);let staticHost=host&&!dynamicHost;const bases:number[]=[];let total=this.reserved;
+  if(staticHost){
    for(const item of items){bases.push(total);total+=Math.floor(item.extent!.indices/3)*(item.batch.source.visibleInstanceFrontier?.indices.length??item.extent!.instances);}
-   if(total>this.triangleCapacity){try{this.ensureCapacity(total);}catch{host=false;}}
+   if(total>this.triangleCapacity){try{this.ensureCapacity(total);}catch{host=false;staticHost=false;}}
   }
   const draws:{pipeline:GPURenderPipeline;entry:RetainedContact;base:number;count:number}[]=[];
   const packing=encoder.beginComputePass({label:'MAIN contact triangles'});
@@ -323,31 +328,37 @@ export class SurfaceIntersections {
    // RETAINED PER-SOURCE BINDINGS (frame cost, 2026-11-11), as in
    // surface-relations.ts: the uniform, indirect arguments and bind groups of
    // a source stay between frames and only the 96 uniform bytes are rewritten.
+   const item=items[draws.length]!,nativeAdmitted=item.frontierAdmitted===true&&!!batch.source.nativeVisibleInstanceFrontier;
    const entry=this.retainedFor(source,batch);
-   const index=draws.length,count=host?Math.floor(items[index]!.extent!.indices/3)*(batch.source.visibleInstanceFrontier?.indices.length??items[index]!.extent!.instances):0;
-   const data=new Float32Array(32);data.set(this.view!.clipFromWorld);new Uint32Array(data.buffer).set([this.width,this.height,this.triangleCapacity,Number(!!batch.source.visibleInstances)],16);new Uint32Array(data.buffer).set([domain,batch.source.vertexCapacity,batch.source.indexBase??0,this.device.limits.maxComputeWorkgroupsPerDimension],20);
-   new Uint32Array(data.buffer).set([host?bases[index]!:0,Number(host),batch.source.visibleInstanceOffset??0,batch.source.visibleInstanceFrontier?.offset??0],24);
+   const index=draws.length,count=staticHost?Math.floor(items[index]!.extent!.indices/3)*(batch.source.visibleInstanceFrontier?.indices.length??items[index]!.extent!.instances):0;
+   const selected=item.selection??batch.source.visibleInstances;
+   if(nativeAdmitted&&!selected)throw Error('Admitted native contact frontier has no compact selection buffer');
+   const data=new Float32Array(32);data.set(this.view!.clipFromWorld);new Uint32Array(data.buffer).set([this.width,this.height,this.triangleCapacity,nativeAdmitted?0:Number(!!batch.source.visibleInstances)],16);new Uint32Array(data.buffer).set([domain,batch.source.vertexCapacity,batch.source.indexBase??0,this.device.limits.maxComputeWorkgroupsPerDimension],20);
+   // Native admission writes [count, local ordinals...] to its compact list.
+   // The exact indirect record remains the metadata source; range.w selects
+   // the compact count/list and range.z is its local list base.
+   new Uint32Array(data.buffer).set([staticHost?bases[index]!:0,Number(staticHost),nativeAdmitted?0:(batch.source.visibleInstanceOffset??0),nativeAdmitted?1:(batch.source.visibleInstanceFrontier?.offset??0)],24);
    const page=this.page,early=!!page&&page[0]>0&&page[1]>0;
    if(early){new Uint32Array(data.buffer).set([1|(Number(!!this.fieldDomains?.has(domain))<<1),0,this.field!.width,this.field!.height],28);data[29]=17*this.field!.height/page![1];}
    this.device.queue.writeBuffer(entry.uniform,0,data);
    const formView=early?formDepths(this.device).view(this.field!):(this.emptyForm??=this.device.createTexture({label:'MAIN contact unselected form table',size:[1,1],format:'rgba32uint',usage:GPUTextureUsage.TEXTURE_BINDING})).createView();
    const formMatrix=early?formDepths(this.device).matrix(this.field!):entry.uniform;
    const indexed=isGpuIndexedResident(source)?source.gpu:undefined;
-   const buffers=[entry.uniform,indexed?.incidence.binding??source.bufferBinding??source.buffer,batch.storage?.vertices??batch.vertices,batch.storage?.attributes??batch.attributes,batch.storage?.metadata??batch.metadata,this.triangleBinding!,entry.args,batch.source.visibleInstances??batch.metadata,this.sourceStatus!,entry.args,{view:formView},formMatrix] as ContactBinding[];
+   const buffers=[entry.uniform,indexed?.incidence.binding??source.bufferBinding??source.buffer,batch.storage?.vertices??batch.vertices,batch.storage?.attributes??batch.attributes,batch.storage?.metadata??batch.metadata,this.triangleBinding!,entry.args,selected??batch.metadata,this.sourceStatus!,entry.args,{view:formView},formMatrix] as ContactBinding[];
    for(const [pipeline,used,name]of [[this.prepare,[0,4,6,7,8],'prepare'],[this.pack,[0,1,2,3,4,5,7,9,10,11],'pack']] as const){
-    if(host&&pipeline===this.prepare)continue;
-    if(host&&!count)continue;
+    if(staticHost&&pipeline===this.prepare)continue;
+    if(staticHost&&!count)continue;
     packing.setPipeline(pipeline);packing.setBindGroup(0,retainedGroup(this.device,entry.groups,name,pipeline,used.map(binding=>buffers[binding]!),used));
     if(pipeline===this.prepare)packing.dispatchWorkgroups(1);
-    else if(host){const groups=Math.ceil(count/64),limit=this.device.limits.maxComputeWorkgroupsPerDimension;packing.dispatchWorkgroups(Math.min(groups,limit),Math.ceil(groups/limit));}
+    else if(staticHost){const groups=Math.ceil(count/64),limit=this.device.limits.maxComputeWorkgroupsPerDimension;packing.dispatchWorkgroups(Math.min(groups,limit),Math.ceil(groups/limit));}
     else packing.dispatchWorkgroupsIndirect(entry.args,0);
    }
-   draws.push({pipeline:this.raster[batch.source.cullMode??0]!,entry,base:host?bases[index]!:0,count});
+   draws.push({pipeline:this.raster[batch.source.cullMode??0]!,entry,base:staticHost?bases[index]!:0,count});
   }
   packing.end();
   const load:GPULoadOp=this.cleared?'load':'clear';this.cleared=true;
   const pass=encoder.beginRenderPass({label:'MAIN contact triangle ids',colorAttachments:[{view:this.ids!.createView(),loadOp:load,storeOp:'store'}],depthStencilAttachment:{view:this.depth!.createView(),depthClearValue:0,depthLoadOp:load,depthStoreOp:'store'}});
-  if(host){
+  if(staticHost){
    // The status triangle word is what prepare's atomics left: every range.
    this.reserved=total;this.device.queue.writeBuffer(this.reservedWord,0,new Uint32Array([total]));
    for(let at=0;at<draws.length;){
@@ -361,7 +372,7 @@ export class SurfaceIntersections {
    pass.setPipeline(draw.pipeline);pass.setBindGroup(0,retainedGroup(this.device,draw.entry.groups,name,draw.pipeline,[draw.entry.uniform,this.triangleBinding!]));pass.drawIndirect(draw.entry.args,16);
   }
   pass.end();
-  if(host)encoder.copyBufferToBuffer(this.reservedWord,0,this.sourceStatus!,12,4);
+  if(staticHost)encoder.copyBufferToBuffer(this.reservedWord,0,this.sourceStatus!,12,4);
  }
  private serial=0;
  private readonly retained=new Map<ResidentRelationSource,Map<object,RetainedContact>>();

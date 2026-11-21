@@ -14,6 +14,12 @@ export interface SourcePathFeature {
  /** Stable start/end ports. Shared port IDs explicitly declare a join. */
  readonly ports:readonly [number,number];
  readonly rank:number;
+
+
+
+
+
+ readonly faces?:readonly (readonly [number,number])[];
 }
 export interface SourcePathPair {
  readonly id:number;
@@ -75,13 +81,19 @@ export function validateSourceConstruction(value:SourceConstruction,indexCount:n
  const paths=value.paths??[],pairs=value.pathPairs??[];
  if(paths.length||pairs.length){
   if(!Number.isSafeInteger(vertexCount)||vertexCount!<1||indexCount%3)throw Error('Authored paths require original source extents');
-  const byId=new Map<number,SourcePathFeature>();
+  const byId=new Map<number,SourcePathFeature>(),covered:[number,number][]=[];
   for(const path of paths){
    if(!sourceId(path.id)||byId.has(path.id)||path.sites.length<2||path.ports.length!==2||!path.ports.every(sourceId)||!Number.isFinite(path.rank)||path.rank<0)
     throw Error('Invalid authored path feature or identity');
    for(const site of path.sites)validatePathSite(site,indexCount,vertexCount!);
+   for(const range of path.faces??[]){
+    if(range.length!==2||!sourceId(range[0])||!Number.isSafeInteger(range[1])||range[1]<=0||range[0]+range[1]>indexCount/3)throw Error('Authored path face range is outside the original source');
+    covered.push([range[0],range[1]]);
+   }
    byId.set(path.id,path);
   }
+  covered.sort((a,b)=>a[0]-b[0]);
+  for(let k=1;k<covered.length;k++)if(covered[k]![0]<covered[k-1]![0]+covered[k-1]![1])throw Error('Authored path face ranges overlap');
   const pairIds=new Set<number>();
   for(const pair of pairs){
    if(!sourceId(pair.id)||pairIds.has(pair.id)||pair.paths.length!==2||pair.paths[0]===pair.paths[1]||pair.endPorts.length!==2||pair.endPorts.some(ports=>ports.length!==2))

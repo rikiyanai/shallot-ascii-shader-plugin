@@ -1,4 +1,4 @@
-import {prepareComputePipelines} from './gpu-pipeline-preparation.ts';
+import {prepareComputePipelines,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 /** Source residency owns the shared bounds/visibility subset of the arena
  * interface. Geometry/posed-output buffers keep their existing owners until
  * their range-aware consumers migrate. No buffer is a batch identity. */
@@ -67,7 +67,7 @@ export class SourceInstanceArena {
  private readonly slots:CullSlot[]=[];private readonly retired:GPUBuffer[]=[];
  private readonly free:SourceInstanceRange[]=[];private readonly retiring:SourceInstanceRange[]=[];
  epoch=0;
- static async create(device:GPUDevice,progress?:(fraction:number)=>void):Promise<SourceInstanceArena>{
+ static async create(device:GPUDevice,progress?:ComputePipelineProgress):Promise<SourceInstanceArena>{
   const descriptor=()=>({layout:'auto' as const,compute:{module:device.createShaderModule({label:'MAIN global instance frustum',code:CULL}),entryPoint:'main'}});
   const pipelines=await prepareComputePipelines(device,new Map([['global-instance-frustum',descriptor]]),progress);
   return new SourceInstanceArena(device,pipelines.get('global-instance-frustum')!);

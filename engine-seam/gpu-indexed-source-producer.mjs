@@ -7,7 +7,7 @@
  * it after apply.mjs, because apply.mjs owns the visitor's main suffix.
  */
 import {readFile,writeFile} from 'node:fs/promises';
-import {resolve} from 'node:path';
+import {dirname,resolve} from 'node:path';
 
 export const GPU_INDEXED_SOURCE_PRODUCER_MARKER='/* TRUEFF_MAIN_GPU_INDEXED_SOURCE_PRODUCER_0103 */';
 export const GPU_INDEXED_SOURCE_METADATA_TYPE=`{
@@ -29,7 +29,7 @@ export const GPU_INDEXED_SOURCE_METADATA_TYPE=`{
         posedNormalClass?: "face-constant";
         edgeContactClass?: "posed-coincident";
         parts?: { kind: "closed-cells"; extent: readonly [number, number, number]; cellCodes: GPUBufferBinding };
-        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding };
+        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding; occupancy?: { kind: "voxel-column-occupancy-v1"; columns: GPUBufferBinding } };
         poseContent?: {
             kind: "voxel-terrain-material";
             sourceGeneration: number;
@@ -40,6 +40,8 @@ export const GPU_INDEXED_SOURCE_METADATA_TYPE=`{
         };
     }`;
 export const GPU_INDEXED_SOURCE_VOXEL_MARKER='/* TRUEFF_MAIN_GPU_INDEXED_SOURCE_VOXEL_0103 */';
+export const GPU_INDEXED_SOURCE_MESHER_MARKER='/* TRUEFF_MAIN_GPU_INDEXED_SOURCE_MESHER_0103 */';
+export const GPU_INDEXED_SOURCE_POOL_MARKER='/* TRUEFF_MAIN_GPU_INDEXED_SOURCE_POOL_0103 */';
 
 function once(text,from,to,label){
  const matches=text.split(from).length-1;
@@ -73,8 +75,9 @@ export function transformGpuIndexedSourceSources({mesh,forward}){
  const parts='\n        parts?: { kind: "closed-cells"; extent: readonly [number, number, number]; cellCodes: GPUBufferBinding };';
  if(!mesh.includes('parts?: { kind: "closed-cells"'))mesh=once(mesh,kind,kind+parts,'Mesh construction parts');
  if(!forward.includes('parts?: { kind: "closed-cells"'))forward=once(forward,kind,kind+parts,'visitor construction parts');
- const restCellChart='        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding };';
+ const restCellChart='        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding; occupancy?: { kind: "voxel-column-occupancy-v1"; columns: GPUBufferBinding } };';
  const legacyRestCellChart='        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding };';
+ const noOccupancyRestCellChart='        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding };';
  const upgradeRestCellChart=(text,label)=>{
   const declarations=text.split('\n').filter(line=>line.includes('restCellChart?:'));
   if(declarations.length===0)return once(text,parts,parts+'\n'+restCellChart,label);
@@ -82,6 +85,7 @@ export function transformGpuIndexedSourceSources({mesh,forward}){
   const declaration=declarations[0];
   if(declaration===restCellChart)return text;
   if(declaration===legacyRestCellChart)return once(text,declaration,restCellChart,label+' legacy schema');
+  if(declaration===noOccupancyRestCellChart)return once(text,declaration,restCellChart,label+' no-occupancy schema');
   throw Error(`MAIN GPU indexed source ${label} has an unexpected rest-cell chart declaration`);
  };
  mesh=upgradeRestCellChart(mesh,'Mesh rest-cell chart');
@@ -106,13 +110,16 @@ export function transformVoxelTerrainSource(source,{importSpecifier='../../../..
  const resourceAnchor='    emitPass: GPUComputePassDescriptor;';
  source=once(source,resourceAnchor,`${resourceAnchor}\n    producer: GpuIndexedSourceProducerRuntime | null;`,'voxel producer resource type');
  const slotAnchor='    geometry: Geometry;\n    dirty: boolean;';
- source=once(source,slotAnchor,`    geometry: Geometry;\n    /** Counts source-buffer emission changes independently of topology generation. */\n    poseRevision: number;\n    dirty: boolean;\n    /** A wrapped chunk calls resetInterpolation; omit pose retention for that frame. */\n    poseDiscontinuous: boolean;`,'voxel pose revision');
+ source=once(source,slotAnchor,`    geometry: Geometry;\n    /** Counts source-buffer emission changes independently of topology generation. */\n    poseRevision: number;\n    dirty: boolean;\n    /** A wrapped chunk calls resetInterpolation; omit pose retention for that frame. */\n    poseDiscontinuous: boolean;\n    /** Per-slot column occupancy written by voxel:emit (voxel-column-occupancy-v1). */\n    occupancy: GPUBuffer;`,'voxel pose revision and occupancy slot');
  const terrainAnchor='export const Terrain: Resource<{';
  source=once(source,terrainAnchor,`/** Exact CPU-owned inputs of TerrainMaterial.vertex for one chunk draw.\n * The producer updates this certificate whenever emission, chunk Transform, or\n * the material's radial parameters can change. Unknown stages do not call it.\n * The transform is the same previous/current interpolation used by Shallot's\n * global-transform render table; a wrapped chunk fails closed for one frame. */\nfunction voxelPoseContent(slot: Pick<Slot, "x" | "z" | "poseRevision" | "poseDiscontinuous">, previousViewer: number, viewer: number, alpha: number, config: TerrainConfig) {\n    if (slot.poseDiscontinuous) return undefined;\n    const { inner, outer } = radii(config);\n    const currentX = chunkTranslation(slot.x, viewer, config);\n    const previousX = chunkTranslation(slot.x, previousViewer, config);\n    const x = previousX * (1 - alpha) + currentX * alpha;\n    return {\n        kind: "voxel-terrain-material" as const,\n        vertexRevision: slot.poseRevision,\n        instanceTransform: [\n            x, -config.height / 2, chunkTranslation(slot.z, 0, config),\n            0, 0, 0, 1, 1, 1, 1,\n        ] as const,\n        materialParameters: [inner, outer] as const,\n    };\n}\n${terrainAnchor}`,'voxel pose certificate helper');
  const createAnchor='        emitPass: { label: "voxel:emit" },';
  source=once(source,createAnchor,`${createAnchor}\n        producer: null,`,'voxel producer resource create');
  const initializeAnchor='            const { device, root } = world.gpu;';
  source=once(source,initializeAnchor,`${initializeAnchor}\n            s.producer = new GpuIndexedSourceProducerRuntime(device);\n            world.onDispose(() => {\n                s.producer?.dispose();\n                s.producer = null;\n            });`,'voxel producer initialization');
+ // T19B: the occupancy buffer and the seventh bind-group entry live in the
+ // pool transform now, so pool()'s single createBindGroup is already valid.
+ // Terrain only reads geometry.occupancy below.
  const updateAnchor='                    const s = world.resource(Terrain);\n                    let pass: GPUComputePassEncoder | undefined;';
  source=once(source,updateAnchor,`                    const s = world.resource(Terrain);\n                    s.producer?.rethrowFrameSubmitError();\n                    let pass: GPUComputePassEncoder | undefined;`,'voxel producer frame error');
  const wrapAnchor='            slot.x = x;\n            slot.dirty = true;';
@@ -133,13 +140,13 @@ export function transformVoxelTerrainSource(source,{importSpecifier='../../../..
                     posedNormalClass: "face-constant",
                     edgeContactClass: "posed-coincident",
                     poseContent: voxelPoseContent({ x, z, poseRevision: 0, poseDiscontinuous: false }, s.previousViewer, s.viewer, 0, config),
-                    restCellChart: { kind: "voxel-rest-cell-chart", cornerOrder: "shallot-voxel-quad-v1", extent: [config.chunkSize, config.height, config.chunkSize], vertexCellCodes: { buffer: root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 } },
+                    restCellChart: { kind: "voxel-rest-cell-chart", cornerOrder: "shallot-voxel-quad-v1", extent: [config.chunkSize, config.height, config.chunkSize], vertexCellCodes: { buffer: root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 }, occupancy: { kind: "voxel-column-occupancy-v1", columns: { buffer: geometry.occupancy, size: geometry.occupancy.size } } },
                     parts: geometry.allFaces ? { kind: "closed-cells", extent: [config.chunkSize, config.height, config.chunkSize], cellCodes: { buffer: root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 } } : undefined,
                 });
                 const handle = world.resource(Meshes).add(geometry.mesh);`;
  source=once(source,addAnchor,addReplacement,'voxel producer initial mesh attachment');
  const slotInitAnchor='                    geometry,\n                    dirty: true,';
- source=once(source,slotInitAnchor,`                    geometry,\n                    poseRevision: 0,\n                    poseDiscontinuous: false,\n                    dirty: true,`,'voxel pose revision initialization');
+ source=once(source,slotInitAnchor,`                    geometry,\n                    poseRevision: 0,\n                    poseDiscontinuous: false,\n                    occupancy: geometry.occupancy,\n                    dirty: true,`,'voxel pose revision initialization');
  const emitAnchor='                        world.gpu.device.queue.writeBuffer(geometry.uniform, 0, geometry.input);';
  const emitReplacement=`                        world.gpu.device.queue.writeBuffer(geometry.uniform, 0, geometry.input);
                         const producerIndices = world.gpu.root.unwrap(geometry.mesh.indices);
@@ -156,7 +163,7 @@ export function transformVoxelTerrainSource(source,{importSpecifier='../../../..
                             posedNormalClass: "face-constant",
                             edgeContactClass: "posed-coincident",
                             poseContent: voxelPoseContent(slot, s.previousViewer, s.viewer, world.time.fixedAlpha, config),
-                            restCellChart: { kind: "voxel-rest-cell-chart", cornerOrder: "shallot-voxel-quad-v1", extent: [config.chunkSize, config.height, config.chunkSize], vertexCellCodes: { buffer: world.gpu.root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 } },
+                            restCellChart: { kind: "voxel-rest-cell-chart", cornerOrder: "shallot-voxel-quad-v1", extent: [config.chunkSize, config.height, config.chunkSize], vertexCellCodes: { buffer: world.gpu.root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 }, occupancy: { kind: "voxel-column-occupancy-v1", columns: { buffer: slot.occupancy, size: slot.occupancy.size } } },
                             parts: geometry.allFaces ? { kind: "closed-cells", extent: [config.chunkSize, config.height, config.chunkSize], cellCodes: { buffer: world.gpu.root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 } } : undefined,
                         });
                         slot.poseDiscontinuous = false;`;
@@ -177,18 +184,80 @@ function onTerrainGpuIndexedSourceFrameSubmit(world: World): void {
  return source;
 }
 
-/** Vite-facing build hook. It matches the imported producer by resolved file
- * identity, not by scene name or renderer state, and returns a virtual
- * transformed module while leaving the checked-in source untouched. */
+/**
+ * Build-only transform for the original voxel mesher. Same mechanism as
+ * transformVoxelTerrainSource: the checked-in mesher.ts is never rewritten.
+ * The voxel:emit kernel gains a per-column occupancy write from the same
+ * height the exposed-face branches read: each emit thread owns its (x,z)
+ * column's W words exclusively (no atomics) and sets bit y exactly for
+ * y < min(h, Height), so the chart's occupancy certificate carries the
+ * mesher's own source occupancy for this emission.
+ */
+export function transformVoxelMesherSource(source){
+ if(source.includes(GPU_INDEXED_SOURCE_MESHER_MARKER))return source;
+ const layoutAnchor='    chunk: { uniform: d.vec4i },';
+ source=once(source,layoutAnchor,`${layoutAnchor}\n    occupancy: { storage: d.arrayOf(d.u32), access: "mutable" },`,'voxel mesher occupancy layout');
+ const wordsAnchor='    const Height = config.height;';
+ source=once(source,wordsAnchor,`${wordsAnchor}\n    const occupancyWords = Math.ceil(config.height / 32);`,'voxel mesher occupancy words');
+ const writeAnchor='                const h = height(wx, wz);';
+ source=once(source,writeAnchor,`${writeAnchor}
+                const solid = std.max(0, std.min(h, d.i32(Height)));
+                const column = (d.u32(z) * d.u32(Chunk) + d.u32(x)) * d.u32(occupancyWords);
+                for (let w = 0; w < occupancyWords; w++) {
+                    let word = d.u32(0);
+                    for (let b = 0; b < 32; b++) {
+                        if (d.i32(w * 32 + b) < solid) word = word | (d.u32(1) << d.u32(b));
+                    }
+                    layout.$.occupancy[column + d.u32(w)] = word;
+                }`,'voxel mesher occupancy write');
+ return `${source}\n${GPU_INDEXED_SOURCE_MESHER_MARKER}\n`;
+}
+
+/**
+ * Build-only transform for the original voxel pool. Same mechanism as the
+ * terrain/mesher transforms: the checked-in pool.ts is never rewritten.
+ * Each per-geometry record gains the occupancy buffer the mesher's extended
+ * bind group layout requires: allocated exactly like the other per-geometry
+ * buffers, bound LAST (binding 6, after uniform), so the group's single
+ * creation is already valid against the seven-binding layout.
+ */
+export function transformVoxelPoolSource(source){
+ if(source.includes(GPU_INDEXED_SOURCE_POOL_MARKER))return source;
+ const typeAnchor='    group: GPUBindGroup;\n    allFaces: boolean;';
+ source=once(source,typeAnchor,'    group: GPUBindGroup;\n    occupancy: GPUBuffer;\n    allFaces: boolean;','voxel pool occupancy type');
+ const hoistAnchor='    for (let i = 0; i < count; i++) {';
+ source=once(source,hoistAnchor,'    const occupancyWordsPerColumn = Math.ceil(config.height / 32);\n'+hoistAnchor,'voxel pool occupancy words');
+ const allocAnchor='        const uniform = allocate(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);';
+ source=once(source,allocAnchor,`${allocAnchor}\n        const occupancy = allocate(config.chunkSize * config.chunkSize * occupancyWordsPerColumn * 4, GPUBufferUsage.STORAGE);`,'voxel pool occupancy allocation');
+ const entriesAnchor='            entries: [vertices, position, indices, voxel, counts, uniform].map(';
+ source=once(source,entriesAnchor,'            entries: [vertices, position, indices, voxel, counts, uniform, occupancy].map(','voxel pool occupancy binding');
+ const pushAnchor='            group,\n            allFaces: false,';
+ source=once(source,pushAnchor,'            group,\n            occupancy,\n            allFaces: false,','voxel pool occupancy record');
+ return `${source}\n${GPU_INDEXED_SOURCE_POOL_MARKER}\n`;
+}
+
+/** Vite-facing build hook. It matches the imported producer modules by
+ * resolved file identity, with terrain.ts as the original build's sibling
+ * module anchor, not by scene name or renderer state, and returns virtual
+ * transformed modules while leaving checked-in sources untouched. */
 export function gpuIndexedSourceVoxelVitePlugin({sourcePath,importSpecifier}={}){
  const expected=sourcePath?resolve(sourcePath):undefined;
+ // The original voxel Vite integration supplies terrain.ts as the producer
+ // anchor, but the occupancy contract spans the sibling mesher.ts and pool.ts
+ // modules too. Treat that one anchor as the producer directory; explicit
+ // mesher/pool anchors remain exact for focused callers and tests.
+ const terrainRoot=expected&&expected.endsWith('/terrain.ts')?dirname(expected):undefined;
  return {
   name:'shallot-main-gpu-indexed-source-voxel',
   enforce:'pre',
   transform(code,id){
    const clean=id.split('?')[0];
-   if(expected&&resolve(clean)!==expected)return null;
-   if(!expected&&!clean.endsWith('/examples/shallot/voxel/src/terrain.ts'))return null;
+   const resolved=resolve(clean);
+   const terrainSibling=terrainRoot&&dirname(resolved)===terrainRoot&&/\/(?:terrain|mesher|pool)\.ts$/.test(resolved);
+   if(expected&&resolved!==expected&&!terrainSibling)return null;
+   if(!expected&&!clean.endsWith('/examples/shallot/voxel/src/terrain.ts')&&!clean.endsWith('/examples/shallot/voxel/src/mesher.ts')&&!clean.endsWith('/examples/shallot/voxel/src/pool.ts'))return null;
+   if(clean.endsWith('/mesher.ts'))return {code:transformVoxelMesherSource(code),map:null};
+   if(clean.endsWith('/pool.ts'))return {code:transformVoxelPoolSource(code),map:null};
    return {code:transformVoxelTerrainSource(code,{importSpecifier}),map:null};
   },
  };
