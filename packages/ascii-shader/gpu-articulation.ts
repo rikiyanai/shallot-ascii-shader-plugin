@@ -3644,13 +3644,18 @@ fn farColumns(run:Run,kind:u32,span:vec4f)->vec2i{
  return vec2i(max(i32(floor(x.x/16.0)),0),min(i32(floor(x.y/16.0)),skyColumns()-1));
 }
 fn farMarkKey(run:Run,form:FarForm)->u32{return (u32(clamp(form.height,0.0,4095.0))<<20u)|(run.identity.z&0xfffffu);}
+// Select whole source constructions in a separate entry, ordered before skyline
+// in the SAME compute pass. This preserves every producer input/output while
+// keeping native layout admission out of the skyline compiler's call graph.
+@compute @workgroup_size(64) fn prepareSourceParts(@builtin(global_invocation_id) id:vec3u){
+ let runID=scheduledRun(id);if(runID==0xffffffffu||runID>=p.extent.z){return;}
+ let run=runs[runID];if(run.range.y<2u||(run.range.z&0x10000u)!=0u){return;}
+ prepareWholeSourcePart(runID,run);
+}
 @compute @workgroup_size(64) fn skylineReduce(@builtin(global_invocation_id) id:vec3u){
  let runID=scheduledRun(id);if(runID==0xffffffffu||runID>=p.extent.z){return;}
  let run=runs[runID];if(run.range.y<2u||(run.range.z&0x10000u)!=0u){return;}
  let away=heldTier(runID,run);
- // This ordered pass already precedes all construction dispatches. Prepare
- // one complete whole-part verdict here; no member yields speculatively.
- prepareWholeSourcePart(runID,run,away);
 
  if(away==0u){limbWrite(run);}
  if(rippleRun(run)&&tierSelects(run,away)){rippleWrite(run);}
@@ -5062,7 +5067,7 @@ fn sourcePartPreparedCommit(at:u32,owner:u32,record:u32,whole:vec4i){
  // the admitted playback member; the stable group leader remains at.
  atomicStore(&counts[at+12u],SOURCE_PART_PREPARED_FLAG|owner);
 }
-fn prepareWholeSourcePart(runID:u32,run:Run,tier:u32){
+fn prepareWholeSourcePart(runID:u32,run:Run){
  if(runProgramFeature(run)==0u||runProgramContext(run)==0u||sourcePartLeader(run)!=runID){return;}
  // sourcePartReduce chooses the representative by stable source identity, not
  // by this frame's visibility.  A clipped source can therefore have a hidden
@@ -7276,7 +7281,7 @@ function articulationPipelinePlan(device:GPUDevice){
  const pipeline=device.createPipelineLayout({bindGroupLayouts:[layout]});
  const plans=new Map<string,ComputePipelinePlan>();
  const stage=(key:string,entryPoint:string,code:string)=>{const label='MAIN '+key;plans.set(key,()=>{const module=device.createShaderModule({label,code});return {label,layout:pipeline,compute:{module,entryPoint}};});};
- for(const entryPoint of ['featureplace','toneplace','featureorder','featureorderMerge','wordvisibility','sourcePartInit','sourcePartReduce','standingFinalize','sourcePartCanonicalRows','claimMemo','resolveMemo','reclaimMemo','skylineReduce'])stage(entryPoint,entryPoint,isolateComputeEntry(ARTICULATION_SHADER,entryPoint));
+ for(const entryPoint of ['featureplace','toneplace','featureorder','featureorderMerge','wordvisibility','sourcePartInit','sourcePartReduce','standingFinalize','sourcePartCanonicalRows','claimMemo','resolveMemo','reclaimMemo','prepareSourceParts','skylineReduce'])stage(entryPoint,entryPoint,isolateComputeEntry(ARTICULATION_SHADER,entryPoint));
  for(const {entryPoint,code}of buildFarKindStages(ARTICULATION_SHADER).entries)stage(entryPoint,entryPoint,code);
  for(const family of PLAYBACK_FAMILIES)stage('featurecurves:'+family,'featurecurves',familyPlayback(ARTICULATION_SHADER,family));
  // Hard lines and anchors retain the PATH queue/publication ABI but compile
@@ -7387,6 +7392,7 @@ export class GpuArticulation {
  private readonly wordVisibility:GPUComputePipeline;private readonly visibilityDispatch:GPUComputePipeline;private readonly activeRuns:GPUComputePipeline;private readonly activeRunArgs:GPUComputePipeline;
  /** skylineReduce: the merged far skyline profile, after the memo passes and before featurecurves. */
  private readonly skyline:GPUComputePipeline;
+ private readonly prepareSourceParts:GPUComputePipeline;
  /** Startup-prepared direct source-table -> rgba32uint snapshot producer. */
  private readonly partAnchorPack:GPUComputePipeline;
 
@@ -7584,7 +7590,7 @@ export class GpuArticulation {
   this.wordVisibility=pipelines.get('wordvisibility')!;this.visibilityDispatch=pipelines.get('visibilityDispatch')!;
   this.activeRuns=pipelines.get('activeRuns')!;this.activeRunArgs=pipelines.get('activeRunArgs')!;
   this.sourcePartInit=pipelines.get('sourcePartInit')!;this.sourcePartReduce=pipelines.get('sourcePartReduce')!;this.standingFinalize=pipelines.get('standingFinalize')!;this.sourcePartRows=pipelines.get('sourcePartCanonicalRows')!;this.claimMemo=pipelines.get('claimMemo')!;this.resolveMemo=pipelines.get('resolveMemo')!;this.reclaimMemo=pipelines.get('reclaimMemo')!;
-  this.skyline=pipelines.get('skylineReduce')!;this.rehashMemo=pipelines.get('rehashMemo')!;this.toneSeed=pipelines.get('toneSeed')!;this.partAnchorPack=pipelines.get('partAnchorPack')!;
+  this.prepareSourceParts=pipelines.get('prepareSourceParts')!;this.skyline=pipelines.get('skylineReduce')!;this.rehashMemo=pipelines.get('rehashMemo')!;this.toneSeed=pipelines.get('toneSeed')!;this.partAnchorPack=pipelines.get('partAnchorPack')!;
   this.seal=prepared.seal??new GpuNativeSealer(device);
   const articulatedAt=12+this.packed.instructions.length,hardAt=articulatedAt+this.packed.articulatedInstructions.length,partsAt=hardAt+this.packed.hardLineInstructions.length,paperAt=partsAt+this.packed.partAtoms.length,circleAt=paperAt+this.packed.partPaper.length,metricsAt=circleAt+this.packed.circleProgram.length,pointsAt=metricsAt+this.packed.glyphs.length;
   // The far strip table is appended after every existing section (header
@@ -8069,7 +8075,12 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
     f.setBindGroup(0,this.device.createBindGroup({layout:foreign.getBindGroupLayout(0),entries:[{binding:5,resource:{buffer:fpBuffer}},{binding:6,resource:{buffer:output}},{binding:7,resource:{buffer:counts}},{binding:3,resource:{buffer:stacked.upper.words}},{binding:4,resource:{buffer:stacked.upper.count}}]}));
     f.dispatchWorkgroups(Math.ceil(rows/64));f.end();
    }
-   const pass=encoder.beginComputePass({label:pipeline===this.sourcePartInit?'MAIN source-part key initialization':pipeline===this.sourcePartReduce?'MAIN source-part exact-key reduction':pipeline===this.standingFinalize?'MAIN standing owner payload finalization':pipeline===this.sourcePartRows?'MAIN prepared source-part native rows':pipeline===this.skyline?'MAIN merged far skyline profile':pipeline===this.claimMemo||pipeline===this.resolveMemo||pipeline===this.reclaimMemo?'MAIN exact source-key correspondence':construction.includes(pipeline)?'MAIN featurecurves compiled playback':pipeline===this.wordVisibility?'MAIN parallel whole-word visibility':'MAIN featureplace fixed native cursors'});pass.setPipeline(pipeline);pass.setBindGroup(0,group);const argumentOffset=activeArgumentOffset(pipeline);if(pipeline===this.wordVisibility)pass.dispatchWorkgroupsIndirect(visibilityArguments,0);else if(job.gpu&&activeArguments&&activeRunPipelines.has(pipeline)&&argumentOffset!==undefined)pass.dispatchWorkgroupsIndirect(activeArguments,argumentOffset);else pass.dispatchWorkgroups(x,y);pass.end();
+   const pass=encoder.beginComputePass({label:pipeline===this.sourcePartInit?'MAIN source-part key initialization':pipeline===this.sourcePartReduce?'MAIN source-part exact-key reduction':pipeline===this.standingFinalize?'MAIN standing owner payload finalization':pipeline===this.sourcePartRows?'MAIN prepared source-part native rows':pipeline===this.skyline?'MAIN merged far skyline profile':pipeline===this.claimMemo||pipeline===this.resolveMemo||pipeline===this.reclaimMemo?'MAIN exact source-key correspondence':construction.includes(pipeline)?'MAIN featurecurves compiled playback':pipeline===this.wordVisibility?'MAIN parallel whole-word visibility':'MAIN featureplace fixed native cursors'});const argumentOffset=activeArgumentOffset(pipeline);
+   if(pipeline===this.skyline){
+    pass.setPipeline(this.prepareSourceParts);pass.setBindGroup(0,group);
+    if(job.gpu&&activeArguments&&argumentOffset!==undefined)pass.dispatchWorkgroupsIndirect(activeArguments,argumentOffset);else pass.dispatchWorkgroups(x,y);
+   }
+   pass.setPipeline(pipeline);pass.setBindGroup(0,group);if(pipeline===this.wordVisibility)pass.dispatchWorkgroupsIndirect(visibilityArguments,0);else if(job.gpu&&activeArguments&&activeRunPipelines.has(pipeline)&&argumentOffset!==undefined)pass.dispatchWorkgroupsIndirect(activeArguments,argumentOffset);else pass.dispatchWorkgroups(x,y);pass.end();
    if(pipeline===this.far[0])rebuildActiveQueues?.();
    if(pipeline===this.place){const tone=encoder.beginComputePass({label:'MAIN parallel region tone words'});tone.setPipeline(this.tonePlace);tone.setBindGroup(0,group);tone.dispatchWorkgroups(x,y);tone.end();}
   }
