@@ -92,14 +92,14 @@ fn at(q:vec2i)->Sample{
  return vec4f(vec3f(band),.5);
 }
 `;
-                                                                         
-                                                                               
-                                                                              
-                                                                             
-                                                                             
-                                                                    
-                                                                        
-                                                                              
+
+
+
+
+
+
+
+
 interface PreparedConstructionMask{
  readonly prepare:GPUComputePipeline;
  readonly lines:GPURenderPipeline;readonly features:GPURenderPipeline;readonly featureLayout:GPUBindGroupLayout;

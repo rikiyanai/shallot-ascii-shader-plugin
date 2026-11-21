@@ -1,6 +1,6 @@
-                                                                        
+
 //
-                                                                           
+
 // emits every PART_FORK band as an explicit source incidence graph: each arm
 // section with its ports, every band halfedge/face/source edge with the arm
 // section that labels each end, and the section's exact interpolated samples.

@@ -1,12 +1,12 @@
-                                                                               
-                                                                               
-                                                                               
-                                                                        
-                                                             
-                                                                        
-                                                                              
-                                                                   
-                                                                        
+
+
+
+
+
+
+
+
+
 export const PRIMARY_IMAGE_MARKER='/* TRUEFF_MAIN_PRIMARY_IMAGE_0117 */';
 function once(text,from,to,label){if(text.split(from).length!==2)throw Error('MAIN primary image: '+label+' changed');return text.replace(from,to);}
 export function transformPrimaryImageTonemapping(tonemap){

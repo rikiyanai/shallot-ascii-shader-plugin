@@ -445,4 +445,3 @@ fn nativeRowRepeatPaperSpan(base:u32,rowAddr:u32,extra:u32,copy:u32)->vec4i{
 }
 `;
 }
-

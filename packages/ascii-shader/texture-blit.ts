@@ -1,8 +1,8 @@
-                                                                              
-                                                                             
-                                                                            
-                                                                          
-                                                                               
+
+
+
+
+
 const SHADER=/* wgsl */`
 @group(0) @binding(0) var source:texture_2d<f32>;
 struct V {@builtin(position) position:vec4f,@location(0) uv:vec2f}
