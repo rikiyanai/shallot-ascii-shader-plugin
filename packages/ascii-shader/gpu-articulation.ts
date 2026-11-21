@@ -27,7 +27,7 @@ import type {SourceSmallParent} from './source-small-parent.ts';
 import type {SourceWholePartRole} from './source-lod.ts';
 import {compileComputePipelines,prepareComputePipelines,type ComputePipelinePlan,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {CONSTRUCTION_POINT_WGSL,POINT_SOURCE_CHART_WGSL,SPAN_SOURCE_TAG,NATIVE_SPAN_SOURCE} from './source-coordinates.ts';
-import {TONE_PASSAGES,TEXTURE_EDGE_MEASURE} from './compiled-tone-passages.ts';
+import {TONE_PASSAGES} from './compiled-tone-passages.ts';
 import {nativeWholeInk,type NativeGlyph,type NativeNeighborhood,type NativeOccurrence} from './native-page.ts';
 import type {SurfaceField} from './surface-fields.ts';
 import {FORM_DEPTH_WGSL,FORM_DEPTH_HEADER_ROW,NEAR_FROM_ROWS,FAR_STRIP_BELOW_ROWS,LOD_TIER_HOLD,formDepths} from './form-depths.ts';
@@ -1377,31 +1377,6 @@ fn limbRead(run:Run)->vec2u{
  }
  return read;
 }
-// PATH-LED OR REGION-LED (compiled-tone-passages.ts TEXTURE_EDGE_MEASURE, the
-// same function the tone producer reads): x stations read, y stations where
-// the run's own form has a boundary finer than a glyph and hangs over open
-// space. The tone producer spells that envelope as texture-edge words.
-${TEXTURE_EDGE_MEASURE}
-fn leafRead(run:Run)->vec2u{
- let scale=p.field.xy/p.rect.zw;let stride=max(1u,run.range.y/8u)*2u;var read=vec2u(0u);
- for(var k=0u;k<4u;k++){
-  let i=k*stride;if(i+1u>=run.range.y){break;}
-  let a=points[run.range.x+i];let b=points[run.range.x+i+1u];if(!pointVisible(a)){continue;}
-  let along=b.position.xy-a.position.xy;if(dot(along,along)<16.0){continue;}
-  let lean=normalize(vec2f(-along.y,along.x))*scale;let px=length(lean);let unit=lean/px;let inner=max(2.0*px,1.5);
-  let f=fieldPoint(mix(a.position.xy,b.position.xy,.5));
-  // The form is the side that reads the owner, or the nearer side where the
-  // owner occludes itself (limbRead's relation).
-  let plus=tierSample(run,f+unit*inner);let minus=tierSample(run,f-unit*inner);
-  var own=f;var depth=0.0;
-  if(plus.on&&(!minus.on||plus.d>minus.d*1.03)){own=f+unit*inner;depth=plus.d;}
-  else if(minus.on&&(!plus.on||minus.d>plus.d*1.03)){own=f-unit*inner;depth=minus.d;}
-  else{continue;}
-  read.x++;
-  if(textureEdge(own,vec2u(run.identity.y,run.identity.z),depth)){read.y++;}
- }
- return read;
-}
 // Selection table [tier][column] (TIER_SELECTION): least visible projected
 // length in text rows, TIER_NEVER = not drawn at that tier.
 // The slope turn across a terrain crease, read on the frame's own normals at
@@ -1495,6 +1470,19 @@ fn terrainOutlineRead(run:Run)->vec3u{
  }
  return read;
 }
+// A visibility partition may move between the sampled stations of one source
+// edge. One certified surviving silhouette/occluding station is enough to
+// keep the source run; the word-visibility pass clips the hidden members later.
+// A majority vote was wrong here: it turned a partial occlusion into a whole
+// outline deletion and made the line pop back when the partition crossed a
+// sample. For terrain, y is the certified depth-step count; for hard
+// non-terrain edges, z is the certified depth-step-or-normal-turn count.
+// x == 0 means the field gave us no evidence, so the incumbent selection
+// remains intact.
+fn hasCertifiedOutline(outline:vec3u,terrain:bool)->bool{
+ let kept=select(outline.z,outline.y,terrain);
+ return outline.x==0u||kept>0u;
+}
 var<private> probeOutline:bool;// PROBE
 // tier: the form's one tier (distanceTier), the row of TIER_SELECTION.
 fn tierSelects(run:Run,tier:u32)->bool{
@@ -1525,14 +1513,14 @@ fn tierSelects(run:Run,tier:u32)->bool{
  // seam or mesh border lying on flat ground, a fold inside one cliff face, at
  // the page's own scale) is no outline, and the surface's tone carries it
  // (skill 11 falsifier "all detected edges were spelled"). Every tier: what
- // a row cannot show is decided by the row's world span. Majority of the
- // stations read; a run that reads none keeps its selection.
+ // a row cannot show is decided by the row's world span. Any certified
+ // surviving station keeps the outline; no field evidence keeps its incumbent.
  // A hard edge also keeps a crease turn (z); a height surface's folds go by
  // depth alone (y), so a picket of facet contours down one cliff face yields.
  if((terrain||((run.range.z&0x40000u)!=0u&&wholeBoundaryFlags(run)==0u))&&line<=1u){
   probeOutline=!terrain;let outline=terrainOutlineRead(run);probeOutline=false;let kept=select(outline.z,outline.y,terrain);
   if(!terrain){if(outline.x==0u){probeAdd(67u);}else if(kept*2u>outline.x){probeAdd(84u);if(outline.y*2u>outline.x){probeAdd(85u);}}}// PROBE
-  if(outline.x>0u&&kept*2u<=outline.x){
+  if(outline.x>0u&&!hasCertifiedOutline(outline,terrain)){
    // A FOLD OF A STEEP FACE (a cliff's facets turning 45 degrees or more
    // against each other) is the face's construction, not a seam: it stays
    // when it runs three rows or more and no second fold lies inside one
@@ -1563,14 +1551,11 @@ fn tierSelects(run:Run,tier:u32)->bool{
  // runs that cannot read their own form, keep both sides.
  // A whole round or box (0x120000) is ONE closed run: no twin outline to
  // yield to; a thin visible crescent keeps its arc (lines4, D1).
- if(line<=1u&&(run.range.z&0x120000u)==0u){let limb=limbRead(run);if(limb.x>0u&&limb.y*2u>limb.x){return false;}}
- // A boundary finer than a glyph that hangs over open space is region-led:
- // in the near and middle views the tone producer spells it as texture-edge
- // words (tone-field.ts textureEdges), so its outline is not also spelled.
- // The far view keeps the connected outline (D9). Only a field-class source
- // (0x8000000, the class the tone producer's texture edge acts on) qualifies;
- // hard edges and whole round or box constructions are never texture.
- if(line<=1u&&tier<2u&&(run.range.z&0x8060000u)==0x8000000u){let leaf=leafRead(run);if(leaf.x>0u&&leaf.y*2u>leaf.x){return false;}}
+ // A thin paired flank may yield its secondary occluding side, but never the
+ // source silhouette itself. The old line<=1 gate let the screen-side test
+ // erase a real outer outline when the visible partition moved; line class 0
+ // is the connected outline and is therefore unconditional here.
+ if(line==1u&&(run.range.z&0x18070000u)==0x8000000u){let limb=limbRead(run);if(limb.x>0u&&limb.y*2u>limb.x){return false;}}
  // At the outline tier an occluding contour INSIDE a soft form (one tier of
  // a conifer's crown over the next, a lobe over a lobe) is drawn only when it
  // runs FAR_CONTOUR_LEAST_ROWS rows: a run is one unit and its shift per row,
@@ -2306,7 +2291,11 @@ fn boxSeam(run:Run,a:Point,b:Point)->bool{
   let half=along*(2.5/span);
   for(var s=1u;s<4u;s++){if((open&(1u<<s))==0u){continue;}let c=mix(a.position.xy,b.position.xy,f32(s)*.25);seam+=surfaceOutlineRead(c-half,c+half);}
  }
- return seam.x>0u&&seam.z*2u<=seam.x;
+ // The same source edge can cross a seam and a genuine outline. A screen
+ // majority must not delete its surviving outline interval; word visibility
+ // clips the hidden intervals after construction. Only all-seam evidence
+ // authorizes this complete-edge rejection.
+ return seam.x>0u&&seam.z==0u;
 }
 
 // lids; each unit clips by the lid that holds its centre: none if that lid is
@@ -4146,9 +4135,10 @@ fn sourcePartCanonicalAtRow(run:Run,row:i32)->SourceCanonicalHit{
 // cannot repeat source-edge traversal or choose from visibility fragments.
 fn sourcePartCanonicalPlaybackAtRow(run:Run,row:i32)->SourceCanonicalHit{
  let range=sourcePartCanonicalRangeCached(run);if(range.x==NONE||range.y<2u){return sourcePartCanonicalMiss();}
- let group=sourcePartLeader(run);var step=NONE;
- if(sourcePartRowGroupReady(group)){step=sourcePartRowEdge(group,row);if(step==NONE){return sourcePartCanonicalMiss();}}
- else{return sourcePartCanonicalAtRow(run,row);}
+ let leader=sourcePartLeader(run);if(leader==NONE){return sourcePartCanonicalMiss();}
+ let group=sourcePartRowGroupForRun(leader);var step=NONE;
+ if(!sourcePartRowGroupReady(group)){return sourcePartCanonicalMiss();}
+ step=sourcePartRowEdge(group,row);if(step==NONE){return sourcePartCanonicalMiss();}
  let closed=(range.z&SOURCE_PART_CANONICAL_FLAG_CLOSED)!=0u;
  let j=select(step+1u,0u,closed&&step+1u==range.y);let aa=sourcePartCanonicalRowAddress(range,step);let bb=sourcePartCanonicalRowAddress(range,j);
  let ca=vec4f(bitcast<f32>(partAnchorWord(aa)),bitcast<f32>(partAnchorWord(aa+1u)),bitcast<f32>(partAnchorWord(aa+2u)),bitcast<f32>(partAnchorWord(aa+3u)));
@@ -4188,10 +4178,16 @@ fn sourcePartCanonicalEdgeDistance(run:Run,range:vec4u,step:u32,row:i32)->f32{
  let ay=sourcePartCanonicalPage(ca);let by=sourcePartCanonicalPage(cb);let rowY=f32(row)*17.0+8.5;return abs(clamp(rowY,min(ay.y,by.y),max(ay.y,by.y))-rowY);
 }
 fn sourcePartCanonicalRowsFor(runID:u32,run:Run){
- if(!sourcePartRowReady()||runProgramFeature(run)==0u||runProgramContext(run)==0u||sourcePartLeader(run)!=runID){return;}
+ let prepared=sourcePartPrepared(run);
+ let leader=sourcePartLeader(run);
+ if(prepared!=NONE&&leader==runID){
+  let state=atomicLoad(&counts[prepared+12u]);
+  atomicStore(&counts[prepared+12u],(state&~SOURCE_PART_ROWS_READY)|SOURCE_PART_ROWS_FAILED);
+ }
+ if(!sourcePartRowReady()||runProgramFeature(run)==0u||runProgramContext(run)==0u||leader!=runID){return;}
  let range=sourcePartCanonicalRangeCached(run);if(range.x==NONE||range.y<2u){return;}
  let nativeRows=sourcePartRowWord(3u);let blocks=sourcePartRowWord(4u);let groupCount=sourcePartRowWord(2u);
- let record=sourcePartCanonicalRecord(run.identity.y,run.identity.z,run.identity.z,runProgramFeature(run)&SOURCE_PART_FEATURE_ORDINAL_MASK);let group=runID;
+ let record=sourcePartCanonicalRecord(run.identity.y,run.identity.z,run.identity.z,runProgramFeature(run)&SOURCE_PART_FEATURE_ORDINAL_MASK);let group=sourcePartRowGroupForRun(runID);
  if(group==NONE||group>=groupCount||group>=sourcePartRowWord(11u)){return;}
  let descriptor=sourcePartRowWord(6u)+group*SOURCE_PART_ROW_TABLE_GROUP_WORDS;let bitset=sourcePartRowWord(7u)+group*blocks;let prefix=sourcePartRowWord(8u)+group*blocks;let payloadBase=sourcePartRowWord(9u);
  let closed=(range.z&SOURCE_PART_CANONICAL_FLAG_CLOSED)!=0u;let edgeCount=select(range.y-1u,range.y,closed);
@@ -4203,8 +4199,12 @@ fn sourcePartCanonicalRowsFor(runID:u32,run:Run){
  let payload=atomicAdd(&counts[p.partAnchors.w],touched);if(payload+touched>sourcePartRowWord(10u)){atomicOr(&counts[rowCount()],32u);return;}
  sourcePartRowStore(descriptor,1u);sourcePartRowStore(descriptor+1u,bitset);sourcePartRowStore(descriptor+2u,prefix);sourcePartRowStore(descriptor+3u,payload);sourcePartRowStore(descriptor+4u,touched);sourcePartRowStore(descriptor+5u,record);
  var seen=0u;for(var block=0u;block<blocks;block++){let mask=sourcePartRowWord(bitset+block);for(var bit=0u;bit<32u;bit++){if((mask&(1u<<bit))==0u){continue;}sourcePartRowStore(payloadBase+payload+seen,NONE);seen++;}}
- for(var step=0u;step<edgeCount;step++){let next=select(step+1u,0u,closed&&step+1u==range.y);let aa=sourcePartCanonicalRowAddress(range,step);let bb=sourcePartCanonicalRowAddress(range,next);let ca=vec4f(bitcast<f32>(partAnchorWord(aa)),bitcast<f32>(partAnchorWord(aa+1u)),bitcast<f32>(partAnchorWord(aa+2u)),bitcast<f32>(partAnchorWord(aa+3u)));let cb=vec4f(bitcast<f32>(partAnchorWord(bb)),bitcast<f32>(partAnchorWord(bb+1u)),bitcast<f32>(partAnchorWord(bb+2u)),bitcast<f32>(partAnchorWord(bb+3u)));let ay=sourcePartCanonicalPage(ca);let by=sourcePartCanonicalPage(cb);let lo=min(ay.y,by.y);let hi=max(ay.y,by.y);let first=i32(clamp(floor(lo/17.0),0.0,f32(nativeRows-1u)));let last=i32(clamp(floor(hi/17.0),0.0,f32(nativeRows-1u)));
   for(var row=first;row<=last;row++){if(!sourcePartCanonicalEdgeSpan(run,range,step,row)){continue;}let block=u32(row)>>5u;let mask=sourcePartRowWord(bitset+block);let rank=sourcePartRowWord(prefix+block)+countOneBits(mask&((1u<<(u32(row)&31u))-1u));let at=payloadBase+payload+rank;let current=sourcePartRowWord(at);let candidateDistance=sourcePartCanonicalEdgeDistance(run,range,step,row);let replace=current==NONE||!(candidateDistance>=sourcePartCanonicalEdgeDistance(run,range,current,row));if(replace){sourcePartRowStore(at,step);}}
+ }
+ if(prepared!=NONE){
+  let state=atomicLoad(&counts[prepared+12u]);
+  if(sourcePartPreparedRowsWitnessed(run)){atomicStore(&counts[prepared+12u],(state&~SOURCE_PART_ROWS_FAILED)|SOURCE_PART_ROWS_READY);}
+  else{atomicStore(&counts[prepared+12u],(state&~SOURCE_PART_ROWS_READY)|SOURCE_PART_ROWS_FAILED);}
  }
 }
 @compute @workgroup_size(64) fn sourcePartCanonicalRows(@builtin(global_invocation_id) id:vec3u){let runID=scheduledRun(id);if(runID==0xffffffffu||runID>=p.extent.z){return;}sourcePartCanonicalRowsFor(runID,runs[runID]);}
@@ -4730,6 +4730,10 @@ fn wholePartNativeRow(sourceRow:i32,sourceRows:i32,partRows:i32)->i32{
 // packets retain endpoint interpolation.
 fn programmedWholePart(runID:u32,run:Run,role:u32,size:u32,row:i32,portion:u32,seen:bool,sourcePair:u32,sourceQ:vec4f,priority:u32,canonicalReady:bool,canonical:SourceCanonicalHit)->bool{
  let prepared=sourcePartPrepared(run);if(prepared==NONE){return false;}
+ // A failed replacement leaves this entire source group on the incumbent.
+ // softPortion can re-enter here after whole-source playback declined; a
+ // committed layout alone must not swallow that fallback via portion>0.
+ if(!sourcePartPreparedCanonicalRowsReady(runID,run)){return false;}
  let record=atomicLoad(&counts[prepared+13u]);let whole=sourcePartPreparedLayout(prepared);
  if(whole.w<0){return false;}
  let partRow=row-whole.y;if(partRow<0||partRow>=whole.w){return false;}
@@ -5048,13 +5052,21 @@ fn sourcePartLeader(run:Run)->u32{
 // canonical source leader remains the stable group owner; the member may be a
 // different visible run when the stable leader is hidden.
 const SOURCE_PART_PREPARED_FLAG=0x80000000u;
+// The prepared group record already has 18 words: words 12..17 carry the
+// selected native owner, record and layout. Reuse two high status bits in its
+// published word rather than allocating another storage binding/arena. The
+// owner ID remains in the low 29 bits; source-run capacity is far below that
+// address space on every admitted device.
+const SOURCE_PART_ROWS_READY=0x40000000u;
+const SOURCE_PART_ROWS_FAILED=0x20000000u;
+const SOURCE_PART_OWNER_MASK=0x1fffffffu;
 fn sourcePartPrepared(run:Run)->u32{
  let leader=sourcePartLeader(run);if(leader==NONE){return NONE;}
  let at=sourcePartRecordAddress(leader);return select(NONE,at,(atomicLoad(&counts[at+12u])&SOURCE_PART_PREPARED_FLAG)!=0u);
 }
 fn sourcePartPreparedOwner(run:Run)->u32{
  let at=sourcePartPrepared(run);if(at==NONE){return NONE;}
- return atomicLoad(&counts[at+12u])&~SOURCE_PART_PREPARED_FLAG;
+ return atomicLoad(&counts[at+12u])&SOURCE_PART_OWNER_MASK;
 }
 // The ordered source-group producer commits the complete selected record and
 // layout in words 13..17. Playback reads this compact decision directly;
@@ -5068,7 +5080,10 @@ fn sourcePartPreparedCommit(at:u32,owner:u32,record:u32,whole:vec4i){
  atomicStore(&counts[at+13u],record);atomicStore(&counts[at+14u],bitcast<u32>(whole.x));atomicStore(&counts[at+15u],bitcast<u32>(whole.y));atomicStore(&counts[at+16u],bitcast<u32>(whole.z));atomicStore(&counts[at+17u],bitcast<u32>(whole.w));
  // Publish only after every record/layout word is complete. The low bits name
  // the admitted playback member; the stable group leader remains at.
- atomicStore(&counts[at+12u],SOURCE_PART_PREPARED_FLAG|owner);
+ // Row admission is a group verdict published by sourcePartCanonicalRows;
+ // until that later dispatch completes, every member must retain the
+ // incumbent rather than letting the selected owner and its siblings diverge.
+ atomicStore(&counts[at+12u],SOURCE_PART_PREPARED_FLAG|owner|SOURCE_PART_ROWS_FAILED);
 }
 fn prepareWholeSourcePart(runID:u32,run:Run){
  if(runProgramFeature(run)==0u||runProgramContext(run)==0u||sourcePartLeader(run)!=runID){return;}
@@ -5316,8 +5331,9 @@ fn softProgramRowPairScan(run:Run,row:i32)->u32{
 // incumbent resolver below remains authoritative.
 fn softPreparedRowPair(runID:u32,run:Run,row:i32)->u32{
  if(runProgramFeature(run)==0u){return NONE;}
- let leader=sourcePartLeader(run);if(leader==NONE||!sourcePartRowGroupReady(leader)){return NONE;}
- let step=sourcePartRowEdge(leader,row);if(step==NONE){return NONE;}
+ let leader=sourcePartLeader(run);if(leader==NONE){return NONE;}
+ let group=sourcePartRowGroupForRun(leader);if(!sourcePartRowGroupReady(group)){return NONE;}
+ let step=sourcePartRowEdge(group,row);if(step==NONE){return NONE;}
  let range=sourcePartCanonicalRangeCached(run);if(range.x==NONE||range.y<2u){return NONE;}
  let edgeCount=select(range.y-1u,range.y,(range.z&SOURCE_PART_CANONICAL_FLAG_CLOSED)!=0u);if(step>=edgeCount){return NONE;}
  let at=sourcePartCanonicalRowAddress(range,step);let descriptor=sourcePartCanonicalPair(run,partAnchorWord(at+5u),partAnchorWord(at+6u));
@@ -5415,7 +5431,7 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
  if(row<0||row>=i32(rowCount())){return;}
  let base=run.range.x;let programFeature=runProgramFeature(run);var role=runRole(run);
  var sourcePair=0u;
- var sourceQ=softSourceAt(run,sourcePair,row);
+ var sourceQ=vec4f(0.0);
  var canonical=sourcePartCanonicalMiss();
 
  // 133 rule over whole edges), never seeded by the visible portion's first pair.
@@ -5750,6 +5766,34 @@ fn segmentDirection(pair:u32)->u32{
  for(var i=0u;i<segmentCount;i++){if(pair<=segmentEnd[i]){return segmentDir[i];}}
  return runDirection;
 }
+// A whole native plan is admitted only when its complete emitted page-row
+// envelope already has source-owned row witnesses in the prepared table. The
+// row table carries canonical edge ordinals, so an inserted cap/return row
+// must not borrow an edge from a neighbouring band or fall back to pair zero.
+// This producer-side check is run once by the source-group leader after the
+// row payload is complete; all members consume its published verdict.
+fn sourcePartPreparedRowsWitnessed(run:Run)->bool{
+ let prepared=sourcePartPrepared(run);if(prepared==NONE){return true;}
+ let whole=sourcePartPreparedLayout(prepared);if(whole.w<=0){return false;}
+ let leader=sourcePartLeader(run);if(leader==NONE){return false;}
+ let group=sourcePartRowGroupForRun(leader);if(!sourcePartRowGroupReady(group)){return false;}
+ let pageRows=i32(p.extent.y)/17;let first=max(0,-whole.y);let last=min(whole.w,pageRows-whole.y);
+ for(var sourceRow=first;sourceRow<last;sourceRow++){
+  if(sourcePartRowEdge(group,whole.y+sourceRow)==NONE){return false;}
+ }
+ return true;
+}
+fn sourcePartPreparedCanonicalRowsReady(runID:u32,run:Run)->bool{
+ let prepared=sourcePartPrepared(run);
+ if(prepared==NONE){
+  // An absent native-entry layout is not evidence of an available row
+  // payload. Keep the complete incumbent when optional row storage missed.
+  let leader=sourcePartLeader(run);if(leader==NONE){return false;}
+  return sourcePartRowGroupReady(sourcePartRowGroupForRun(leader));
+ }
+ let state=atomicLoad(&counts[prepared+12u]);
+ return (state&SOURCE_PART_ROWS_READY)!=0u&&(state&SOURCE_PART_ROWS_FAILED)==0u;
+}
 // D5 ON A CURVED FORM (line repair step 4): no upright or bracket unit on the
 // same side in two consecutive rows. A run is one side; a curved run is a bent
 // chain (runBent). A straight steep fold keeps its ずらし run (terrain table):
@@ -5784,11 +5828,12 @@ fn d5Swap(word:u32,row:i32)->bool{return curvedRun&&word!=0u&&abs(row-lastUprigh
 fn programmedWholeSourcePart(runID:u32,run:Run,table:u32,size:u32,priority:u32,canonicalReady:bool)->bool{
  if(runProgramFeature(run)==0u||runProgramContext(run)==0u||run.range.y<2u){return false;}
  let prepared=sourcePartPrepared(run);if(prepared==NONE){return false;}
+ if(!sourcePartPreparedCanonicalRowsReady(runID,run)){return false;}
  let owner=sourcePartPreparedOwner(run);if(owner==NONE){return false;}
+ if(owner!=runID){return true;}
  let whole=sourcePartPreparedLayout(prepared);
  if(whole.w<0){return false;}
  let leader=sourcePartLeader(run);if(leader==NONE){return false;}
- if(owner!=runID){return true;}
 	// Walk only complete native rows on the page. Keep sourceRow in the
 	// source's original coordinate system: wholePartMember(), growth and the
 	// anchor row all use whole.w and the original row identity. emitMapped()
@@ -5810,7 +5855,8 @@ fn softRunPhaseOrigin(run:Run)->Point{
  return finiteRunStart(run);
 }
 fn softRunPlayback(runID:u32,run:Run,table:u32,size:u32,priority:u32,nativeAnchorPhase:f32,nativeTurn:vec2f){
- let canonicalReady=sourcePartCanonicalPlayable(run);
+ var canonicalReady=sourcePartCanonicalPlayable(run);
+ if(canonicalReady&&!sourcePartPreparedCanonicalRowsReady(runID,run)){canonicalReady=false;}
  if(programmedWholeSourcePart(runID,run,table,size,priority,canonicalReady)){return;}
  softRunAnchor=softRunPhaseOrigin(run);
  let base=run.range.x;let pairs=run.range.y/2u;
@@ -8054,7 +8100,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
    const curveIndex=this.curves.indexOf(pipeline);if(curveIndex>=0)return (1+curveIndex)*12;
    return undefined;
   };
-  for(const [pipeline,x,y]of [[this.sourcePartInit,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.sourcePartReduce,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.standingFinalize,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.sourcePartRows,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.claimMemo,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.resolveMemo,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.reclaimMemo,Math.min(curveColumns,Math.ceil(memo.slots/64)),Math.ceil(memo.slots/(curveColumns*64))],[this.skyline,curveColumns,Math.ceil(curveGroups/curveColumns)],...construction.map(pipeline=>{const [x,y]=pipeline===this.far[2]?standingGroups:[curveColumns,Math.ceil(curveGroups/curveColumns)];return [pipeline,x,y] as const;}),[this.wordVisibility,0,0],[this.place,rows,1]] as const){
+  for(const [pipeline,x,y]of [[this.sourcePartInit,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.sourcePartReduce,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.standingFinalize,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.claimMemo,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.resolveMemo,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.reclaimMemo,Math.min(curveColumns,Math.ceil(memo.slots/64)),Math.ceil(memo.slots/(curveColumns*64))],[this.skyline,curveColumns,Math.ceil(curveGroups/curveColumns)],[this.sourcePartRows,curveColumns,Math.ceil(curveGroups/curveColumns)],...construction.map(pipeline=>{const [x,y]=pipeline===this.far[2]?standingGroups:[curveColumns,Math.ceil(curveGroups/curveColumns)];return [pipeline,x,y] as const;}),[this.wordVisibility,0,0],[this.place,rows,1]] as const){
    if(pipeline===this.wordVisibility){
     const pass=encoder.beginComputePass({label:'MAIN count-sized word visibility dispatch'});pass.setPipeline(this.visibilityDispatch);pass.setBindGroup(0,visibilityDispatchGroup);pass.dispatchWorkgroups(1);pass.end();
    }

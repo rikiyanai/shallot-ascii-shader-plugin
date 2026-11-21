@@ -621,6 +621,42 @@ fn selectedListCapacity()->u32{return chartClusters();}
 fn chartEarlyEmittedWord()->u32{return selectedListBase()+select(0u,2u+selectedListCapacity()+4u+requirementCount(),chartOn());}
 fn chartEarlyEmitted()->bool{return chartOn()&&atomicLoad(&contactWork[chartEarlyEmittedWord()])!=0u;}
 fn columnEnd()->u32{return chartEarlyEmittedWord()+select(0u,1u,chartOn());}
+// R51 residual domain: the chart-cluster list is deliberately not reused for
+// fine source IDs. Its bounded tail holds [edgeCount,vertexCount,overflow,
+// faceCount], a compact edge list, a vertex membership bitset, and a compact
+// vertex list. The edge/vertex output capacities are the chart's cluster
+// count; overflow keeps the complete incumbent consumer domains.
+fn residualHeader()->u32{return columnEnd();}
+// Bit 6 of the producer's chart flags authorizes the optional residual suffix.
+fn residualOn()->bool{return chartOn()&&(params.owners[3].y&64u)!=0u;}
+fn residualEdgeCapacity()->u32{return select(0u,chartClusters(),residualOn());}
+fn residualVertexCapacity()->u32{return select(0u,chartClusters(),residualOn());}
+fn residualEdgeBase()->u32{return residualHeader()+4u;}
+fn residualVertexBitsBase()->u32{return residualEdgeBase()+residualEdgeCapacity();}
+fn residualVertexBits()->u32{return select(0u,(sourceVertexCount()+31u)/32u,residualOn());}
+fn residualVertexBase()->u32{return residualVertexBitsBase()+residualVertexBits();}
+fn residualFaceBitsBase()->u32{return residualVertexBase()+residualVertexCapacity();}
+fn residualFaceBits()->u32{return select(0u,(sourceFaceCount()+31u)/32u,residualOn());}
+fn residualFaceBase()->u32{return residualFaceBitsBase()+residualFaceBits();}
+fn residualFaceCapacity()->u32{return select(0u,chartClusters(),residualOn());}
+fn residualEnd()->u32{return select(columnEnd(),residualFaceBase()+residualFaceCapacity(),residualOn());}
+fn residualEdgeCount()->u32{return atomicLoad(&contactWork[residualHeader()]);}
+fn residualVertexCount()->u32{return atomicLoad(&contactWork[residualHeader()+1u]);}
+fn residualOverflow()->bool{return atomicLoad(&contactWork[residualHeader()+2u])!=0u;}
+fn residualReady()->bool{return residualOn()&&chartEarlyEmitted()&&!residualOverflow();}
+fn residualEdgeAt(i:u32)->u32{return atomicLoad(&contactWork[residualEdgeBase()+i]);}
+fn residualVertexAt(i:u32)->u32{return atomicLoad(&contactWork[residualVertexBase()+i]);}
+fn residualFaceCount()->u32{return atomicLoad(&contactWork[residualHeader()+3u]);}
+fn residualFaceAt(i:u32)->u32{return atomicLoad(&contactWork[residualFaceBase()+i]);}
+fn residualOverflowMark(){atomicStore(&contactWork[residualHeader()+2u],1u);}
+fn residualEdgeAppend(id:u32){if(!residualOn()){return;}let at=atomicAdd(&contactWork[residualHeader()],1u);if(at<residualEdgeCapacity()){atomicStore(&contactWork[residualEdgeBase()+at],id);}else{residualOverflowMark();}}
+fn residualVertexAppend(v:u32){if(!residualOn()||v>=sourceVertexCount()){if(residualOn()){residualOverflowMark();}return;}let word=residualVertexBitsBase()+v/32u;let mask=1u<<(v%32u);let old=atomicOr(&contactWork[word],mask);if((old&mask)==0u){let at=atomicAdd(&contactWork[residualHeader()+1u],1u);if(at<residualVertexCapacity()){atomicStore(&contactWork[residualVertexBase()+at],v);}else{residualOverflowMark();}}}
+fn residualFaceAppend(face:u32){
+ if(!residualOn()||face>=sourceFaceCount()){if(residualOn()){residualOverflowMark();}return;}
+ let word=residualFaceBitsBase()+face/32u;let mask=1u<<(face%32u);let old=atomicOr(&contactWork[word],mask);
+ if((old&mask)==0u){let at=atomicAdd(&contactWork[residualHeader()+3u],1u);if(at<residualFaceCapacity()){atomicStore(&contactWork[residualFaceBase()+at],face);}else{residualOverflowMark();}}
+}
+fn residualDispatchBase()->u32{return 0u;}
 fn storedLattice(v:u32)->vec4i{
  if(v>=chartVertices()){return vec4i(0);}let w=atomicLoad(&contactWork[latticeBase()+v]);if(w==0u){return vec4i(0);}
  let p=w-1u;return vec4i(i32(p&511u),i32((p>>9u)&511u),i32((p>>18u)&511u),1);
@@ -1097,13 +1133,31 @@ fn chartSelect(id:u32){
 // boundaryAt's voxel branch. True: the chart owns this fine edge; it produces
 // nothing (its clusters are emitted by chartEmitAt). False: fine path.
 fn voxelColumnEdge(id:u32,t:Triangle,face:u32)->bool{return voxelEdgeCoarse(id);}
+fn residualFacesForEdge(id:u32){
+ let e=edge(id);
+ for(var i=0u;i<e.z;i++){let incidence=sourceEdgeCorner(id,i);residualFaceAppend(incidence/3u);}
+}
 // Voxel levels are selected from the already-certified resident chart before
 // any fine contact slots are built. This is the same ownership predicate used
 // by boundaryAtFine; the stage only moves the existing cluster claim earlier,
 // it does not invent a second topology or a fallback geometry.
 fn chartSelectAt(id:u32){
  if(!posedContacts()||!chartOn()||id>=sourceEdgeCount()||!edgeInDraw(id)){return;}
- if(voxelEdgeCoarse(id)){chartSelect(id);}
+ let h=halfedge(edge(id).x);let b=segmentLevel(h.x,h.y);var coarse=b>=2u;
+ let around=segmentClusters(storedLattice(h.x).xyz,storedLattice(h.y).xyz,max(b,1u));
+ if(coarse){for(var k=0u;k<8u;k++){if(around[k].w!=0&&(clusterBorder(around[k].xyz,b)||!clusterCertified(around[k].xyz,b)||!clusterLevelOk(around[k].xyz,b))){coarse=false;break;}}}
+ let bankFallback=sourcePathSegmentCount()!=0u||sourcePlanarSpanCount()!=0u||sourcePanelJoinCount()!=0u||sourceHullEdgeCount()!=0u;
+ if(coarse&&!bankFallback){
+  for(var k=0u;k<8u;k++){
+   if(around[k].w==0){continue;}let s=clusterSlot(around[k].xyz,b);
+   if(s!=NONE_CLUSTER&&atomicLoad(&contactWork[s])!=0u){
+    let old=atomicOr(&contactWork[s+2u],CLUSTER_SELECTED);
+    if((old&CLUSTER_SELECTED)==0u){let index=(s-levelHomeBase(b)-4u)/4u;let list=selectedListBase();let at=atomicAdd(&contactWork[list],1u);if(at<selectedListCapacity()){atomicStore(&contactWork[list+2u+at],index|(levelOrdinal(b)<<28u));}else{atomicStore(&contactWork[list+1u],1u);}}
+   }
+  }
+  return;
+ }
+ residualEdgeAppend(id);residualVertexAppend(h.x);residualVertexAppend(h.y);residualFacesForEdge(id);
 }
 @compute @workgroup_size(64) fn chartSelectStage(@builtin(global_invocation_id) gid:vec3u){chartSelectAt(gid.x+gid.y*params.owners[3].w*64u);}
 // Cluster-count work in the boundary stage: thread i (strided) emits every
@@ -1133,6 +1187,18 @@ fn chartEmitAt(id:u32,threads:u32){
   clusterEmit(vec3i(i32(i%n.x),i32((i/n.x)%n.y),i32(i/(n.x*n.y))),b,triangle(inc,0u),inc,inc/3u);
  }
 }
+fn residualDispatchWrite(){
+ let base=residualDispatchBase();let limit=max(1u,params.owners[3].w);let usable=residualOn()&&!residualOverflow();
+ var boundary=sourceBoundarySlots()*selectedCount();
+ var contour=sourceFaceCount()*selectedCount();
+ var vertices=min(sourceFaceCount()*2u,native[0]/6u*4u);
+ var edges=min(sourceEdgeCount(),native[0]/6u*5u);
+ if(usable){boundary=residualEdgeCount();contour=residualFaceCount()*selectedCount();vertices=max(residualVertexCount(),prepareAnchorParts());edges=residualEdgeCount();}
+ let bg=(boundary+63u)/64u;dispatch[base+0u]=min(bg,limit);dispatch[base+1u]=max(1u,(bg+limit-1u)/limit);dispatch[base+2u]=1u;
+ let cg=(contour+63u)/64u;dispatch[base+3u]=min(cg,limit);dispatch[base+4u]=max(1u,(cg+limit-1u)/limit);dispatch[base+5u]=1u;
+ let vg=(vertices+63u)/64u;dispatch[base+9u]=min(vg,limit);dispatch[base+10u]=max(1u,(vg+limit-1u)/limit);dispatch[base+11u]=1u;
+ let eg=(edges+63u)/64u;dispatch[base+12u]=min(eg,limit);dispatch[base+13u]=max(1u,(eg+limit-1u)/limit);dispatch[base+14u]=1u;
+}
 // The chart is a complete source-owned surface representation. Emit its
 // selected clusters as a separate ordered stage, before contactVertices and
 // contactEdges can expand the fine incidence graph. The marker is written by
@@ -1141,6 +1207,9 @@ fn chartEmitAt(id:u32,threads:u32){
 @compute @workgroup_size(64) fn chartEmit(@builtin(global_invocation_id) gid:vec3u){
  let id=gid.x+gid.y*params.owners[3].w*64u;let threads=max(1u,chartClusters());
  chartEmitAt(id,threads);if(id==0u&&posedContacts()&&chartOn()){atomicStore(&contactWork[chartEarlyEmittedWord()],1u);}
+}
+@compute @workgroup_size(64) fn chartPublish(@builtin(global_invocation_id) gid:vec3u){
+ let id=gid.x+gid.y*params.owners[3].w*64u;if(id==0u&&posedContacts()&&chartOn()){residualDispatchWrite();}
 }
 fn partCode(v:u32)->u32{return (partCodes[v]&0xffffffu)+1u;}
 fn partExtent()->vec3u{return ((vec3u(params.owners[3].y)>>vec3u(8u,16u,24u))&vec3u(255u))+vec3u(1u);}
@@ -1418,7 +1487,7 @@ fn partAnchorClearAt(id:u32){
 @compute @workgroup_size(64) fn contactClear(@builtin(global_invocation_id) gid:vec3u){contactClearAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn contactClearAt(id:u32){
  if(!posedContacts()||native[0]==0u){return;}
- let slots=contactSlots();let count=columnEnd();
+ let slots=contactSlots();let count=residualEnd();
  if(id<count){let base=partBase();let low=cellParts()&&id>=base+slots&&id<base+slots*2u;atomicStore(&contactWork[id],select(0u,0xffffffffu,low));}
 }
 
@@ -1431,7 +1500,7 @@ fn contactClearAt(id:u32){
 // edge touching an unrepresentable or border column keep the full fine work.
 @compute @workgroup_size(64) fn voxelVote(@builtin(global_invocation_id) gid:vec3u){voxelVoteAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn voxelVoteAt(v:u32){
- if(!posedContacts()||v>=min(sourceFaceCount()*2u,native[0]/6u*4u)){return;}
+ if(!posedContacts()){return;}
  voxelColumnVertex(v);addPartVertex(v,position(v,0u));
 }
 @compute @workgroup_size(64) fn voxelBin(@builtin(global_invocation_id) gid:vec3u){voxelBinAt(gid.x+gid.y*params.owners[3].w*64u);}
@@ -1541,40 +1610,44 @@ fn contactVertexAt(v:u32){
    atomicStore(&contactWork[h+1u],select(0u,params.selection.w,complete));atomicStore(&contactWork[h+2u],levelCode(b));
   }
  }
+ let residual=residualReady();var sourceV=v;
+ if(residual){if(v>=residualVertexCount()){return;}sourceV=residualVertexAt(v);}
+ if(sourceV>=min(sourceFaceCount()*2u,native[0]/6u*4u)){return;}
  // Owned by the selected coarse representation: no fine port is ever read.
- if(voxelVertexCoarse(v)){return;}
- let q=position(v,0u);let slots=contactSlots();let hash=contactPositionHash(q);
+ if(!residual&&voxelVertexCoarse(sourceV)){return;}
+ let q=position(sourceV,0u);let slots=contactSlots();let hash=contactPositionHash(q);
  for(var probe=0u;probe<slots;probe++){
   let at=(hash+probe)&(slots-1u);var first=atomicLoad(&contactWork[at]);
   // Retry only a spurious EMPTY exchange. Never wait for another invocation
   // to publish a key: the claimed word is already a complete source address.
-  loop{if(first!=0u){break;}let claim=atomicCompareExchangeWeak(&contactWork[at],0u,v+1u);first=claim.old_value;if(claim.exchanged){first=v+1u;break;}}
-  if(all(position(first-1u,0u)==q)){atomicMin(&contactWork[at],v+1u);break;}
+  loop{if(first!=0u){break;}let claim=atomicCompareExchangeWeak(&contactWork[at],0u,sourceV+1u);first=claim.old_value;if(claim.exchanged){first=sourceV+1u;break;}}
+  if(all(position(first-1u,0u)==q)){atomicMin(&contactWork[at],sourceV+1u);break;}
  }
 }
 @compute @workgroup_size(64) fn contactEdges(@builtin(global_invocation_id) gid:vec3u){contactEdgeAt(gid.x+gid.y*params.owners[3].w*64u);}
 fn contactEdgeAt(id:u32){
- if(!posedContacts()||id>=sourceEdgeCount()||!edgeInDraw(id)){return;}
+ if(!posedContacts()){return;}
+ let residual=residualReady();var edgeId=id;if(residual){if(id>=residualEdgeCount()){return;}edgeId=residualEdgeAt(id);}else if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}
  if(cellParts()){
-  let code=partCode(halfedge(edge(id).x).x);let base=edgePartBase();
-  atomicStore(&contactWork[base+id],code);
+  let code=partCode(halfedge(edge(edgeId).x).x);let base=edgePartBase();
+  atomicStore(&contactWork[base+edgeId],code);
   // One edge per quad contributes its held whole-part level; all vertices
   // have completed the bound reduction. Flags commute with contact marking.
-  if(id%5u==0u&&smallClosedPart(code)){let at=partSlot(code);if(at!=NO_CONTACT){atomicOr(&contactWork[partFlagsBase()+at],1u);}}
+  if(edgeId%5u==0u&&smallClosedPart(code)){let at=partSlot(code);if(at!=NO_CONTACT){atomicOr(&contactWork[partFlagsBase()+at],1u);}}
  }
  // Owned by the selected coarse representation: its contact list is never read;
 
- if(voxelEdgeCoarse(id)){chartSelect(id);return;}
- let key=posedEdgePorts(id);if(key.x==key.y){return;}let slots=contactSlots();let hash=contactHash(key.x^contactHash(key.y));
+ if(!residual&&voxelEdgeCoarse(edgeId)){return;}
+ let key=posedEdgePorts(edgeId);if(key.x==key.y){return;}let slots=contactSlots();let hash=contactHash(key.x^contactHash(key.y));
  for(var probe=0u;probe<slots;probe++){
   let slot=(hash+probe)&(slots-1u);let at=slots+slot;var first=atomicLoad(&contactWork[at]);
-  loop{if(first!=0u){break;}let claim=atomicCompareExchangeWeak(&contactWork[at],0u,id+1u);first=claim.old_value;if(claim.exchanged){first=id+1u;break;}}
+  loop{if(first!=0u){break;}let claim=atomicCompareExchangeWeak(&contactWork[at],0u,edgeId+1u);first=claim.old_value;if(claim.exchanged){first=edgeId+1u;break;}}
   if(all(posedEdgePorts(first-1u)==key)){
-   atomicMin(&contactWork[at],id+1u);
-   let previous=atomicExchange(&contactWork[slots*2u+slot],id+1u);atomicStore(&contactWork[slots*3u+id],previous);
+   atomicMin(&contactWork[at],edgeId+1u);
+   let previous=atomicExchange(&contactWork[slots*2u+slot],edgeId+1u);atomicStore(&contactWork[slots*3u+edgeId],previous);
    // Mark the WHOLE part as connected, not just this edge. Read the original
    // immutable codes, not another invocation's not-yet-published work record.
-   if(cellParts()&&previous!=0u){connectParts(partCode(halfedge(edge(id).x).x),partCode(halfedge(edge(previous-1u).x).x));}return;
+   if(cellParts()&&previous!=0u){connectParts(partCode(halfedge(edge(edgeId).x).x),partCode(halfedge(edge(previous-1u).x).x));}return;
   }
  }
 }
@@ -1840,10 +1913,14 @@ fn planarJoinAt(k:u32,instance:u32){
  }else if(!af){t=b;}
  emitLevel(position(j[0],instance),position(j[1],instance),t,kind,0xa8000000u|k,vec4u(boundaryPort(j[0],instance),boundaryPort(j[1],instance),j[2],j[3]),vec4f(0),false,true);
 }
-fn boundaryAtFine(ordinal:u32,instance:u32,selectedOrdinal:u32){
+fn boundaryAtFine(ordinal:u32,instance:u32,selectedOrdinal:u32,residual:bool){
  if(native[0]==0u||!selected(instance)){return;}
 
  authoredPathsAt(ordinal,instance);
+ if(planarProgramLevel(instance)){
+  let v=halfedge(0u).x;if(ownerUnseen(v,instance)||ownerMerged(edgeOwner(v,instance))){return;}
+  if(ordinal<sourcePlanarSpanCount()){planarSpanAt(ordinal,instance);}else{planarJoinAt(ordinal-sourcePlanarSpanCount(),instance);}return;
+ }
  if(ordinal>=sourceEdgeCount()){return;}
  let sourceId=selectedOrdinal*sourceEdgeCount()+ordinal;
  if(!chartEarlyEmitted()){chartEmitAt(sourceId,sourceEdgeCount()*selectedCount());}let e=edge(ordinal);if(ownerUnseen(halfedge(e.x).x,instance)||ownerMerged(edgeOwner(halfedge(e.x).x,instance))){return;}
@@ -1858,7 +1935,7 @@ fn boundaryAtFine(ordinal:u32,instance:u32,selectedOrdinal:u32){
 
  // representation; this fine edge is then owned by it (not expanded), BEFORE
 
- if(posedContacts()){let inc=sourceEdgeCorner(halfedge(e.x).z,0u);if(inDraw(inc)&&validFace(inc)&&voxelColumnEdge(ordinal,triangle(inc,0u),inc/3u)){return;}}
+ if(!residual&&posedContacts()){let inc=sourceEdgeCorner(halfedge(e.x).z,0u);if(inDraw(inc)&&validFace(inc)&&voxelColumnEdge(ordinal,triangle(inc,0u),inc/3u)){return;}}
  let contact=posedEdgeSlot(ordinal);var canonical=canonicalEdge(ordinal,instance);
  if(contact!=NO_CONTACT){canonical=edge(atomicLoad(&contactWork[contactSlots()+contact])-1u).x;}
  if(e.x!=canonical){return;}
@@ -1961,10 +2038,15 @@ fn boundaryAt(id:u32){
   let ordinal=id-record.z;let instance=record.x;if(!selected(instance)){return;}
   if(record.y==LEVEL_BANK_OUTLINE){authoredPathsAt(ordinal,instance);if(ordinal<sourceHullEdgeCount()){hullOutlineAt(ordinal,instance);}return;}
   if(record.y==LEVEL_BANK_PLANAR){authoredPathsAt(ordinal,instance);let spans=sourcePlanarSpanCount();if(ordinal<spans){planarSpanAt(ordinal,instance);}else if(ordinal<spans+sourcePanelJoinCount()){planarJoinAt(ordinal-spans,instance);}return;}
-  boundaryAtFine(ordinal,instance,record.w);return;
+  boundaryAtFine(ordinal,instance,record.w,false);return;
+ }
+ if(residualReady()){
+  let residualEdges=residualEdgeCount();if(residualEdges==0u){return;}
+  let total=residualEdges*selectedCount();if(id>=total){return;}
+  let selectedOrdinal=id/residualEdges;let residualOrdinal=id%residualEdges;boundaryAtFine(residualEdgeAt(residualOrdinal),selectedInstance(selectedOrdinal),selectedOrdinal,true);return;
  }
  let slots=sourceBoundarySlots();if(id>=slots*selectedCount()||native[0]==0u){return;}
- boundaryAtFine(id%slots,selectedInstance(id/slots),id/slots);
+ boundaryAtFine(id%slots,selectedInstance(id/slots),id/slots,false);
 }
 // THE L2 CONNECTED OUTLINE CONSTRUCTION (compileOutlineHull). Hull edge k is
 // an outline when its two compiled hull faces, posed from the SAME vertex
@@ -1995,6 +2077,9 @@ fn contourAt(id:u32){
  if(levelDispatchEnabled()){
   if(id>=levelContourTotal()){return;}
   let mapped=levelContourFor(id);if(mapped.x==0xffffffffu){return;}instance=mapped.x;face=mapped.y;
+ }else if(residualReady()){
+  let faces=residualFaceCount();if(faces==0u||id>=faces*selectedCount()){return;}
+  instance=selectedInstance(id/faces);face=residualFaceAt(id%faces);
  }else{
   let faces=sourceFaceCount();if(faces==0u||id>=faces*selectedCount()){return;}instance=selectedInstance(id/faces);face=id%faces;
  }
@@ -2517,7 +2602,7 @@ function physicalSurfaceRelationsShader(source:string):string{
  specialized=replaceWgslFunctionBody(specialized,'prepareAnchorParts','return params.frontier.z;');
  for(const hook of [
   'if(!chartEarlyEmitted()){chartEmitAt(sourceId,sourceEdgeCount()*selectedCount());}',
-  'if(posedContacts()){let inc=sourceEdgeCorner(halfedge(e.x).z,0u);if(inDraw(inc)&&validFace(inc)&&voxelColumnEdge(ordinal,triangle(inc,0u),inc/3u)){return;}}',
+  'if(!residual&&posedContacts()){let inc=sourceEdgeCorner(halfedge(e.x).z,0u);if(inDraw(inc)&&validFace(inc)&&voxelColumnEdge(ordinal,triangle(inc,0u),inc/3u)){return;}}',
   'if(posedContacts()&&voxelClusterEmit(position(h.x,instance),position(h.y,instance),t,kind,e.x,vec2u(first/3u,select(0xffffffffu,second/3u,second!=0xffffffffu)),smallPart&&samePart)){return;}',
  ]){
   const next=specialized.replace(hook,'');if(next===specialized)throw Error('Physical relation shader hook changed');specialized=next;
@@ -2536,12 +2621,70 @@ function physicalSurfaceRelationsShader(source:string):string{
   ['  if(cellParts()){samePart=samePart&&atomicLoad(&contactWork[edgePartBase()+halfedge(h).z])==ownPart;}\n',''],
   ['smallPart&&samePart','false'],
  ])specialized=replaceWgslFunctionSnippet(specialized,'boundaryAtFine',from,to);
+ // The physical host has no chart/contact arena. Remove the generic residual
+ // branch from the boundary caller itself, rather than relying on a false
+ // predicate that would keep binding 12 in the isolated call graph.
+ specialized=replaceWgslFunctionBody(specialized,'boundaryAt',`if(levelDispatchEnabled()){
+  if(id>=levelDispatchTotal()){return;}
+  let record=levelDispatchFor(id);if(record.x==0xffffffffu){return;}
+  let ordinal=id-record.z;let instance=record.x;if(!selected(instance)){return;}
+  if(record.y==3u){authoredPathsAt(ordinal,instance);if(ordinal<sourceHullEdgeCount()){hullOutlineAt(ordinal,instance);}return;}
+  if(record.y==2u){authoredPathsAt(ordinal,instance);let spans=sourcePlanarSpanCount();if(ordinal<spans){planarSpanAt(ordinal,instance);}else if(ordinal<spans+sourcePanelJoinCount()){planarJoinAt(ordinal-spans,instance);}return;}
+  boundaryAtFine(ordinal,instance,record.w,false);return;
+ }
+ let slots=sourceBoundarySlots();if(id>=slots*selectedCount()||native[0]==0u){return;}
+ boundaryAtFine(id%slots,selectedInstance(id/slots),id/slots,false);`);
+ // Physical source packets cannot publish a chart suffix. Keep their contour
+ // closure chart-free while generic direct consumers retain the remap.
+ specialized=replaceWgslFunctionSnippet(specialized,'contourAt',` }else if(residualReady()){
+  let faces=residualFaceCount();if(faces==0u||id>=faces*selectedCount()){return;}
+  instance=selectedInstance(id/faces);face=residualFaceAt(id%faces);
+ }else{`,` }else{`);
  return specialized;
 }
-const SURFACE_RELATIONS_PHYSICAL_SHADER=physicalSurfaceRelationsShader(SURFACE_RELATIONS_SHADER);
+export const SURFACE_RELATIONS_PHYSICAL_SHADER=physicalSurfaceRelationsShader(SURFACE_RELATIONS_SHADER);
+const SURFACE_RELATIONS_GENERIC_DIRECT_SHADER=SURFACE_RELATIONS_PHYSICAL_SHADER;
+function voxelSurfaceRelationsShader(source:string):string{
+ let specialized=source;
+ specialized=replaceWgslFunctionSnippet(specialized,'boundaryAtFine','if(!chartEarlyEmitted()){chartEmitAt(sourceId,sourceEdgeCount()*selectedCount());}','');
+ for(const [name,body] of [
+  ['authoredPathsAt','return;'],['authoredOwnsFace','return false;'],['authoredOwnsEdge','return false;'],
+  ['planarProgramLevel','return false;'],['planarSpanAt','return;'],['planarJoinAt','return;'],['hullOutlineAt','return;'],['outlineLevel','return false;'],
+  ['levelBankFor','if(native[0]==0u||!levelOwnerCertified(instance)){return LEVEL_BANK_UNKNOWN_FINE;}if(principalLevel(levelOwner(instance))){return LEVEL_BANK_PRINCIPAL_FINE;}return LEVEL_BANK_FINE;'],
+  ['levelBankCount','return sourceBoundarySlots();'],
+ ] as const)specialized=replaceWgslFunctionBody(specialized,name,body);
+ for(const snippet of [
+  'authoredPathsAt(ordinal,instance);',
+  `if(planarProgramLevel(instance)){
+  let v=halfedge(0u).x;if(ownerUnseen(v,instance)||ownerMerged(edgeOwner(v,instance))){return;}
+  if(ordinal<sourcePlanarSpanCount()){planarSpanAt(ordinal,instance);}else{planarJoinAt(ordinal-sourcePlanarSpanCount(),instance);}return;
+ }`,
+  'if(outlineLevel(edgeOwner(halfedge(e.x).x,instance))){hullOutlineAt(ordinal,instance);return;}',
+  'if(faces<=2u&&authoredOwnsEdge(first,second,backFirst,backSecond)){return;}',
+ ] as const)specialized=replaceWgslFunctionSnippet(specialized,'boundaryAtFine',snippet,'');
+ specialized=replaceWgslFunctionSnippet(specialized,'chartSelectAt','let bankFallback=sourcePathSegmentCount()!=0u||sourcePlanarSpanCount()!=0u||sourcePanelJoinCount()!=0u||sourceHullEdgeCount()!=0u;','let bankFallback=false;');
+ specialized=replaceWgslFunctionBody(specialized,'boundaryAt',`if(levelDispatchEnabled()){
+  if(id>=levelDispatchTotal()){return;}
+  let record=levelDispatchFor(id);if(record.x==0xffffffffu){return;}
+  let ordinal=id-record.z;let instance=record.x;if(!selected(instance)){return;}
+  boundaryAtFine(ordinal,instance,record.w,false);return;
+ }
+ if(residualReady()){
+  let residualEdges=residualEdgeCount();if(residualEdges==0u){return;}
+  let total=residualEdges*selectedCount();if(id>=total){return;}
+  let selectedOrdinal=id/residualEdges;let residualOrdinal=id%residualEdges;boundaryAtFine(residualEdgeAt(residualOrdinal),selectedInstance(selectedOrdinal),selectedOrdinal,true);return;
+ }
+ let slots=sourceBoundarySlots();if(id>=slots*selectedCount()||native[0]==0u){return;}
+ boundaryAtFine(id%slots,selectedInstance(id/slots),id/slots,false);`);
+ const marker='@compute @workgroup_size(64) fn boundaries(';const contourMarker='@compute @workgroup_size(64) fn contours(';
+ if(!specialized.includes(marker)||!specialized.includes(contourMarker))throw Error('Voxel relation line entry changed');
+ return specialized.replace(marker,'@compute @workgroup_size(64) fn boundariesVoxel(').replace(contourMarker,'@compute @workgroup_size(64) fn contoursVoxel(');
+}
+export const SURFACE_RELATIONS_GENERIC_DIRECT_VOXEL_SHADER=voxelSurfaceRelationsShader(SURFACE_RELATIONS_SHADER);
 function makeBatchShader(source:string,disableChartStages=false):string{
  const chartEntry=(name:string,body:string)=>batchEntry(name,disableChartStages?'return;':body);
- return rebaseSourceArrays(stripWgslComments(source).replace(PARAMS_BINDING,''))+/* wgsl */`
+ const batchSource=source.replace('fn residualDispatchBase()->u32{return 0u;}','fn residualDispatchBase()->u32{return B1.z;}');
+ return rebaseSourceArrays(stripWgslComments(batchSource).replace(PARAMS_BINDING,''))+/* wgsl */`
 struct BatchItem {p:Params,base:vec4u,base2:vec4u,span:vec4u}
 struct BatchTable {head:vec4u,items:array<BatchItem,${SURFACE_RELATION_BATCH_ITEMS}>}
 @group(0) @binding(0) var<uniform> table:BatchTable;
@@ -2566,6 +2709,7 @@ ${chartEntry('batchChartCorners','chartCornerAt(id);')}
 ${chartEntry('batchChartCertify','chartCertifyAt(id);')}
 ${chartEntry('batchChartSelectStage','chartSelectAt(id);')}
 ${chartEntry('batchChartEmit','chartEmitAt(id,max(1u,chartClusters()));if(id==0u&&posedContacts()&&chartOn()){atomicStore(&contactWork[chartEarlyEmittedWord()],1u);}')}
+${chartEntry('batchChartPublish','if(id==0u&&posedContacts()&&chartOn()){residualDispatchWrite();}')}
 ${batchEntry('batchPartAnchorClear','partAnchorClearAt(id);')}
 ${batchEntry('batchPartAnchors','partAnchorAt(id);')}
 ${batchEntry('batchPrepareFrontier','if(local==0u){prepareIn();}')}
@@ -2589,10 +2733,10 @@ export const SURFACE_RELATIONS_BATCH_SHADER=makeBatchShader(SURFACE_RELATIONS_SH
  * their producer-owned chart. No chart or cave/frontier helper is reachable
  * from the line or anchor stages. */
 export const SURFACE_RELATIONS_PHYSICAL_BATCH_SHADER=makeBatchShader(SURFACE_RELATIONS_PHYSICAL_SHADER,true);
-type BatchStage='partAnchorClear'|'partAnchors'|'prepareFrontier'|'contactClear'|'voxelVote'|'voxelBin'|'chartCorners'|'chartCertify'|'chartSelectStage'|'chartEmit'|'contactVertices'|'contactEdges'|'boundaryLines'|'contourLines'|'prepareInterior'|'faceDifferentials'|'radialCurvature'|'suggestiveContours'|'principalCurvature'|'ridgeDerivative'|'ridgeLines'|'viewFaceLines';
+type BatchStage='partAnchorClear'|'partAnchors'|'prepareFrontier'|'contactClear'|'voxelVote'|'voxelBin'|'chartCorners'|'chartCertify'|'chartSelectStage'|'chartEmit'|'chartPublish'|'contactVertices'|'contactEdges'|'boundaryLines'|'contourLines'|'prepareInterior'|'faceDifferentials'|'radialCurvature'|'suggestiveContours'|'principalCurvature'|'ridgeDerivative'|'ridgeLines'|'viewFaceLines';
 /** Global stage order. Per source it is the per-source order (contacts, lines,
  * prepareInterior, tensor, view lines); sources write disjoint ranges. */
-const BATCH_ORDER:readonly BatchStage[]=['partAnchorClear','prepareFrontier','contactClear','voxelVote','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','contactVertices','contactEdges','boundaryLines','contourLines','partAnchors','prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'];
+const BATCH_ORDER:readonly BatchStage[]=['partAnchorClear','prepareFrontier','contactClear','voxelVote','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','boundaryLines','contourLines','partAnchors','prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'];
 const batchEntryName=(stage:BatchStage)=>'batch'+stage[0]!.toUpperCase()+stage.slice(1);
 // Direct and batched anchor dispatches execute the same projection body. It
 // links each complete record atomically; there is no second insertion owner.
@@ -2608,14 +2752,14 @@ export const SURFACE_CONTACT_BINDINGS={
  contactClear:[0,1,4,8,12],voxelVote:[0,1,2,4,8,12,13],voxelHome:[0,1,4,8,12],
  voxelBin:[0,1,2,4,8,12,13],chartCorners:[0,1,2,4,8,12,13],
  chartCertify:[0,1,4,8,12,18],contactVertices:[0,1,2,4,8,12,13,16],
- contactEdges:[0,1,2,4,8,12,13,14],chartSelectStage:[0,1,4,8,12],chartEmit:[0,1,2,3,4,5,6,8,10,11,12,15],
+ contactEdges:[0,1,2,4,8,12,13,14],chartSelectStage:[0,1,4,8,12],chartEmit:[0,1,2,3,4,5,6,8,10,11,12,15],chartPublish:[0,1,4,7,8,12],
 } as const;
-const BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],...SURFACE_CONTACT_BINDINGS,boundaryLines:[0,1,2,3,4,5,6,8,10,11,12,15],contourLines:[0,1,2,3,4,5,6,8,10,11,15],prepareInterior:[0,1,2,3,4,6,7,8,9,10,11],faceDifferentials:[0,1,2,3,4,6,8,9],radialCurvature:[0,1,2,3,4,8,9],suggestiveContours:[0,1,2,3,4,5,6,8,9,15],principalCurvature:[0,1,2,3,4,8,9],ridgeDerivative:[0,1,2,4,8,9],ridgeLines:[0,1,2,3,4,5,6,8,9,15],viewFaceLines:[0,1,2,3,4,5,6,8,9,15]};
+const BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],...SURFACE_CONTACT_BINDINGS,boundaryLines:[0,1,2,3,4,5,6,8,10,11,12,15],contourLines:[0,1,2,3,4,5,6,8,10,11,12,15],prepareInterior:[0,1,2,3,4,6,7,8,9,10,11],faceDifferentials:[0,1,2,3,4,6,8,9],radialCurvature:[0,1,2,3,4,8,9],suggestiveContours:[0,1,2,3,4,5,6,8,9,15],principalCurvature:[0,1,2,3,4,8,9],ridgeDerivative:[0,1,2,4,8,9],ridgeLines:[0,1,2,3,4,5,6,8,9,15],viewFaceLines:[0,1,2,3,4,5,6,8,9,15]};
 const BATCH_INDIRECT_OFFSETS:Partial<Record<BatchStage,number>>={boundaryLines:0,contourLines:12,contactClear:24,contactVertices:36,contactEdges:48,partAnchors:72,voxelVote:84,voxelBin:108,chartCorners:120,chartCertify:132,faceDifferentials:24,radialCurvature:36,suggestiveContours:48,principalCurvature:36,ridgeDerivative:36,ridgeLines:48,viewFaceLines:48};
 /** The physical shader's boundary no longer reaches partCodes or the chart;
  * binding 13 is therefore omitted from its host bind group. Generic and
  * GPU-indexed stages keep the producer-capable map above. */
-const PHYSICAL_BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...BATCH_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],contactClear:[0],voxelVote:[0],voxelBin:[0],chartCorners:[0],chartCertify:[0],chartSelectStage:[0],chartEmit:[0],contactVertices:[0],contactEdges:[0],boundaryLines:BATCH_BINDINGS.boundaryLines.filter(binding=>binding!==12)};
+const PHYSICAL_BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...BATCH_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],contactClear:[0],voxelVote:[0],voxelBin:[0],chartCorners:[0],chartCertify:[0],chartSelectStage:[0],chartEmit:[0],chartPublish:[0],contactVertices:[0],contactEdges:[0],boundaryLines:BATCH_BINDINGS.boundaryLines.filter(binding=>binding!==12&&binding!==13),contourLines:BATCH_BINDINGS.contourLines.filter(binding=>binding!==12)};
 // Params grew by one vec4u for the per-source level prefix. The batch table
 // keeps its existing source/base/span trailer after the complete Params.
 const BATCH_ITEM_WORDS=68,BATCH_DISPATCH_WORDS=36;
@@ -2768,6 +2912,34 @@ export function cellChart(extent:readonly [number,number,number]):{cells:number;
   const cells=x*y*z;if(cells>CHART_CELLS)return undefined;
   return {cells,corners:(x+1)*(y+1)*(z+1),clusters:Math.ceil(x/2)*Math.ceil(y/2)*Math.ceil(z/2)};
 }
+/** Choose an optional producer-owned contact suffix without changing the
+ * required incumbent arena. `growth` is 1 for direct contactWork and 1.25 for
+ * the batched owner, matching its existing aggregate allocation policy. */
+export function chooseOptionalContactArena(baselineWords:number,residualWords:number,maximumBytes:number,usedWords=0,growth=1):{readonly words:number;readonly enabled:boolean}{
+ for(const value of [baselineWords,residualWords,maximumBytes,usedWords,growth])if(!Number.isFinite(value)||value<0)throw Error('Invalid optional contact arena budget');
+ if(!Number.isInteger(baselineWords)||!Number.isInteger(residualWords)||!Number.isInteger(usedWords)||growth<=0)throw Error('Optional contact arena extents must be integral');
+ const maximumWords=Math.floor(maximumBytes/4);
+ const fits=(words:number)=>words<=maximumWords&&Math.min(Math.ceil(words*growth),maximumWords)*4<=maximumBytes;
+ if(!fits(usedWords+baselineWords))throw Error(`Complete contact arena (${usedWords+baselineWords} words) exceeds device binding capacity ${maximumBytes} bytes`);
+ const full=usedWords+baselineWords+residualWords;
+ return {words:baselineWords+(residualWords>0&&fits(full)?residualWords:0),enabled:residualWords>0&&fits(full)};
+}
+export interface ContactArenaHomePlan {readonly retainHome:boolean;readonly scratchWords:number;readonly homeWords:number}
+/** Select the optional suffix only after accounting for the direct allocator's
+ * retained-home reserve and its second 1.25 growth. The transient plan is the
+ * safe fallback when a new persistent home would not fit. */
+export function chooseOptionalContactArenaWithHome(baselineWords:number,residualWords:number,maximumBytes:number,full:ContactArenaHomePlan,baselinePlan:ContactArenaHomePlan,transient?:ContactArenaHomePlan):{readonly words:number;readonly enabled:boolean;readonly plan:ContactArenaHomePlan}{
+ const values=[baselineWords,residualWords,maximumBytes,full.scratchWords,full.homeWords,baselinePlan.scratchWords,baselinePlan.homeWords,...(transient?[transient.scratchWords,transient.homeWords]:[])];
+ for(const value of values)if(!Number.isFinite(value)||value<0||!Number.isInteger(value))throw Error('Invalid retained contact-home budget');
+ const bytes=(words:number,plan:ContactArenaHomePlan)=>{
+  const required=plan.retainHome?Math.max(words,plan.scratchWords+plan.homeWords):words;
+  return (plan.retainHome?Math.max(required,Math.min(Math.ceil(required*1.25),Math.floor(maximumBytes/4))):required)*4;
+ };
+ if(bytes(baselineWords+residualWords,full)<=maximumBytes)return {words:baselineWords+residualWords,enabled:residualWords>0,plan:full};
+ if(bytes(baselineWords,baselinePlan)<=maximumBytes)return {words:baselineWords,enabled:false,plan:baselinePlan};
+ if(transient&&bytes(baselineWords,transient)<=maximumBytes)return {words:baselineWords,enabled:false,plan:transient};
+ throw Error(`Complete retained contact arena exceeds device binding capacity ${maximumBytes} bytes`);
+}
 /** params.selection.w: 0 without a posed revision, 1 with one (unchanged meaning, tested ==0u), and for a cell-chart
  * source 2 + its exact source GENERATION (0..POSED_CONTENT_MAX): the chart's occupancy is generation-owned, so a
  * retained home survives every pose. Outside that range: 1, never retained. */
@@ -2820,7 +2992,8 @@ export function tensorRevision(batch:{readonly source:{readonly posedRevision?:n
   if(!batch.gpuPose)return batch.source.posedRevision;
   const token=posedContentToken(batch);return token>1?token:undefined;
 }
-const SURFACE_RELATION_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','voxelVote','voxelHome','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','contactVertices','contactEdges','boundaries','contours','surfaceLines'] as const;
+const SURFACE_RELATION_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','voxelVote','voxelHome','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','boundaries','contours','surfaceLines'] as const;
+const SURFACE_RELATION_GENERIC_DIRECT_ENTRIES=[...SURFACE_RELATION_ENTRIES.filter(entry=>entry!=='surfaceLines'),'boundariesVoxel','contoursVoxel'];
 const SURFACE_RELATION_INTERIOR_ENTRIES=['prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'] as const;
 // The batched entries exist only with the interior stages (the physical path).
 const SURFACE_RELATION_BATCH_ENTRIES=BATCH_ORDER.map(batchEntryName);
@@ -2837,7 +3010,7 @@ type SurfaceRelationEntry=typeof SURFACE_RELATION_ENTRIES[number]|typeof SURFACE
 export type SurfaceRelationPreparation='generic'|'generic-direct'|'physical-batched';
 const surfaceRelationEntries=(interior:boolean,preparation:SurfaceRelationPreparation='generic'):readonly SurfaceRelationEntry[]=>
  preparation==='physical-batched'?(interior?['admitFrontier',...SURFACE_RELATION_BATCH_ENTRIES]:['admitFrontier']):
- preparation==='generic-direct'?(interior?[...SURFACE_RELATION_ENTRIES,...SURFACE_RELATION_INTERIOR_ENTRIES]:SURFACE_RELATION_ENTRIES):
+ preparation==='generic-direct'?(interior?[...SURFACE_RELATION_GENERIC_DIRECT_ENTRIES,...SURFACE_RELATION_INTERIOR_ENTRIES]:SURFACE_RELATION_GENERIC_DIRECT_ENTRIES):
  interior?[...SURFACE_RELATION_ENTRIES,...SURFACE_RELATION_INTERIOR_ENTRIES,...SURFACE_RELATION_BATCH_ENTRIES]:SURFACE_RELATION_ENTRIES;
 interface PreparedSurfaceRelations{
  readonly plans:ReadonlyMap<SurfaceRelationEntry,ComputePipelinePlan>;
@@ -2849,9 +3022,12 @@ function surfaceRelationPipelinePlans(device:GPUDevice,interior:boolean,preparat
  const batchSource=(preparation==='physical-batched'?SURFACE_RELATIONS_PHYSICAL_BATCH_SHADER:SURFACE_RELATIONS_BATCH_SHADER).replace(`items:array<BatchItem,${SURFACE_RELATION_BATCH_ITEMS}>`,`items:array<BatchItem,${relationBatchItems(device)}>`);
  for(const entry of surfaceRelationEntries(interior,preparation)){
   const batched=entry.startsWith('batch');
-  const code=batched?isolateComputeEntry(batchSource,entry):isolateComputeEntry(SURFACE_RELATIONS_SHADER,entry);
+  const voxelEntry=entry==='boundariesVoxel'||entry==='contoursVoxel';
+  const directSource=preparation==='generic-direct'&&voxelEntry?SURFACE_RELATIONS_GENERIC_DIRECT_VOXEL_SHADER:preparation==='generic-direct'&&(entry==='boundaries'||entry==='contours')?SURFACE_RELATIONS_GENERIC_DIRECT_SHADER:SURFACE_RELATIONS_SHADER;
+  const entryPoint=entry==='boundariesVoxel'?'boundariesVoxel':entry==='contoursVoxel'?'contoursVoxel':entry;
+  const code=batched?isolateComputeEntry(batchSource,entry):isolateComputeEntry(directSource,entryPoint);
   plans.set(entry,()=>{const module=device.createShaderModule({label:'MAIN attributed source relations '+entry,code});
-   return {layout:'auto',compute:{module,entryPoint:entry}};});
+   return {layout:'auto',compute:{module,entryPoint}};});
  }
  return plans;
 }
@@ -3290,7 +3466,7 @@ export class SurfaceRelations {
     // dispatches every queued source's stage at once. A second use of the same
     // batch in one frame keeps the per-source path (its tensor would be shared).
     const batched=!!shared&&!!extent&&this.interior&&!!this.queue&&!!batch.source.visibleInstances&&batch.source.posedRevision!==undefined&&!this.queue.seen.has(posedBatchIdentity(batch));
-    if(this.preparation==='generic-direct'&&batched)throw Error('Generic-direct relation preparation does not accept a batched extent');
+    if(this.preparation==='generic-direct'&&extent)throw Error('Generic-direct relation preparation does not accept a host extent');
     if(this.preparation==='physical-batched'&&(isGpuIndexedResident(source)||!batched))throw Error('Physical-batched relation preparation requires a non-GPU-indexed host batch with extent, visibility frontier and posed revision');
     const entry=batched?undefined:this.bindings(source,batch);
     const ownerKey=nativeAdmitted?'native-frontier':selectedOwners===undefined?'':owners.join(',');
@@ -3338,9 +3514,15 @@ export class SurfaceRelations {
     }
     const indexed=isGpuIndexedResident(source)?source.gpu:undefined;
     const posedContacts=indexed?.edgeContactClass==='posed-coincident'&&indexed.topology.indexPattern==='independent-quads'&&batch.source.instanceCapacity===1;
+    const boundaryStage=this.preparation==='generic-direct'&&posedContacts?'boundariesVoxel':'boundaries';
+    const contourStage=this.preparation==='generic-direct'&&posedContacts?'contoursVoxel':'contours';
     const contactEdges=posedContacts?sourceResidencyEdgeCount(source):0;
     const parts=posedContacts&&earlyDetail?indexed?.parts:undefined;
-    let contactSlots=0,contactWords=1;
+    let contactSlots=0,contactWords=1,baselineContactWords=1,residualWords=0,residualEnabled=false;
+    let allowPersistentHome=true;
+    let plannedHomeLevels:readonly number[]|undefined;
+    let plannedHomeKey:unknown;
+    let plannedHomeWords=0;
 
     // rest-cell chart of THIS generation), when its dense tables are bounded. Never both: parts win.
     const surfaceChart=posedContacts&&earlyDetail&&!parts?currentRestCellChart(indexed):undefined;
@@ -3352,7 +3534,26 @@ export class SurfaceRelations {
       contactSlots=2**Math.ceil(Math.log2(Math.max(2,contactEdges*2,sourceResidencyFaceCount(source)*4)));
 
 
-      contactWords=(parts?contactSlots*7+contactEdges*2:contactSlots*3+contactEdges)+contactSlots+4+(chart?chart.cells*19+chart.corners*4+4+chart.clusters*4+sourceResidencyFaceCount(source)*2+2+chart.clusters+4+chartRequirementWords((parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]):4);
+      baselineContactWords=(parts?contactSlots*7+contactEdges*2:contactSlots*3+contactEdges)+contactSlots+4+(chart?chart.cells*19+chart.corners*4+4+chart.clusters*4+sourceResidencyFaceCount(source)*2+2+chart.clusters+4+chartRequirementWords((parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]):4);
+      residualWords=chart?4+chart.clusters+Math.ceil(sourceResidencyVertexCount(source)/32)+chart.clusters+Math.ceil(sourceResidencyFaceCount(source)/32)+chart.clusters:0;
+      const residualProducerEnabled=!!chart&&(!!parts||!!surfaceChart);
+      const maximumBytes=Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize);
+      const homeRequested=!!chart&&chartToken(batch,source,true)>1;
+      const homeLevels=homeRequested?chartLevelClusters((parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]):undefined;
+      const homeKey=homeRequested?posedBatchIdentity(batch):undefined;
+      const heldHome=homeRequested?this.homes.get(homeKey):undefined;
+      const sameHomeLayout=!!heldHome&&heldHome.anchorParts===anchorParts&&heldHome.levels.length===homeLevels!.length&&heldHome.levels.every((clusters,i)=>clusters===homeLevels![i]);
+      plannedHomeLevels=homeLevels;plannedHomeKey=homeKey;plannedHomeWords=homeLevels?chartHomeWords(homeLevels):0;
+      const homePlan=(words:number):ContactArenaHomePlan=>{
+        const reset=words>this.homeScratch;let scratchWords=reset?Math.ceil(words*1.25):this.homeScratch;let homeWords=reset?0:this.homeWords;let homes=reset?0:this.homes.size;
+        if(homeRequested&&(reset||!sameHomeLayout)){if(homeWords+plannedHomeWords>COLUMN_HOME_WORDS){homeWords=0;homes=0;}homeWords+=plannedHomeWords;homes=1;}
+        return {retainHome:homes>0,scratchWords,homeWords};
+      };
+      const fullHomePlan=homePlan(baselineContactWords+(residualProducerEnabled?residualWords:0));
+      const baselineHomePlan=homePlan(baselineContactWords);
+      const transientHomePlan={retainHome:false,scratchWords:0,homeWords:0};
+      const arena=chooseOptionalContactArenaWithHome(baselineContactWords,residualProducerEnabled?residualWords:0,maximumBytes,fullHomePlan,baselineHomePlan,transientHomePlan);
+      contactWords=arena.words;residualEnabled=residualProducerEnabled&&arena.enabled;allowPersistentHome=arena.plan.retainHome;
       const words=new Uint32Array(floats.buffer);words[41]=contactSlots;words[45]=1;
       if(parts){const [x,y,z]=parts.extent;words[45]=3|(chart?4:0)|((x-1)<<8)|((y-1)<<16)|((z-1)<<24);}
       // Surface: the chart (4) with explicit surface semantics (8); NEVER the closed-cell part bit (2).
@@ -3361,9 +3562,10 @@ export class SurfaceRelations {
       if(chart&&currentRestCellChart(indexed)?.cornerOrder===VOXEL_REST_CORNER_ORDER)words[45]|=16;
 
       if(occupancy)words[45]|=32;
+      if(residualEnabled)words[45]|=64;
     }
     if(levelOwnerCertificate===2)new Uint32Array(floats.buffer)[45]|=128;
-    if(batched){this.queueBatched(batch,source,new Uint32Array(floats.buffer),extent!,{posedContacts,contactWords,contactEdges,parts,chartCodes,occupancy,chartClusters:chart?.clusters??0,anchorParts,earlyDetail,terrain,selection:selection!,frontierAdmitted});return;}
+    if(batched){this.queueBatched(batch,source,new Uint32Array(floats.buffer),extent!,{posedContacts,contactWords,baselineContactWords,residualWords,contactEdges,parts,chartCodes,occupancy,chartClusters:chart?.clusters??0,anchorParts,earlyDetail,terrain,selection:selection!,frontierAdmitted});return;}
     const held=entry!,params=held.params;
 
     // grow-only) | homes]. A source whose producer certifies its posed content
@@ -3373,13 +3575,17 @@ export class SurfaceRelations {
     // keeps its fine producer). Growing the scratch or the buffer, or a changed
     // source, restarts the homes (a new header, an invalid token).
     let home:ColumnHome|undefined;
-    if(posedContacts&&contactWords>this.homeScratch){this.homeScratch=Math.ceil(contactWords*1.25);this.homes.clear();this.homeWords=0;}
-    if(chart&&chartToken(batch,source,true)>1){
+    if(!allowPersistentHome&&(this.homes.size>0||this.homeScratch>0)){
+      if(this.contactWork)this.retired.push(this.contactWork);
+      this.contactWork=undefined;this.homes.clear();this.homeWords=0;this.homeScratch=0;
+    }
+    if(allowPersistentHome&&posedContacts&&contactWords>this.homeScratch){this.homeScratch=Math.ceil(contactWords*1.25);this.homes.clear();this.homeWords=0;}
+    if(allowPersistentHome&&chart&&chartToken(batch,source,true)>1){
 
       // home.offset, each sized for its own level and retained under its own (generation token, block)
       // header. A level transition selects that level's retained home instead of rebuilding one shared home.
-      const slots=chart.clusters,levels=chartLevelClusters((parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]),key=posedBatchIdentity(batch);
-      const words=chartHomeWords(levels);
+      const slots=chart.clusters,levels=plannedHomeLevels??chartLevelClusters((parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]),key=plannedHomeKey??posedBatchIdentity(batch);
+      const words=plannedHomeWords||chartHomeWords(levels);
       home=this.homes.get(key);
 
       // level-2 slots can carry different 4/8/16 sizes and hence different level-home offsets). A changed
@@ -3395,7 +3601,9 @@ export class SurfaceRelations {
     const required=Math.max(contactWords,this.homes.size?this.homeScratch+this.homeWords:0);
     if(!this.contactWork||this.contactWork.size<required*4){
       if(this.contactWork)this.retired.push(this.contactWork);
-      const size=this.homes.size?Math.ceil(required*1.25):required;
+      const maximumWords=Math.floor(Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize)/4);
+      if(required>maximumWords)throw Error(`Complete contact arena (${required} words) exceeds device binding capacity`);
+      const size=this.homes.size?Math.min(maximumWords,Math.ceil(required*1.25)):required;
       this.contactWork=this.device.createBuffer({label:'MAIN source-local posed quad contacts',size:size*4,usage:GPUBufferUsage.STORAGE});
       // A new buffer is zero: every home's header is written again before use.
       for(const record of this.homes.values())record.fresh=true;
@@ -3415,7 +3623,7 @@ export class SurfaceRelations {
     buffers[18]=occupancy?.columns??this.status;
     buffers[19]=this.partAnchorAlloc;
     (buffers as RelationBinding[])[17]=this.partAnchorBuffer??this.partAnchorAlloc;
-    const used:Record<string,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,...SURFACE_CONTACT_BINDINGS,prepare:[0,1,2,3,4,5,6,7,8,10,11],boundaries:[0,1,2,3,4,5,6,8,10,11,12,15],contours:[0,1,2,3,4,5,6,8,10,11,15]};
+    const used:Record<string,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,...SURFACE_CONTACT_BINDINGS,prepare:[0,1,2,3,4,5,6,7,8,10,11],boundaries:this.preparation==='generic-direct'?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],boundariesVoxel:[0,1,2,3,4,5,6,8,10,11,12,15],contours:this.preparation==='generic-direct'?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],contoursVoxel:[0,1,2,3,4,5,6,8,10,12,15]};
     (buffers as RelationBinding[])[10]={view:this.lineDetailView(earlyDetail)};
     (buffers as RelationBinding[])[15]={view:this.contactPatchView()};
     const anchors=this.partAnchorsFor(batch,source);
@@ -3447,11 +3655,11 @@ export class SurfaceRelations {
       if(threads<=0)return;const pipeline=this.pipelines[stage]!,count=Math.ceil(threads/64);
       pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(groups,stage,pipeline,bindings,bound));pass.dispatchWorkgroups(Math.min(count,limit),Math.ceil(count/limit));
     };
-    const indirect=(stage:string,offset?:number)=>{const pipeline=this.pipelines[stage]!;pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(held.groups,stage,pipeline,used[stage]!,buffers));if(offset===undefined)pass.dispatchWorkgroups(1);else pass.dispatchWorkgroupsIndirect(this.dispatch,offset);};
+    const indirect=(stage:string,offset?:number)=>{const pipeline=this.pipelines[stage]!,bindings=used[stage]!;pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(held.groups,stage,pipeline,bindings,buffers));if(offset===undefined)pass.dispatchWorkgroups(1);else pass.dispatchWorkgroupsIndirect(this.dispatch,offset);};
     if((posedContacts&&!host)||frontierAdmitted){
       indirect('prepare');
       if(posedContacts){
-        indirect('contactClear',24);indirect('voxelVote',84);indirect('voxelHome',96);indirect('voxelBin',108);indirect('chartCorners',120);indirect('chartCertify',132);indirect('chartSelectStage',48);indirect('chartEmit',132);indirect('contactVertices',36);indirect('contactEdges',48);
+        indirect('contactClear',24);indirect('voxelVote',84);indirect('voxelHome',96);indirect('voxelBin',108);indirect('chartCorners',120);indirect('chartCertify',132);indirect('chartSelectStage',48);indirect('chartEmit',132);direct('chartPublish',1,held.groups,used.chartPublish!,buffers);indirect('contactVertices',36);indirect('contactEdges',48);
       }
     }else if(posedContacts){
       direct('contactClear',contactWords,held.groups,used.contactClear!,buffers);
@@ -3462,8 +3670,8 @@ export class SurfaceRelations {
       direct('chartCertify',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartCertify!,buffers);
       direct('chartSelectStage',contactEdges,held.groups,used.chartSelectStage!,buffers);
       direct('chartEmit',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartEmit!,buffers);
-      direct('contactVertices',Math.max(faces*2,anchorParts),held.groups,used.contactVertices!,buffers);
-      direct('contactEdges',contactEdges,held.groups,used.contactEdges!,buffers);
+      direct('chartPublish',1,held.groups,used.chartPublish!,buffers);
+      indirect('contactVertices',36);indirect('contactEdges',48);
     }
 
     // R48: once the form table is available, prepareIn writes the exact mixed
@@ -3471,9 +3679,10 @@ export class SurfaceRelations {
     // E*instances surfaceLines path remains only for sources without early
     // levels; it cannot consume a compact mixed-bank mapping safely.
     if(host&&!frontierAdmitted){
-      if(earlyLevels){indirect('prepare');indirect('boundaries',0);indirect('contours',12);}
+      if(earlyLevels){indirect('prepare');indirect(boundaryStage,0);indirect(contourStage,12);}
+      else if(posedContacts){indirect(boundaryStage,0);indirect(contourStage,12);}
       else{const instances=frontier?.indices.length??host.instances;direct('surfaceLines',(edges+faces)*instances,held.groups,used.boundaries!,buffers);}
-    }else{if(!posedContacts&&!frontierAdmitted)indirect('prepare');indirect('boundaries',0);indirect('contours',12);}
+    }else{if(!posedContacts&&!frontierAdmitted)indirect('prepare');indirect(boundaryStage,0);indirect(contourStage,12);}
     // A host-sized posed-contact source skips prepare above; run it here so
     // its anchor dispatch uses the same native count and no capacity-derived
     // direct extent. All other paths already issued prepare before lines.
@@ -3579,7 +3788,7 @@ export class SurfaceRelations {
    * same thread counts (host-sized, or prepareInterior's upper bound with its
    * GPU count read by the stage body), the same parameter words, and word
    * bases in place of binding offsets. */
-  private queueBatched(batch:PosedSourceBatch,source:ResidentRelationSource,words:Uint32Array,host:SourceDrawExtent,{posedContacts,contactWords,contactEdges,parts,chartCodes,occupancy,chartClusters,anchorParts,earlyDetail,terrain,selection,frontierAdmitted}:{posedContacts:boolean;contactWords:number;contactEdges:number;parts:{readonly cellCodes:SourceStorageBinding;readonly levels:SourceStorageBinding}|undefined;chartCodes:SourceStorageBinding|undefined;occupancy:GpuIndexedCellOccupancy|undefined;chartClusters:number;anchorParts:number;earlyDetail:boolean;terrain:boolean;selection:GPUBuffer;frontierAdmitted:boolean}):void{
+  private queueBatched(batch:PosedSourceBatch,source:ResidentRelationSource,words:Uint32Array,host:SourceDrawExtent,{posedContacts,contactWords,baselineContactWords,residualWords,contactEdges,parts,chartCodes,occupancy,chartClusters,anchorParts,earlyDetail,terrain,selection,frontierAdmitted}:{posedContacts:boolean;contactWords:number;baselineContactWords:number;residualWords:number;contactEdges:number;parts:{readonly cellCodes:SourceStorageBinding;readonly levels:SourceStorageBinding}|undefined;chartCodes:SourceStorageBinding|undefined;occupancy:GpuIndexedCellOccupancy|undefined;chartClusters:number;anchorParts:number;earlyDetail:boolean;terrain:boolean;selection:GPUBuffer;frontierAdmitted:boolean}):void{
     const q=this.queue!;q.seen.add(posedBatchIdentity(batch));
     const indexed=isGpuIndexedResident(source)?source.gpu:undefined;
     const whole=(value:SourceStorageBinding,unit:number):[GPUBuffer,number]=>{const b=storageBinding(value),offset=b.offset??0;if(offset%unit)throw Error('Batched source relation range is not word aligned');return [b.buffer,offset/unit];};
@@ -3587,6 +3796,13 @@ export class SurfaceRelations {
     const [vertices,vertexBase]=whole(batch.storage?.vertices??batch.vertices,16);
     const [attributes,attributeBase]=whole(batch.storage?.attributes??batch.attributes,16);
     const [metadata,metadataBase]=whole(batch.storage?.metadata??batch.metadata,4);
+    if(posedContacts){
+      const maximumBytes=Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize);
+      const residualRequested=(words[45]!&64)!==0;
+      const arena=chooseOptionalContactArena(baselineContactWords,residualRequested?residualWords:0,maximumBytes,q.contactWords,1.25);
+      contactWords=arena.words;
+      if(residualRequested&&!arena.enabled)words[45]&=~64;
+    }
     const contactBase=posedContacts?q.contactWords:0;if(posedContacts)q.contactWords+=contactWords;
     const base=[incidenceBase,vertexBase,attributeBase,metadataBase];
     // Bindings 5, 6, 7 and 12 are this object's shared buffers, bound at flush.
@@ -3616,8 +3832,8 @@ export class SurfaceRelations {
     const levelPrefixWords=useLevelPrefix?2+selectedInstances*4:0;
     const levelPrefixBase=this.lineCapacity+q.levelPrefixRecords;
     if(levelPrefixWords)q.levelPrefixRecords+=requestedPrefixRecords;
-    const frontierDispatchBase=(frontierAdmitted||earlyDetail)?q.dispatchWords:0;
-    if(frontierAdmitted||earlyDetail)q.dispatchWords+=BATCH_DISPATCH_WORDS;
+    const frontierDispatchBase=(posedContacts||frontierAdmitted||earlyDetail)?q.dispatchWords:0;
+    if(posedContacts||frontierAdmitted||earlyDetail)q.dispatchWords+=BATCH_DISPATCH_WORDS;
     if(levelPrefixWords){words[52]=levelPrefixBase;words[53]=1;words[54]=selectedInstances;words[55]=batch.source.physicalUniformProducerRows?2:batch.source.ownerAuthority?.kind==='standard-entity'?1:batch.source.ownerAuthority?.kind==='producer-row'?2:0;}
     if(batch.source.physicalUniformProducerRows||batch.source.ownerAuthority?.kind==='producer-row')words[45]|=128;
     if(frontierAdmitted||earlyDetail){words[49]=0;words[50]=anchorParts;push('prepareFrontier',64,words,[contactBase,0,frontierDispatchBase,Number(frontierAdmitted)],bound);}
@@ -3628,7 +3844,7 @@ export class SurfaceRelations {
     bound[16]=anchorEntry?.input??this.emptyPartAnchorVertices!;
     const relationBase2=[contactBase,0,frontierDispatchBase,Number(frontierAdmitted)];
     if(anchorEntry&&this.partAnchorBuffer){const anchorBound=[...bound];anchorBound[16]=anchorEntry.input;anchorBound[17]=this.partAnchorBuffer;push('partAnchors',anchorEntry.parts*anchorEntry.instances,words,relationBase2,anchorBound,frontierAdmitted);}
-    if(posedContacts){push('contactClear',contactWords,words,relationBase2,bound,frontierAdmitted);push('voxelVote',faces*2,words,relationBase2,bound,frontierAdmitted);push('voxelBin',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartCorners',faces*2,words,relationBase2,bound,frontierAdmitted);push('chartCertify',Math.max(chartClusters,anchorParts),words,relationBase2,bound,frontierAdmitted);push('chartSelectStage',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartEmit',chartClusters,words,relationBase2,bound,frontierAdmitted);push('contactVertices',Math.max(faces*2,anchorParts),words,relationBase2,bound,frontierAdmitted);push('contactEdges',contactEdges,words,relationBase2,bound,frontierAdmitted);}
+    if(posedContacts){const compact=chartClusters>0;push('contactClear',contactWords,words,relationBase2,bound,frontierAdmitted);push('voxelVote',faces*2,words,relationBase2,bound,frontierAdmitted);push('voxelBin',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartCorners',faces*2,words,relationBase2,bound,frontierAdmitted);push('chartCertify',Math.max(chartClusters,anchorParts),words,relationBase2,bound,frontierAdmitted);push('chartSelectStage',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartEmit',chartClusters,words,relationBase2,bound,frontierAdmitted);push('chartPublish',1,words,relationBase2,bound);push('contactVertices',Math.max(faces*2,anchorParts),words,relationBase2,bound,frontierAdmitted||compact);push('contactEdges',contactEdges,words,relationBase2,bound,frontierAdmitted||compact);}
     const lineBound=[...bound];
     lineBound[11]=earlyDetail?formDepths(this.device).matrix(this.detailField!):(this.emptyMatrix??=this.device.createBuffer({label:'MAIN unselected detail matrix',size:64,usage:GPUBufferUsage.UNIFORM}));
     // Keep the original fused operation's boundary-before-contour order, but
@@ -3708,7 +3924,9 @@ export class SurfaceRelations {
       }
     }
     if(!q.items.length)return;
-    if(!this.batchContact||this.batchContact.size<Math.max(4,q.contactWords*4)){if(this.batchContact)this.retired.push(this.batchContact);this.batchContact=this.device.createBuffer({label:'MAIN batched posed quad contacts',size:Math.max(4,Math.ceil(q.contactWords*1.25)*4),usage:GPUBufferUsage.STORAGE});}
+    const maximumContactWords=Math.floor(Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize)/4);
+    if(q.contactWords>maximumContactWords)throw Error(`Complete batched contact arena (${q.contactWords} words) exceeds device binding capacity`);
+    if(!this.batchContact||this.batchContact.size<Math.max(4,q.contactWords*4)){if(this.batchContact)this.retired.push(this.batchContact);this.batchContact=this.device.createBuffer({label:'MAIN batched posed quad contacts',size:Math.max(4,Math.min(maximumContactWords,Math.ceil(q.contactWords*1.25))*4),usage:GPUBufferUsage.STORAGE});}
     const dispatchBytes=Math.max(1,q.dispatchWords)*4;
     if(!this.batchDispatch||this.batchDispatch.size<dispatchBytes){if(this.batchDispatch)this.retired.push(this.batchDispatch);this.batchDispatch=this.device.createBuffer({label:'MAIN batched source dispatch words',size:dispatchBytes*2,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.INDIRECT});}
     for(const clear of q.clears)encoder.clearBuffer(clear.buffer,clear.offset,clear.size);

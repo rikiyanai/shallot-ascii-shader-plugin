@@ -114,6 +114,27 @@ export interface SourceWholeConstruction {
  readonly compound?:SourceWholeCompound;
 }
 
+/**
+ * A required contact is an open, source-owned path. It is not a closed native
+ * part: when it occupies one page row the resident whole-part bank quite
+ * correctly has no two-anchor height variant, but the far source-part emitter
+ * can still carry the ordered contact segment into the shared path consumer.
+ * Keep this predicate at the source/far seam so the selector cannot admit a
+ * one-row contact unless that producer contract is actually present.
+ */
+export function sourceWholeContactPathReady(value:SourceWholeOpening|undefined):boolean{
+ const entryRef=value?.entryRef,context=value?.context,pose=value?.worldFromSource;
+ return !!value&&value.closed===false&&!!value.geometry&&value.geometry.length>=2&&
+  typeof entryRef==='number'&&Number.isSafeInteger(entryRef)&&entryRef>=1&&
+  typeof context==='number'&&Number.isSafeInteger(context)&&context>0&&
+  !!value.role&&!!pose&&pose.length===16&&
+  Array.from(pose).every(number=>Number.isFinite(number));
+}
+
+/** Shared source/far marker for the existing open-hard contact consumer. */
+export const SOURCE_CONTACT_BOUNDARY_FLAG=0x04000000;
+export const SOURCE_CONTACT_LINE_CLASS=2;
+
 /** Source-revision form emitted by the production compiler before an instance
  * identity exists. `sourceContributors` are compiled source-part ordinals,
  * never glyphs or projected fragments. The engine adapter binds them to the
@@ -451,7 +472,10 @@ export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|
   const cx=clip[0]!*wx+clip[4]!*wy+clip[8]!*wz+clip[12]!,cy=clip[1]!*wx+clip[5]!*wy+clip[9]!*wz+clip[13]!,cw=clip[3]!*wx+clip[7]!*wy+clip[11]!*wz+clip[15]!;
   if(!(cw>1e-5))return;return [((cx/cw)*.5+.5)*pageWidth,(.5-(cy/cw)*.5)*pageHeight];
  };
- const parts=[...value.parts,...value.openings,...value.contacts,...value.protectedVoids,...(value.paper??[])];
+ const parts:{readonly part:SourceWholePartRef|SourceWholeOpening;readonly contact:boolean}[] = [];
+ parts.push(...value.parts.map(part=>({part,contact:false})),...value.openings.map(part=>({part,contact:false})),
+  ...value.contacts.map(part=>({part,contact:true})),...value.protectedVoids.map(part=>({part,contact:false})),
+  ...(value.paper??[]).map(part=>({part,contact:false})));
  const direction=(delta:readonly [number,number]):number=>Math.round((((Math.atan2(delta[1]!,delta[0]!)/(Math.PI*2))+1)%1)*8)&7;
  const rowPlanComplete=(projected:readonly (readonly [number,number])[],closed:boolean,low:number,high:number):boolean=>{
   const covered=new Uint8Array(Math.max(0,high-low+1)),segments=closed?projected.length:projected.length-1;
@@ -462,7 +486,7 @@ export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|
   }
   return covered.every(value=>value!==0);
  };
- return parts.every(part=>{
+ return parts.every(({part,contact})=>{
   const geometry=part.geometry,pose=part.worldFromSource;if(!geometry||geometry.length<2||!pose||pose.length!==16)return false;
   const projected=geometry.map(point=>project(point,pose));if(projected.some(point=>!point))return false;
   const projectedPoints=projected as readonly (readonly [number,number])[];
@@ -482,14 +506,23 @@ export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|
   // overrun or an endpoint on the first invalid integer row.
   if(minX<0||maxX>pageWidth||origin<0||origin+sourceWidth>pageWidth||minY<0||maxY>pageHeight||lowRow<0||highRow>=rowCount)return false;
   const rows=highRow-lowRow+1,closed=part.closed===true;
-  if(rows<2)return false;
+  // A required contact uses the existing open-hard boundary consumer, not a
+  // fabricated whole-part bank entry. Its source geometry, pose and relation
+  // identity remain in the packet; the ordinary planar queue owns spelling.
+  const contactSpan=contact&&sourceWholeContactPathReady(part)&&projectedPoints.some((a,index)=>{
+   if(index+1>=projectedPoints.length)return false;const b=projectedPoints[index+1]!;
+   return Math.hypot(b[0]!-a[0]!,b[1]!-a[1]!)>=1;
+  });
+  if(rows<2&&!contactSpan)return false;
   if(!rowPlanComplete(projectedPoints,closed,lowRow,highRow))return false;
   const segments=closed?projectedPoints.length:projectedPoints.length-1;if(segments<1)return false;
   const firstDelta:[number,number]=[projectedPoints[0]![0]!-projectedPoints[1]![0]!,projectedPoints[0]![1]!-projectedPoints[1]![1]!];
   const lastIndex=segments-1,lastA=projectedPoints[lastIndex]!,lastB=projectedPoints[(lastIndex+1)%projectedPoints.length]!;
   const lastDelta:[number,number]=[lastB[0]!-lastA[0]!,lastB[1]!-lastA[1]!];
   const nativeContext=((part.context!>>6)&7)<<6|direction(firstDelta)|direction(lastDelta)<<3;
-  return !!part.role&&!!nativePart&&nativePart(part.role,nativeContext,rows,sourceWidth,origin);
+  if(contactSpan)return true;
+  if(!part.role||!nativePart)return false;
+  return nativePart(part.role,nativeContext,rows,sourceWidth,origin);
  });
 }
 /** Combine immutable source programs without introducing a scene recipe. A

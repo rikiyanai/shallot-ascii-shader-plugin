@@ -251,7 +251,9 @@ function specializeSoftProducer(code:string,kind:'legacy'|'program'):string{
    // This queue contains ONLY unprogrammed sources. Remove its canonical
    // prologue by its interface, not by a frozen copy of the programmed
    // producer's condition. Junction/context changes belong to that producer.
-   const start=body.indexOf(' let canonicalReady=sourcePartCanonicalPlayable(run);');
+   const markers=[' let canonicalReady=sourcePartCanonicalPlayable(run);',' var canonicalReady=sourcePartCanonicalPlayable(run);'];
+   const marker=markers.find(value=>body.includes(value));
+   const start=marker===undefined?-1:body.indexOf(marker);
    const end=body.indexOf(' let base=run.range.x;let pairs=run.range.y/2u;',start);
    const prologue=body.slice(start,end);
    if(start<0||end<0||!prologue.includes('programmedWholeSourcePart(')||!prologue.includes('softRunAnchor='))

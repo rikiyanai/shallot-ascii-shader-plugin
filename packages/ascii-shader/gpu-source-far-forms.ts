@@ -1,5 +1,5 @@
 import type {SurfaceField} from './surface-fields.ts';
-import {PARENT_MAX_COLUMNS,sourceWholeConstructionRenderable,type FarFormInstance,type SourceWholeConstruction,type SourceWholeOpening,type SourceWholePartRef,type SourceWholePartRole} from './source-lod.ts';
+import {PARENT_MAX_COLUMNS,SOURCE_CONTACT_BOUNDARY_FLAG,SOURCE_CONTACT_LINE_CLASS,sourceWholeConstructionRenderable,type FarFormInstance,type SourceWholeConstruction,type SourceWholeOpening,type SourceWholePartRef,type SourceWholePartRole} from './source-lod.ts';
 import {DeviceComputePrograms,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {CONSTRUCTION_POINT_WGSL} from './source-coordinates.ts';
 import {FORM_DEPTH_WGSL,LOD_TIER_HOLD,formDepths} from './form-depths.ts';
@@ -152,7 +152,14 @@ fn sourceParts(input:Input,local:u32){
     top=min(top,min(a.position.y,b.position.y));bottom=max(bottom,max(a.position.y,b.position.y));
    }
    let rows=u32(clamp(floor(top)+16384.0,0.0,65535.0))|(u32(clamp(ceil(bottom)+16384.0,0.0,65535.0))<<16u);
-   runs[at.y]=Run(vec4u(at.x,pointCount,${COMPILED_FAR_PROFILE_BIT}u|0x40000002u,(feature<<5u)|(role<<2u)),vec4u(feature,owner,feature),vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(0u,count,rows,role|select(0u,0x80000000u,relation)|select(0u,0x40000000u,contact)|select(0u,0x20000000u,relationParent)|select(0u,0x10000000u,compoundParent)),vec4u(owner,input.program.z,sourcePartLineage(feature,i,relation,contact)));
+   // Required contacts are ordinary open-hard source paths. They stay in the
+   // normal planar queue and retain their source samples/feature identity;
+   // only closed parts and protected/opening relations use the measured-far
+   // parent consumer. This prevents a far profile from taking ownership of a
+   // one-row contact and lets hardBoundaryConstruction spell its complete
+   // source edge with the existing visibility path.
+   let pathFlags=select(${COMPILED_FAR_PROFILE_BIT}u|0x40000002u,${SOURCE_CONTACT_BOUNDARY_FLAG}u|(${SOURCE_CONTACT_LINE_CLASS}u<<8u)|role,contact);
+   runs[at.y]=Run(vec4u(at.x,pointCount,pathFlags,(feature<<5u)|(role<<2u)),vec4u(feature,owner,feature),vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(0u,count,rows,role|select(0u,0x80000000u,relation)|select(0u,0x40000000u,contact)|select(0u,0x20000000u,relationParent)|select(0u,0x10000000u,compoundParent)),vec4u(owner,input.program.z,sourcePartLineage(feature,i,relation,contact)));
   }
  }
 }
