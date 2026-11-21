@@ -1983,7 +1983,7 @@ fn boundaryAtFine(ordinal:u32,instance:u32,selectedOrdinal:u32,residual:bool){
  var backFirst=0xffffffffu;var backSecond=0xffffffffu;var backNormal=vec3f(0.0);var backCrease=false;
  let start=halfedge(e.x);
  var members=1u;var membersAt=0u;if(e.w>0u){let group=source[9]+(e.w-1u)*2u;membersAt=source[group];members=source[group+1u];}
- var member=0u;var contactHead=0u;var lastContact=NO_CONTACT;if(contact!=NO_CONTACT){contactHead=atomicLoad(&contactWork[contactSlots()*2u+contact]);}
+ var member=0u;var contactHead=0u;if(contact!=NO_CONTACT){contactHead=atomicLoad(&contactWork[contactSlots()*2u+contact]);}
  var samePart=true;var ownPart=0u;var smallPart=false;
  if(cellParts()){
   ownPart=atomicLoad(&contactWork[edgePartBase()+ordinal]);
@@ -1992,11 +1992,8 @@ fn boundaryAtFine(ordinal:u32,instance:u32,selectedOrdinal:u32,residual:bool){
  loop{
   var h=e.x;
   if(contact!=NO_CONTACT){
-   // Atomic list insertion order is not drawing order. Visit source edges
-   // ascending so face ports and the normal reference cannot flip by race.
-   var cursor=contactHead;var next=NO_CONTACT;
-   loop{if(cursor==0u){break;}let candidate=cursor-1u;if(lastContact==NO_CONTACT||candidate>lastContact){next=min(next,candidate);}cursor=atomicLoad(&contactWork[contactSlots()*3u+candidate]);}
-   if(next==NO_CONTACT){break;}lastContact=next;h=edge(next).x;
+   if(contactHead==0u){break;}
+   let current=contactHead;contactHead=atomicLoad(&contactWork[contactSlots()*3u+(current-1u)]);h=edge(current-1u).x;
   }
   else{if(member>=members){break;}h=select(e.x,source[membersAt+member*2u],e.w>0u);member++;}
   if(!contactMatches(e.x,h,instance)){continue;}
@@ -2650,13 +2647,13 @@ function physicalSurfaceRelationsShader(source:string):string{
  for(const [from,to] of [
   ['let contact=posedEdgeSlot(ordinal);var canonical=canonicalEdge(ordinal,instance);','var canonical=canonicalEdge(ordinal,instance);'],
   ['if(contact!=NO_CONTACT){canonical=edge(atomicLoad(&contactWork[contactSlots()+contact])-1u).x;}',''],
-  ['var member=0u;var contactHead=0u;var lastContact=NO_CONTACT;if(contact!=NO_CONTACT){contactHead=atomicLoad(&contactWork[contactSlots()*2u+contact]);}','var member=0u;'],
+  ['var member=0u;var contactHead=0u;if(contact!=NO_CONTACT){contactHead=atomicLoad(&contactWork[contactSlots()*2u+contact]);}','var member=0u;'],
   [`var samePart=true;var ownPart=0u;var smallPart=false;
  if(cellParts()){
   ownPart=atomicLoad(&contactWork[edgePartBase()+ordinal]);
   let at=partSlot(ownPart);if(ownPart!=0u&&at!=NO_CONTACT){smallPart=(atomicLoad(&contactWork[partFlagsBase()+at])&3u)==1u;}
  }`,'var smallPart=false;'],
-  ['  if(contact!=NO_CONTACT){\n   // Atomic list insertion order is not drawing order. Visit source edges\n   // ascending so face ports and the normal reference cannot flip by race.\n   var cursor=contactHead;var next=NO_CONTACT;\n   loop{if(cursor==0u){break;}let candidate=cursor-1u;if(lastContact==NO_CONTACT||candidate>lastContact){next=min(next,candidate);}cursor=atomicLoad(&contactWork[contactSlots()*3u+candidate]);}\n   if(next==NO_CONTACT){break;}lastContact=next;h=edge(next).x;\n  }\n  else{if(member>=members){break;}h=select(e.x,source[membersAt+member*2u],e.w>0u);member++;}','  if(member>=members){break;}h=select(e.x,source[membersAt+member*2u],e.w>0u);member++;'],
+  ['  if(contact!=NO_CONTACT){\n   if(contactHead==0u){break;}\n   let current=contactHead;contactHead=atomicLoad(&contactWork[contactSlots()*3u+(current-1u)]);h=edge(current-1u).x;\n  }\n  else{if(member>=members){break;}h=select(e.x,source[membersAt+member*2u],e.w>0u);member++;}','  if(member>=members){break;}h=select(e.x,source[membersAt+member*2u],e.w>0u);member++;'],
   ['  if(cellParts()){samePart=samePart&&atomicLoad(&contactWork[edgePartBase()+halfedge(h).z])==ownPart;}\n',''],
   ['smallPart&&samePart','false'],
  ])specialized=replaceWgslFunctionSnippet(specialized,'boundaryAtFine',from,to);
