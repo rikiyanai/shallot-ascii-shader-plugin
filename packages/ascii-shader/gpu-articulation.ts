@@ -3150,9 +3150,10 @@ fn skyCell(run:Run,x0:f32)->SkyCell{
 // is the run's form (high 10 bits) and its own end points (low 9 bits).
 fn skyMix(x:u32)->u32{var h=x*0x9e3779b1u;h^=h>>15u;h*=0x85ebca77u;h^=h>>13u;return h;}
 fn skyID(run:Run)->u32{
- let a=bitcast<vec2u>(finiteRunStart(run).position.xy);let b=bitcast<vec2u>(finiteRunEnd(run).position.xy);
  let form=skyMix(run.identity.y^skyMix(run.identity.z))&0x3ffu;
- let own=skyMix(a.x^skyMix(a.y^skyMix(b.x^skyMix(b.y^skyMix(run.identity.w^run.range.y)))))&0x1ffu;
+ // Ownership follows the same normalized source feature/epoch namespace as
+ // native playback, never projected endpoints or visibility fragment count.
+ let own=memoHash(memoKey(run))&0x1ffu;
  return (form<<9u)|own;
 }
 fn skyKey(top:f32,flag:u32,id:u32)->u32{
@@ -3668,12 +3669,13 @@ fn farMarkKey(run:Run,form:FarForm)->u32{return (u32(clamp(form.height,0.0,4095.
  // column's top that column is clipped. Selection of visible runs is unchanged.
  if(!tierSelects(run,away)&&!(kind==3u&&standingHidden(run))){return;}
  let table=select(0u,1u,kind==3u);
+ let ownerKey=skyID(run);
  let columns=farColumns(run,kind,span);let c0=columns.x;let c1=columns.y;
  var footKey=0u;if(kind==3u){footKey=u32(clamp(skyLevel(farForm(run,span).base),-1024,3000)+1025);}
  for(var c=c0;c<=c1;c++){
 
   let cell=farCell(run,kind,c);if(cell.at>=STANDING_SHARED){continue;}
-  atomicMax(&counts[SKY_AT+table*SKY_COLUMNS+u32(c)],skyKey(cell.top,u32(kind==2u),skyID(run)));
+  atomicMax(&counts[SKY_AT+table*SKY_COLUMNS+u32(c)],skyKey(cell.top,u32(kind==2u),ownerKey));
   if(kind==3u){atomicMax(&counts[SKY_AT+2u*SKY_COLUMNS+u32(c)],footKey);}
  }
 }
@@ -3793,6 +3795,7 @@ fn skyUnits(id:u32,run:Run,cls:u32,c:i32,cell:SkyCell,level:i32,left:i32,right:i
 // never as column-lattice fragments under the strip.
 fn farSkyline(id:u32,run:Run,kind:u32,span:vec4f,priority:u32)->bool{
  let table=grammar[9];var own=0;var bright=0.0;
+ let ownerKey=skyID(run);
  if(kind==3u){
   own=skyLevel(farForm(run,span).base);bright=formBright(run);
  }
@@ -3808,7 +3811,7 @@ fn farSkyline(id:u32,run:Run,kind:u32,span:vec4f,priority:u32)->bool{
   for(var c=c0;c<=c1&&!held;c++){
    let cell=skyCell(run,f32(c)*16.0);if(cell.at==NONE){continue;}
    let top=skyRead(0u,c);
-   held=!top.on||(top.flag==0u&&top.id==skyID(run))||skyLevel(cell.top)-top.level<=1;
+   held=!top.on||(top.flag==0u&&top.id==ownerKey)||skyLevel(cell.top)-top.level<=1;
   }
   if(!held){return false;}
  }
@@ -3824,7 +3827,7 @@ fn farSkyline(id:u32,run:Run,kind:u32,span:vec4f,priority:u32)->bool{
   // outline strokes). A trial that held every lobe within three rows of its
 
   // was withdrawn.
-  if(top.on&&top.flag==0u&&top.id==skyID(run)){
+  if(top.on&&top.flag==0u&&top.id==ownerKey){
    level=top.level;
    let l=skyRead(cls,c-1);let r=skyRead(cls,c+1);
    if(cls==0u){
@@ -3844,7 +3847,7 @@ fn farSkyline(id:u32,run:Run,kind:u32,span:vec4f,priority:u32)->bool{
    // A terrain line under the horizon in this column is in front of it: the
    // strip does not spell it here (no stepped lattice fragments on the ground).
    if(cls==0u&&terrainRun(run)){continue;}
-   if(top.on&&cls==1u&&(top.id>>9u)==(skyID(run)>>9u)){continue;}
+   if(top.on&&cls==1u&&(top.id>>9u)==(ownerKey>>9u)){continue;}
    // A lower MASS ends on its ground (its turn and base are what it keeps);
    // a lower terrain line that ends, ends flat.
    let l=farCell(run,kind,c-1);let r=farCell(run,kind,c+1);

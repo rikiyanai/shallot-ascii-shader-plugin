@@ -177,7 +177,7 @@ function specializeSkyline(combined:string,kind:1|3):string{
   fn=replaceConditional(fn,'kind==3u','remove');
   fn=replaceConditional(fn,'cls==1u','remove','foot=groupFoot');
   fn=replaceConditional(fn,'cls==0u','body');
-  fn=replaceConditional(fn,'top.on&&cls==1u&&(top.id>>9u)==(skyID(run)>>9u)','remove');
+  fn=replaceConditional(fn,'top.on&&cls==1u&&(top.id>>9u)==(ownerKey>>9u)','remove');
   fn=replaceConditional(fn,'cls==1u','remove','left=skyGround');
   fn=removeFalseConjunctions(fn,'cls==1u');
   fn=replaceConditional(fn,'cls==1u','remove','shadeCell');
@@ -188,7 +188,7 @@ function specializeSkyline(combined:string,kind:1|3):string{
   fn=replaceConditional(fn,'cls==0u','else');
   fn=replaceConditional(fn,'cls==1u','body','foot=groupFoot');
   fn=replaceConditional(fn,'cls==0u&&terrainRun(run)','remove','continue');
-  fn=fn.replace('top.on&&cls==1u&&(top.id>>9u)==(skyID(run)>>9u)','top.on&&(top.id>>9u)==(skyID(run)>>9u)');
+  fn=fn.replace('top.on&&cls==1u&&(top.id>>9u)==(ownerKey>>9u)','top.on&&(top.id>>9u)==(ownerKey>>9u)');
   fn=replaceConditional(fn,'cls==1u','body','left=skyGround');
   // Only the class test is known. The foot/base condition remains a real
   // drawing decision and must not be folded along with it.
