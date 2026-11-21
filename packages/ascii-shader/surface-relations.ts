@@ -72,6 +72,11 @@ import {FORM_DEPTH_WGSL,FORM_DEPTH_HEADER_ROW,FAR_STRIP_BELOW_ROWS,LOD_TIER_HOLD
 import {SOURCE_PATH_REVERSED,SOURCE_PATH_PAIR_B,EDGE_LEVEL_UNIT,EDGE_LEVEL_DETAIL,EDGE_LEVEL_CHAINED,FACET_CREASE_LEAST_ROWS,TOPOLOGY_PART_CANONICAL_MAGIC,TOPOLOGY_PART_CANONICAL_VERSION,TOPOLOGY_PART_CANONICAL_HEADER_WORDS,TOPOLOGY_PART_CANONICAL_RECORD_WORDS,TOPOLOGY_PART_CANONICAL_SAMPLE_WORDS,TOPOLOGY_PART_CANONICAL_FLAG_COMPLETE} from './compiled-construction-topology.ts';
 import {FAR_AGGREGATE_MEMBER_WGSL} from './gpu-source-far-forms.ts';
 import {sourcePartRowTableLayout} from './gpu-playback-program.ts';
+/** Current GPU-indexed CSRI packets carry incidence, not the MAIN planar/hull
+ * bank directories consumed by sourcePlanarSpanAt/sourceHullAt. Their voxel
+ * chart hierarchy remains the complete producer; an instance-bank prefix for
+ * their registration capacity would allocate memory but select no coarse bank. */
+export function supportsCompiledInstanceLevels(source:ResidentRelationSource):boolean{return !isGpuIndexedResident(source);}
 export interface SurfaceGraphView {
   readonly clipFromWorld:Float32Array;readonly eye:readonly number[];
   readonly direction:readonly number[];readonly perspective:boolean;
@@ -3042,7 +3047,7 @@ export class SurfaceRelations {
     // admitted instance count. Reserving four words per line-capacity entry
     // would turn a large relation arena into an unnecessary second arena before
     // a levelled source is ever submitted.
-    this.levelPrefixRecords=1;
+    this.levelPrefixRecords=Math.min(1,this.levelPrefixBudget());
     this.lines=device.createBuffer({size:(lineCapacity+this.levelPrefixRecords)*RELATION_WORDS*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
     this.status=device.createBuffer({size:16,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
     // prepare publishes relation/contact arguments through word 35 (the
@@ -3063,11 +3068,13 @@ export class SurfaceRelations {
   ensureCapacity(count:number):void{
     if(!Number.isSafeInteger(count)||count<0)throw Error('Invalid complete source relation count');
     if(count<=this.lineCapacity)return;
-    const capacity=Math.ceil(count/256)*256,size=(capacity+this.levelPrefixRecords)*RELATION_WORDS*4;
-    if(size>Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize))throw Error(`Complete source relation range (${count}) needs device-sized chunks`);
+    const capacity=Math.ceil(count/256)*256,maximum=Math.floor(Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize)/(RELATION_WORDS*4));
+    if(capacity>maximum)throw Error(`Complete source relation range (${count}) needs device-sized chunks`);
+    const prefix=Math.min(this.levelPrefixRecords,maximum-capacity),size=(capacity+prefix)*RELATION_WORDS*4;
     const next=this.device.createBuffer({label:'MAIN complete counted source relations',size,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
-    this.retired.push(this.lines);this.lines=next;this.lineCapacity=capacity;
+    this.retired.push(this.lines);this.lines=next;this.lineCapacity=capacity;this.levelPrefixRecords=prefix;
   }
+  private levelPrefixBudget():number{return Math.max(0,Math.floor(Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize)/(RELATION_WORDS*4))-this.lineCapacity);}
   private ensureLevelPrefixRecords(records:number):void{
     if(!Number.isSafeInteger(records)||records<1)throw Error('Invalid complete level prefix record count');
     if(records<=this.levelPrefixRecords)return;
@@ -3079,7 +3086,8 @@ export class SurfaceRelations {
   }
   private reserveLevelPrefix(instances:number):LevelPrefixReservation|undefined{
     const records=levelPrefixRecordCount(instances);
-    this.levelPrefixDemand+=records;
+    const budget=this.levelPrefixBudget();if(records>budget)return undefined;
+    this.levelPrefixDemand=Math.min(budget,this.levelPrefixDemand+records);
     const reservation=levelPrefixReservation(this.lineCapacity,this.levelPrefixRecords,this.levelPrefixUsed,instances,this.levelPrefixWriting);
     if(!reservation)return undefined;
     if(reservation.nextCapacity>this.levelPrefixRecords)this.ensureLevelPrefixRecords(reservation.nextCapacity);
@@ -3087,7 +3095,8 @@ export class SurfaceRelations {
     return reservation;
   }
   private noteLevelPrefixDemand(instances:number):number{
-    const records=levelPrefixRecordCount(instances);this.levelPrefixDemand+=records;return records;
+    const records=levelPrefixRecordCount(instances),budget=this.levelPrefixBudget();if(records>budget)return 0;
+    this.levelPrefixDemand=Math.min(budget,this.levelPrefixDemand+records);return records;
   }
   /** `contactScale`: passed to SurfaceIntersections.begin (id raster columns per field column). */
   begin(encoder:GPUCommandEncoder,view?:SurfaceGraphView,field?:SurfaceField,contactScale=1):void{
@@ -3096,7 +3105,8 @@ export class SurfaceRelations {
     // `lines`; this makes fallback temporary and preserves the full incumbent
     // output while the demand is learned.
     this.levelPrefixUsed=0;this.levelPrefixWriting=false;
-    if(this.levelPrefixDemand>this.levelPrefixRecords)this.ensureLevelPrefixRecords(this.levelPrefixDemand);
+    const wanted=Math.min(this.levelPrefixDemand,this.levelPrefixBudget());
+    if(wanted>this.levelPrefixRecords)this.ensureLevelPrefixRecords(wanted);
     this.levelPrefixDemand=0;
     encoder.clearBuffer(this.status);encoder.clearBuffer(this.partAnchorAlloc);this.admittedFrontiers.clear();this.frontierSelections.clear();this.contactsActive=!!view&&!!field;
     this.detailField=field;this.detailPage=view?.pageExtent;this.fieldDomains=undefined;
@@ -3286,8 +3296,9 @@ export class SurfaceRelations {
     // buffers use their suffix; external visibility lists use the existing
     // indirect dispatch storage and retain their producer-owned list intact.
     const levelCapacity=nativeAdmitted?nativeTransportInstanceCapacity(batch):Math.max(1,frontier?.indices.length??batch.source.instanceCapacity??owners.length,owners.length);
-    const levelReservation=!batched&&earlyDetail?this.reserveLevelPrefix(levelCapacity):undefined;
-    if(!batched&&!earlyDetail)this.levelPrefixWriting=true;
+    const earlyLevels=earlyDetail&&levelOwnerCertificate!==0&&supportsCompiledInstanceLevels(source);
+    const levelReservation=!batched&&earlyLevels?this.reserveLevelPrefix(levelCapacity):undefined;
+    if(!batched)this.levelPrefixWriting=true;
     // Every complete prefix lives in the relation output arena. Its base is a
     // relation-record index, not a word offset into the producer's visibility
     // list or the indirect argument buffer.
@@ -3433,13 +3444,13 @@ export class SurfaceRelations {
     // E*instances surfaceLines path remains only for sources without early
     // levels; it cannot consume a compact mixed-bank mapping safely.
     if(host&&!frontierAdmitted){
-      if(earlyDetail){indirect('prepare');indirect('boundaries',0);indirect('contours',12);}
+      if(earlyLevels){indirect('prepare');indirect('boundaries',0);indirect('contours',12);}
       else{const instances=frontier?.indices.length??host.instances;direct('surfaceLines',(edges+faces)*instances,held.groups,used.boundaries!,buffers);}
     }else{if(!posedContacts&&!frontierAdmitted)indirect('prepare');indirect('boundaries',0);indirect('contours',12);}
     // A host-sized posed-contact source skips prepare above; run it here so
     // its anchor dispatch uses the same native count and no capacity-derived
     // direct extent. All other paths already issued prepare before lines.
-    if(host&&posedContacts&&!frontierAdmitted&&!earlyDetail)indirect('prepare');
+    if(host&&posedContacts&&!frontierAdmitted&&!earlyLevels)indirect('prepare');
 
     // link each complete record from the prepare-written indirect extent.
     if(anchors&&this.partAnchorBuffer){
@@ -3568,11 +3579,13 @@ export class SurfaceRelations {
     // R50's per-source representation prefix is a reserved tail of the shared
     // relation output arena. The ordinary indirect words remain separate and
     // are still written in the existing ordered prepare pass.
-    const requestedPrefixRecords=earlyDetail?this.noteLevelPrefixDemand(selectedInstances):0;
+    const earlyLevels=earlyDetail&&supportsCompiledInstanceLevels(source)&&!!(batch.source.physicalUniformProducerRows||batch.source.ownerAuthority);
+    const requestedPrefixRecords=earlyLevels?this.noteLevelPrefixDemand(selectedInstances):0;
     // A direct source may already have captured `lines` in this frame. If its
     // reserved suffix leaves no room for this queued source, preserve the
     // complete incumbent path instead of growing the live arena at flush.
-    const useLevelPrefix=earlyDetail&&(!this.levelPrefixWriting||this.levelPrefixUsed+q.levelPrefixRecords+requestedPrefixRecords<=this.levelPrefixRecords);
+    const prefixEnd=this.levelPrefixUsed+q.levelPrefixRecords+requestedPrefixRecords;
+    const useLevelPrefix=earlyLevels&&requestedPrefixRecords>0&&prefixEnd<=this.levelPrefixBudget()&&(!this.levelPrefixWriting||prefixEnd<=this.levelPrefixRecords);
     const levelPrefixWords=useLevelPrefix?2+selectedInstances*4:0;
     const levelPrefixBase=this.lineCapacity+q.levelPrefixRecords;
     if(levelPrefixWords)q.levelPrefixRecords+=requestedPrefixRecords;
