@@ -1778,7 +1778,10 @@ fn prepareIn(){
  // chunk words (columnEnd), the same extent contactClearAt clears and the host
  // allocates (contactWords); short of it, column claims, tops/floors and the
  // chunk level vote would persist into the next frame.
- let words=columnEnd();
+ // The indirect clear must reach the SAME complete optional suffix that
+ // contactClearAt clears and the host allocates. Stopping at columnEnd left
+ // previous-frame residual headers, face membership and compact IDs live.
+ let words=residualEnd();
  let clearGroups=select(0u,(words+63u)/64u,contactActive);
  let vertexWork=max(min(sourceFaceCount()*2u,native[0]/6u*4u),prepareAnchorParts());
  let vertexGroups=select(0u,(vertexWork+63u)/64u,contactActive);
@@ -2643,6 +2646,44 @@ function physicalSurfaceRelationsShader(source:string):string{
  return specialized;
 }
 export const SURFACE_RELATIONS_PHYSICAL_SHADER=physicalSurfaceRelationsShader(SURFACE_RELATIONS_SHADER);
+/** Ordinary direct playback is a fine-only fallback for a producer that was
+ * not present during warm-time admission. Keep the posed contact/canonical
+ * correspondence and authored/planar/hull banks, but remove chart, residual
+ * and voxel-cluster consumers from the line call graph. */
+function ordinaryDirectSurfaceRelationsShader(source:string):string{
+ let specialized=source;
+ for(const hook of [
+  'if(!chartEarlyEmitted()){chartEmitAt(sourceId,sourceEdgeCount()*selectedCount());}',
+  'if(!residual&&posedContacts()){let inc=sourceEdgeCorner(halfedge(e.x).z,0u);if(inDraw(inc)&&validFace(inc)&&voxelColumnEdge(ordinal,triangle(inc,0u),inc/3u)){return;}}',
+  'if(posedContacts()&&voxelClusterEmit(position(h.x,instance),position(h.y,instance),t,kind,e.x,vec2u(first/3u,select(0xffffffffu,second/3u,second!=0xffffffffu)),smallPart&&samePart)){return;}',
+ ] as const){
+  const next=specialized.replace(hook,'');if(next===specialized)throw Error('Ordinary fine relation shader hook changed');specialized=next;
+ }
+ specialized=replaceWgslFunctionBody(specialized,'boundaryAt',`if(levelDispatchEnabled()){
+  if(id>=levelDispatchTotal()){return;}
+  let record=levelDispatchFor(id);if(record.x==0xffffffffu){return;}
+  let ordinal=id-record.z;let instance=record.x;if(!selected(instance)){return;}
+  if(record.y==LEVEL_BANK_OUTLINE){authoredPathsAt(ordinal,instance);if(ordinal<sourceHullEdgeCount()){hullOutlineAt(ordinal,instance);}return;}
+  if(record.y==LEVEL_BANK_PLANAR){authoredPathsAt(ordinal,instance);let spans=sourcePlanarSpanCount();if(ordinal<spans){planarSpanAt(ordinal,instance);}else if(ordinal<spans+sourcePanelJoinCount()){planarJoinAt(ordinal-spans,instance);}return;}
+  boundaryAtFine(ordinal,instance,record.w,false);return;
+ }
+ let slots=sourceBoundarySlots();if(id>=slots*selectedCount()||native[0]==0u){return;}
+ boundaryAtFine(id%slots,selectedInstance(id/slots),id/slots,false);`);
+ specialized=replaceWgslFunctionSnippet(specialized,'contourAt',` }else if(residualReady()){
+  let faces=residualFaceCount();if(faces==0u||id>=faces*selectedCount()){return;}
+  instance=selectedInstance(id/faces);face=residualFaceAt(id%faces);
+ }else{`,` }else{`);
+ specialized=replaceWgslFunctionSnippet(specialized,'contactVertexAt',` let residual=residualReady();var sourceV=v;
+ if(residual){if(v>=residualVertexCount()){return;}sourceV=residualVertexAt(v);}
+ if(sourceV>=min(sourceFaceCount()*2u,native[0]/6u*4u)){return;}
+ // Owned by the selected coarse representation: no fine port is ever read.
+ if(!residual&&voxelVertexCoarse(sourceV)){return;}`,` var sourceV=v;
+ if(sourceV>=min(sourceFaceCount()*2u,native[0]/6u*4u)){return;}`);
+ specialized=replaceWgslFunctionSnippet(specialized,'contactEdgeAt',` let residual=residualReady();var edgeId=id;if(residual){if(id>=residualEdgeCount()){return;}edgeId=residualEdgeAt(id);}else if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}`,` var edgeId=id;if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}`);
+ specialized=replaceWgslFunctionSnippet(specialized,'contactEdgeAt','if(!residual&&voxelEdgeCoarse(edgeId)){return;}','');
+ return specialized;
+}
+export const SURFACE_RELATIONS_GENERIC_DIRECT_ORDINARY_SHADER=ordinaryDirectSurfaceRelationsShader(SURFACE_RELATIONS_SHADER);
 const SURFACE_RELATIONS_GENERIC_DIRECT_SHADER=SURFACE_RELATIONS_PHYSICAL_SHADER;
 function voxelSurfaceRelationsShader(source:string):string{
  let specialized=source;
@@ -2994,6 +3035,7 @@ export function tensorRevision(batch:{readonly source:{readonly posedRevision?:n
 }
 const SURFACE_RELATION_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','voxelVote','voxelHome','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','boundaries','contours','surfaceLines'] as const;
 const SURFACE_RELATION_GENERIC_DIRECT_ENTRIES=[...SURFACE_RELATION_ENTRIES.filter(entry=>entry!=='surfaceLines'),'boundariesVoxel','contoursVoxel'];
+const SURFACE_RELATION_GENERIC_DIRECT_ORDINARY_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','contactVertices','contactEdges','boundaries','contours'] as const;
 const SURFACE_RELATION_INTERIOR_ENTRIES=['prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'] as const;
 // The batched entries exist only with the interior stages (the physical path).
 const SURFACE_RELATION_BATCH_ENTRIES=BATCH_ORDER.map(batchEntryName);
@@ -3007,9 +3049,10 @@ type SurfaceRelationEntry=typeof SURFACE_RELATION_ENTRIES[number]|typeof SURFACE
  * supplies the complete batch contract (extent + visibility frontier + posed
  * revision) and queues every source into flushBatched(), so it uses the
  * physical profile instead of guessing from a scene name. */
-export type SurfaceRelationPreparation='generic'|'generic-direct'|'physical-batched';
+export type SurfaceRelationPreparation='generic'|'generic-direct'|'generic-direct-ordinary'|'physical-batched';
 const surfaceRelationEntries=(interior:boolean,preparation:SurfaceRelationPreparation='generic'):readonly SurfaceRelationEntry[]=>
  preparation==='physical-batched'?(interior?['admitFrontier',...SURFACE_RELATION_BATCH_ENTRIES]:['admitFrontier']):
+ preparation==='generic-direct-ordinary'?(interior?[...SURFACE_RELATION_GENERIC_DIRECT_ORDINARY_ENTRIES,...SURFACE_RELATION_INTERIOR_ENTRIES]:SURFACE_RELATION_GENERIC_DIRECT_ORDINARY_ENTRIES):
  preparation==='generic-direct'?(interior?[...SURFACE_RELATION_GENERIC_DIRECT_ENTRIES,...SURFACE_RELATION_INTERIOR_ENTRIES]:SURFACE_RELATION_GENERIC_DIRECT_ENTRIES):
  interior?[...SURFACE_RELATION_ENTRIES,...SURFACE_RELATION_INTERIOR_ENTRIES,...SURFACE_RELATION_BATCH_ENTRIES]:SURFACE_RELATION_ENTRIES;
 interface PreparedSurfaceRelations{
@@ -3023,7 +3066,7 @@ function surfaceRelationPipelinePlans(device:GPUDevice,interior:boolean,preparat
  for(const entry of surfaceRelationEntries(interior,preparation)){
   const batched=entry.startsWith('batch');
   const voxelEntry=entry==='boundariesVoxel'||entry==='contoursVoxel';
-  const directSource=preparation==='generic-direct'&&voxelEntry?SURFACE_RELATIONS_GENERIC_DIRECT_VOXEL_SHADER:preparation==='generic-direct'&&(entry==='boundaries'||entry==='contours')?SURFACE_RELATIONS_GENERIC_DIRECT_SHADER:SURFACE_RELATIONS_SHADER;
+  const directSource=preparation==='generic-direct'&&voxelEntry?SURFACE_RELATIONS_GENERIC_DIRECT_VOXEL_SHADER:preparation==='generic-direct-ordinary'&&!batched?SURFACE_RELATIONS_GENERIC_DIRECT_ORDINARY_SHADER:(preparation==='generic-direct'||preparation==='generic-direct-ordinary')&&(entry==='boundaries'||entry==='contours')?SURFACE_RELATIONS_GENERIC_DIRECT_SHADER:SURFACE_RELATIONS_SHADER;
   const entryPoint=entry==='boundariesVoxel'?'boundariesVoxel':entry==='contoursVoxel'?'contoursVoxel':entry;
   const code=batched?isolateComputeEntry(batchSource,entry):isolateComputeEntry(directSource,entryPoint);
   plans.set(entry,()=>{const module=device.createShaderModule({label:'MAIN attributed source relations '+entry,code});
@@ -3466,7 +3509,7 @@ export class SurfaceRelations {
     // dispatches every queued source's stage at once. A second use of the same
     // batch in one frame keeps the per-source path (its tensor would be shared).
     const batched=!!shared&&!!extent&&this.interior&&!!this.queue&&!!batch.source.visibleInstances&&batch.source.posedRevision!==undefined&&!this.queue.seen.has(posedBatchIdentity(batch));
-    if(this.preparation==='generic-direct'&&extent)throw Error('Generic-direct relation preparation does not accept a host extent');
+    if((this.preparation==='generic-direct'||this.preparation==='generic-direct-ordinary')&&extent)throw Error('Generic-direct relation preparation does not accept a host extent');
     if(this.preparation==='physical-batched'&&(isGpuIndexedResident(source)||!batched))throw Error('Physical-batched relation preparation requires a non-GPU-indexed host batch with extent, visibility frontier and posed revision');
     const entry=batched?undefined:this.bindings(source,batch);
     const ownerKey=nativeAdmitted?'native-frontier':selectedOwners===undefined?'':owners.join(',');
@@ -3514,10 +3557,16 @@ export class SurfaceRelations {
     }
     const indexed=isGpuIndexedResident(source)?source.gpu:undefined;
     const posedContacts=indexed?.edgeContactClass==='posed-coincident'&&indexed.topology.indexPattern==='independent-quads'&&batch.source.instanceCapacity===1;
-    const boundaryStage=this.preparation==='generic-direct'&&posedContacts?'boundariesVoxel':'boundaries';
-    const contourStage=this.preparation==='generic-direct'&&posedContacts?'contoursVoxel':'contours';
+    // Compatibility callers also own posed contacts/charts. Only the
+    // explicitly fine-only profile disables them; specialized voxel entries
+    // belong to generic-direct, not to the compatibility map.
+    const producerCapable=this.preparation!=='generic-direct-ordinary'&&this.preparation!=='physical-batched';
+    const voxelSpecialized=this.preparation==='generic-direct';
+    const fineOnlyOrdinary=this.preparation==='generic-direct-ordinary';
+    const boundaryStage=voxelSpecialized&&posedContacts?'boundariesVoxel':'boundaries';
+    const contourStage=voxelSpecialized&&posedContacts?'contoursVoxel':'contours';
     const contactEdges=posedContacts?sourceResidencyEdgeCount(source):0;
-    const parts=posedContacts&&earlyDetail?indexed?.parts:undefined;
+    const parts=producerCapable&&posedContacts&&earlyDetail?indexed?.parts:undefined;
     let contactSlots=0,contactWords=1,baselineContactWords=1,residualWords=0,residualEnabled=false;
     let allowPersistentHome=true;
     let plannedHomeLevels:readonly number[]|undefined;
@@ -3525,8 +3574,8 @@ export class SurfaceRelations {
     let plannedHomeWords=0;
 
     // rest-cell chart of THIS generation), when its dense tables are bounded. Never both: parts win.
-    const surfaceChart=posedContacts&&earlyDetail&&!parts?currentRestCellChart(indexed):undefined;
-    const chart=posedContacts?(parts?cellChart(parts.extent):surfaceChart?cellChart(surfaceChart.extent):undefined):undefined;
+    const surfaceChart=producerCapable&&posedContacts&&earlyDetail&&!parts?currentRestCellChart(indexed):undefined;
+    const chart=producerCapable&&posedContacts?(parts?cellChart(parts.extent):surfaceChart?cellChart(surfaceChart.extent):undefined):undefined;
     const chartCodes:SourceStorageBinding|undefined=parts?.cellCodes??(chart?surfaceChart?.vertexCellCodes:undefined);
     const occupancy=chart?chartOccupancy(indexed,(parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]):undefined;
     new Uint32Array(floats.buffer)[31]=chartToken(batch,source,!!chart);
@@ -3623,7 +3672,7 @@ export class SurfaceRelations {
     buffers[18]=occupancy?.columns??this.status;
     buffers[19]=this.partAnchorAlloc;
     (buffers as RelationBinding[])[17]=this.partAnchorBuffer??this.partAnchorAlloc;
-    const used:Record<string,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,...SURFACE_CONTACT_BINDINGS,prepare:[0,1,2,3,4,5,6,7,8,10,11],boundaries:this.preparation==='generic-direct'?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],boundariesVoxel:[0,1,2,3,4,5,6,8,10,11,12,15],contours:this.preparation==='generic-direct'?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],contoursVoxel:[0,1,2,3,4,5,6,8,10,12,15]};
+    const used:Record<string,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,...SURFACE_CONTACT_BINDINGS,prepare:[0,1,2,3,4,5,6,7,8,10,11],chartEmit:this.preparation==='generic-direct'?[0,1,2,3,4,5,6,8,10,12,15]:SURFACE_CONTACT_BINDINGS.chartEmit,boundaries:this.preparation==='generic-direct-ordinary'?[0,1,2,3,4,5,6,8,10,11,12,15]:this.preparation==='generic-direct'?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],boundariesVoxel:[0,1,2,3,4,5,6,8,10,11,12,15],contours:(this.preparation==='generic-direct'||this.preparation==='generic-direct-ordinary')?[0,1,2,3,4,5,6,8,10,11,15]:[0,1,2,3,4,5,6,8,10,11,12,15],contoursVoxel:[0,1,2,3,4,5,6,8,10,12,15]};
     (buffers as RelationBinding[])[10]={view:this.lineDetailView(earlyDetail)};
     (buffers as RelationBinding[])[15]={view:this.contactPatchView()};
     const anchors=this.partAnchorsFor(batch,source);
@@ -3658,20 +3707,30 @@ export class SurfaceRelations {
     const indirect=(stage:string,offset?:number)=>{const pipeline=this.pipelines[stage]!,bindings=used[stage]!;pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(held.groups,stage,pipeline,bindings,buffers));if(offset===undefined)pass.dispatchWorkgroups(1);else pass.dispatchWorkgroupsIndirect(this.dispatch,offset);};
     if((posedContacts&&!host)||frontierAdmitted){
       indirect('prepare');
-      if(posedContacts){
+      if(posedContacts&&producerCapable){
         indirect('contactClear',24);indirect('voxelVote',84);indirect('voxelHome',96);indirect('voxelBin',108);indirect('chartCorners',120);indirect('chartCertify',132);indirect('chartSelectStage',48);indirect('chartEmit',132);direct('chartPublish',1,held.groups,used.chartPublish!,buffers);indirect('contactVertices',36);indirect('contactEdges',48);
+      }else if(posedContacts&&fineOnlyOrdinary){
+        // Fine-only late producers still need posed contact/canonical ports,
+        // but have no chart, residual or voxel stages in this profile.
+        indirect('contactClear',24);indirect('contactVertices',36);indirect('contactEdges',48);
       }
     }else if(posedContacts){
-      direct('contactClear',contactWords,held.groups,used.contactClear!,buffers);
-      direct('voxelVote',faces*2,held.groups,used.voxelVote!,buffers);
-      direct('voxelHome',home?chartHomeWords(home.levels):0,held.groups,used.voxelHome!,buffers);
-      direct('voxelBin',contactEdges,held.groups,used.voxelBin!,buffers);
-      direct('chartCorners',faces*2,held.groups,used.chartCorners!,buffers);
-      direct('chartCertify',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartCertify!,buffers);
-      direct('chartSelectStage',contactEdges,held.groups,used.chartSelectStage!,buffers);
-      direct('chartEmit',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartEmit!,buffers);
-      direct('chartPublish',1,held.groups,used.chartPublish!,buffers);
-      indirect('contactVertices',36);indirect('contactEdges',48);
+      if(producerCapable){
+        direct('contactClear',contactWords,held.groups,used.contactClear!,buffers);
+        direct('voxelVote',faces*2,held.groups,used.voxelVote!,buffers);
+        direct('voxelHome',home?chartHomeWords(home.levels):0,held.groups,used.voxelHome!,buffers);
+        direct('voxelBin',contactEdges,held.groups,used.voxelBin!,buffers);
+        direct('chartCorners',faces*2,held.groups,used.chartCorners!,buffers);
+        direct('chartCertify',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartCertify!,buffers);
+        direct('chartSelectStage',contactEdges,held.groups,used.chartSelectStage!,buffers);
+        direct('chartEmit',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartEmit!,buffers);
+        direct('chartPublish',1,held.groups,used.chartPublish!,buffers);
+        indirect('contactVertices',36);indirect('contactEdges',48);
+      }else if(fineOnlyOrdinary){
+        direct('contactClear',contactWords,held.groups,used.contactClear!,buffers);
+        direct('contactVertices',Math.max(faces*2,anchorParts),held.groups,used.contactVertices!,buffers);
+        direct('contactEdges',contactEdges,held.groups,used.contactEdges!,buffers);
+      }
     }
 
     // R48: once the form table is available, prepareIn writes the exact mixed

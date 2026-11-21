@@ -9,7 +9,7 @@ import {composeGlobalTransform} from '@dylanebert/shallot/transform';
 import type {CompositionGeometry} from './composition.ts';
 import nativeFont from './native-glyphs.json' with {type:'json'};
 import {MaterialGeometryTransport,type MaterialGeometryDraw,type RetainedMaterialGeometryBatch} from './geometry.ts';
-import {prepareExampleGpuServices} from './gpu-startup.ts';
+import {prepareExampleGpuServices,type ExampleGpuRelationProfile} from './gpu-startup.ts';
 import type {SourceConstructionClass} from './gpu-construction-runs.ts';
 import type {SourceFarForms} from './gpu-source-far-forms.ts';
 import {SurfaceRelations,RELATION_WORDS,type PartAnchorDemandReadback} from './surface-relations.ts';
@@ -83,6 +83,16 @@ interface MainState {
 let nextWorld=0;
 const stateKey={create:()=>({current:undefined as MainState|undefined})};
 const glyphs=nativeFont.glyphs;
+
+/** Admit the relation capability from registered producer metadata after all
+ * scene/plugin initialize hooks and before MAIN prepares its GPU closures. */
+export function exampleGpuRelationProfile(world:World):ExampleGpuRelationProfile{
+ for(const mesh of world.resource(Meshes).values()){
+  const source=mesh.gpuIndexedSource;
+  if(source?.edgeContactClass==='posed-coincident'&&source.topology.indexPattern==='independent-quads')return 'producer-capable';
+ }
+ return 'ordinary';
+}
 
 function fail(state:MainState,error:unknown):void{
   const message=error instanceof Error?error.message:String(error);if(state.controller.errors.at(-1)===message)return;state.controller.errors.push(message);if(state.controller.errors.length>64)state.controller.errors.shift();console.error('MAIN construction:',message);
@@ -890,7 +900,7 @@ export function mainRenderer(options:{ascii?:boolean;rows?:number;geometryCapaci
 
       {name:'MAIN/PresentationGate',group:'draw',first:true,after:[PrepareViewsSystem],before:[BeginFrameSystem],update:presentationGate},
       {name:'MAIN/Geometry',group:'draw',after:[MainPassSystem],before:[TonemappingSystem],update:build}],
-    async initialize(world,onProgress){
+    async warm(world,onProgress){
       const device=world.gpu.device!;
       const startupNotice=createFrameStateNotice(document.body,applyMobileUiAppearance),startupSince=Date.now();
       let startupDisposed=false,startupFailed=false,startupHandedOff=false;
@@ -917,7 +927,11 @@ export function mainRenderer(options:{ascii?:boolean;rows?:number;geometryCapaci
 
       // ?grammar=legacy keeps the CPU producer reachable until it is deleted.
       const compiled=options.compiledPlayback??new URL(location.href).searchParams.get('grammar')!=='legacy';
-      const services=await prepareExampleGpuServices(device,options.geometryCapacity??1048576,compiled,(p,stage)=>{publishStartup(stage);onProgress?.(p/2);},startupAbort.signal);
+      // All scene/plugin initialize hooks have completed before warm. Admit
+      // the relation capability from registered mesh producers now, so the
+      // required shader closure is compiled before the first frame.
+      const relationProfile=exampleGpuRelationProfile(world);
+      const services=await prepareExampleGpuServices(device,options.geometryCapacity??1048576,compiled,(p,stage)=>{publishStartup(stage);onProgress?.(p/2);},startupAbort.signal,relationProfile);
       let state:MainState;
       try{state={matrix,displayedSnapshots:new Map(),retiredSnapshots:[],world:++nextWorld,transport:services.transport,graph:services.graph,sources:services.sources,visibility:services.visibility,relationExtent:32768,intervalExtents:[131072,131072],construction:new NativeConstruction(glyphs,options.whitespace??'preformatted'),primaryFields:new WeakMap(),lodLifetimes:new FormLodLifetimes(),fields:new Map(),blit:new TextureBlit(device),mask:services.mask,targets:new Map(),jobs:[],controller:{ascii:options.ascii??true,overlay:new URL(location.href).searchParams.get('overlay')==='1',mode:'text',pendingSince:startupSince,get rows(){return matrix.rows;},set rows(rows){if(rows!==undefined&&(!Number.isInteger(rows)||rows<1||rows>matrix.maxRows))throw Error(`Rows must be an integer from 1 to ${matrix.maxRows}`);matrix.rows=rows;},get pending(){const published=this.frames.size>0||this.residentFrames.size>0;return !state.disposed&&(!published||!!state.registration||this.paused&&!state.pauseLatched||[...state.targets.values()].some(target=>target.pending));},get pendingStage(){if(state.registration)return 'Compiling visible sources';if([...state.targets.values()].some(target=>target.pending))return 'Publishing text frame';return undefined;},underlay:new URL(location.href).searchParams.get('underdrawing')==='1',paused:false,pause(paused){if(paused===this.paused)return;state.pauseLatched=false;this.paused=paused;if(paused)world.pause();else world.resume();},frames:new Map(),residentFrames:new Map(),async exportText(){const entries=[...state.displayedSnapshots];if(!entries.length)return [...this.frames.values()];return Promise.all(entries.map(async([target,snapshot])=>{const frame={...await exportResidentFrame(snapshot),comparison:snapshot.comparison};if(state.displayedSnapshots.get(target)===snapshot)this.frames.set(target,frame);return frame;}));},requestPresentation(){return presentationLedger(this).demand();},graphs:new Map(),errors:[]},serial:0,disposed:false,liveOwners:new Set(),semanticOwners:new Set(),pauseLatched:false};}
       catch(error){services.dispose();throw error;}

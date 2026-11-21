@@ -70,7 +70,14 @@ export interface ExampleGpuServices {
  readonly transport:MaterialGeometryTransport;readonly graph:SurfaceRelations;readonly sources:MeshSourceCache<SourceComplexRetention>;
  readonly visibility:[RelationVisibility,RelationVisibility];readonly mask:ConstructionMask;dispose():void;
 }
-export async function prepareExampleGpuServices(device:GPUDevice,geometryCapacity:number,compiled:boolean,progress?:ComputePipelineProgress,signal?:AbortSignal):Promise<ExampleGpuServices>{
+export type ExampleGpuRelationProfile='ordinary'|'producer-capable';
+/** Map warm-time source capability admission to one closed GPU preparation
+ * graph. Ordinary worlds omit producer-only boundary entries; producer-
+ * capable worlds retain both ordinary and posed-quad closures. */
+export function surfaceRelationPreparation(profile:ExampleGpuRelationProfile):'generic-direct'|'generic-direct-ordinary'{
+ return profile==='producer-capable'?'generic-direct':'generic-direct-ordinary';
+}
+export async function prepareExampleGpuServices(device:GPUDevice,geometryCapacity:number,compiled:boolean,progress?:ComputePipelineProgress,signal?:AbortSignal,relationProfile:ExampleGpuRelationProfile='ordinary'):Promise<ExampleGpuServices>{
  await prepareFieldPrograms(device,(p,stage)=>progress?.(p/4,stage),signal);
  if(compiled){
   if(signal?.aborted)throw signal.reason??Error('MAIN world retired during source-far preparation');
@@ -83,7 +90,7 @@ export async function prepareExampleGpuServices(device:GPUDevice,geometryCapacit
   // MAIN's shared example caller appends direct sources without the
   // host-sized extent/frontier contract. Keep the public generic default for
   // other consumers, but explicitly avoid preparing unused batch kernels here.
-  graph:p=>SurfaceRelations.create(device,32768,compiled,p,'generic-direct'),
+  graph:p=>SurfaceRelations.create(device,32768,compiled,p,surfaceRelationPreparation(relationProfile)),
   sources:p=>MeshSourceCache.create(device,'gpu-csr',compiled?'summary':'full',p),
   visibilitySingle:p=>RelationVisibility.create(device,32768,131072,false,p),
   visibilityMultisampled:p=>RelationVisibility.create(device,32768,131072,true,p),
