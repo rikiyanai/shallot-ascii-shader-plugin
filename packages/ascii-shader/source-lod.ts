@@ -1,6 +1,7 @@
 import {FAR_STRIP_BELOW_ROWS,LOD_TIER_HOLD} from './form-depths.ts';
 import {latticeOpening} from './compiled-construction-topology.ts';
 import type {SourceSmallParent} from './source-small-parent.ts';
+import {aliasCoherentParentProduct,CoherentParentCache,isCoherentParentRejected,type CoherentParentMember} from './coherent-parent-union.ts';
 
 
 
@@ -115,7 +116,7 @@ export interface SourceWholeConstruction {
 }
 
 /**
- * A required contact is an open, source-owned path. It is not a closed native
+ * A required contact is an open, source-owned path.  It is not a closed native
  * part: when it occupies one page row the resident whole-part bank quite
  * correctly has no two-anchor height variant, but the far source-part emitter
  * can still carry the ordered contact segment into the shared path consumer.
@@ -165,21 +166,47 @@ const bindOpening=(value:SourceWholeOpeningTemplate,mesh:number,eid:number,world
 /** Bind one immutable source template to one posed instance. This is a pure
  * identity adapter: no camera, mesh scan, glyph lookup or source recompilation
  * occurs here. */
+const boundWholeConstructions=new WeakMap<SourceWholeConstructionTemplate,Map<string,{readonly pose:readonly number[]|undefined;readonly construction:SourceWholeConstruction}>>();
 export function bindSourceWholeConstruction(template:SourceWholeConstructionTemplate|undefined,mesh:number,eid:number,worldFromSource?:ArrayLike<number>):SourceWholeConstruction|undefined{
  if(!template||!Number.isSafeInteger(mesh)||!Number.isSafeInteger(eid))return;
+ let bindings=boundWholeConstructions.get(template);if(!bindings){bindings=new Map();boundWholeConstructions.set(template,bindings);}
+ const key=`${mesh}:${eid}:${template.revision}`,cached=bindings.get(key);
+ const incomingPose=worldFromSource;
+ const samePose=cached&&(incomingPose===undefined?cached.pose===undefined:!!cached.pose&&cached.pose.length===incomingPose.length&&cached.pose.every((value,index)=>value===incomingPose[index]));
+ if(samePose)return cached.construction;
  if(template.parts.some(part=>part.sourceContributors.length===0)||[...template.openings,...template.contacts,...template.protectedVoids,...(template.paper??[])].some(value=>value.sourceContributors.length===0))return;
+ // Engine matrix views are mutable. The generation-owned bound construction
+ // must retain its own pose, otherwise the cache and an in-flight native job
+ // would silently observe a later pose through the same array identity.
+ const pose=worldFromSource===undefined?undefined:Array.from(worldFromSource);
+ worldFromSource=pose;
  const bindParts=template.parts.map(part=>({feature:part.feature,entryRef:part.entryRef,context:part.context,role:part.role,ports:part.ports,contributors:[[mesh,eid] as const],...(part.geometry?{geometry:part.geometry,closed:part.closed}:{}),...(worldFromSource?{worldFromSource}:{}),...(part.paper?{paper:part.paper.flatMap(value=>{const bound=bindOpening(value,mesh,eid,worldFromSource);return bound?[bound]:[];})}: {})}));
  const bindList=(values:readonly SourceWholeOpeningTemplate[])=>values.flatMap(value=>{const bound=bindOpening(value,mesh,eid,worldFromSource);return bound?[bound]:[];});
- return {revision:template.revision,parts:bindParts,openings:bindList(template.openings),contacts:bindList(template.contacts),protectedVoids:bindList(template.protectedVoids),...(template.paper?{paper:bindList(template.paper)}:{}),...(template.compound?{compound:template.compound}:{})};
+ const construction={revision:template.revision,parts:bindParts,openings:bindList(template.openings),contacts:bindList(template.contacts),protectedVoids:bindList(template.protectedVoids),...(template.paper?{paper:bindList(template.paper)}:{}),...(template.compound?{compound:template.compound}:{})};
+ if(bindings.size>=65536)bindings.delete(bindings.keys().next().value!);
+ bindings.set(key,{pose,construction});return construction;
 }
 /** Selection uses mesh handles; native fields use resident source domains
  * (and producer owner tags). Convert identities at that adapter seam, without
  * changing source features, geometry, pose, or anchor correspondence. */
+const remappedWholeConstructions=new WeakMap<SourceWholeConstruction,{readonly contributors:readonly (readonly [number,number])[];readonly residents:Map<string,SourceWholeConstruction>}>();
 export function remapSourceWholeConstruction(value:SourceWholeConstruction|undefined,owner:(mesh:number,eid:number)=>readonly [number,number]|undefined):SourceWholeConstruction|undefined{
  if(!value)return;
+ let memo=remappedWholeConstructions.get(value);
+ if(!memo){
+  const unique=new Map<string,readonly [number,number]>();
+  const collect=(items:readonly {readonly contributors:readonly (readonly [number,number])[]}[])=>{for(const item of items)for(const pair of item.contributors)unique.set(`${pair[0]}:${pair[1]}`,pair);};
+  collect(value.parts);for(const part of value.parts)collect(part.paper??[]);
+  collect([...value.openings,...value.contacts,...value.protectedVoids,...(value.paper??[])]);
+  memo={contributors:[...unique.values()],residents:new Map()};remappedWholeConstructions.set(value,memo);
+ }
+ const mappedOwners=new Map<string,readonly [number,number]>();
+ for(const [mesh,eid] of memo.contributors){const mapped=owner(mesh,eid);if(!mapped)return;mappedOwners.set(`${mesh}:${eid}`,mapped);}
+ const mappingKey=[...mappedOwners.values()].map(pair=>`${pair[0]}:${pair[1]}`).join('|'),cached=memo.residents.get(mappingKey);
+ if(cached)return cached;
  const pairs=(contributors:SourceWholePartRef['contributors'])=>{
   const result:(readonly [number,number])[]=[];
-  for(const [mesh,eid] of contributors){const mapped=owner(mesh,eid);if(!mapped)return;result.push(mapped);}
+  for(const [mesh,eid] of contributors){const mapped=mappedOwners.get(`${mesh}:${eid}`);if(!mapped)return;result.push(mapped);}
   return result;
  };
  const openings=(values:readonly SourceWholeOpening[])=>{
@@ -195,7 +222,10 @@ export function remapSourceWholeConstruction(value:SourceWholeConstruction|undef
  }
  const knownOpenings=openings(value.openings),contacts=openings(value.contacts),protectedVoids=openings(value.protectedVoids),paper=value.paper?openings(value.paper):undefined;
  if(!knownOpenings||!contacts||!protectedVoids||(value.paper&&!paper))return;
- return {...value,parts,openings:knownOpenings,contacts,protectedVoids,...(paper?{paper}:{}),...(value.compound?{compound:value.compound}:{})};
+ const resident={...value,parts,openings:knownOpenings,contacts,protectedVoids,...(paper?{paper}:{}),...(value.compound?{compound:value.compound}:{})};
+ aliasCoherentParentProduct(value,resident);
+ if(memo.residents.size>=8)memo.residents.delete(memo.residents.keys().next().value!);
+ memo.residents.set(mappingKey,resident);return resident;
 }
 export interface SourceLodAggregate {
  readonly key:number;readonly box:readonly [number,number,number,number];
@@ -316,6 +346,8 @@ const instanceSourceRevision=(instance:SourceLodInstance):number|undefined=>inst
 export class ParentGroupCache{
  private readonly nodes=new Map<number,{members:readonly CachedMember[];groups:readonly (readonly number[])[];ids:readonly number[]}>();
  private readonly ids=new Map<string,number>();private next=1;
+ /** Source unions are generation-owned; camera selection reuses them. */
+ readonly coherentParents=new CoherentParentCache();
  /** Entries beyond these bounds are dropped wholesale: ids then re-allocate,
   * so a hold restarts at the entry band (conservative), never inherits. */
  static readonly MAX_NODES=16384;static readonly MAX_IDS=65536;
@@ -424,6 +456,12 @@ export function sourceWholeConstructionReady(value:SourceWholeConstruction|undef
  * metadata remains conservative and descends to children. */
 export function sourceWholeConstructionRenderable(value:SourceWholeConstruction|undefined):value is SourceWholeConstruction{
  if(!sourceWholeConstructionReady(value))return false;
+ // A resident product may have passed CPU admission and still be rejected by
+ // the actual far producer (coverage, native lowering, or allocation).  Keep
+ // the product out of both renderable and executable paths so selectSourceLod
+ // descends to the complete incumbent children on the next same-pose replay;
+ // never turn a rejected parent into an undefined/legacy skyline.
+ if(isCoherentParentRejected(value))return false;
  const relation=[...value.openings,...value.contacts,...value.protectedVoids,...(value.paper??[])];
  // A relation is a replacement construction, not a hint to inherit the first
  // part's native turn.  If its own compiled passage is incomplete, the caller
@@ -601,6 +639,13 @@ export function smallParentPoseSupported(instance:SourceLodInstance,clip:ArrayLi
 export function selectSourceLod(instances:readonly SourceLodInstance[],clip:ArrayLike<number>,width:number,height:number,pageWidth:number,pageHeight:number,exterior:boolean,perspective:boolean,parents:readonly SourceLodParent[]=[],held:ReadonlySet<number>=new Set(),profileSafe:(mesh:number)=>boolean=()=>false,identity:(eid:number)=>number=eid=>eid,cache:ParentGroupCache=new ParentGroupCache(),joinSingles=false,smallAvailable?:SmallConstructionAvailability,heldSmall:ReadonlySet<string>=new Set(),nativePart?:SourceWholeNativePartAdmission):SourceLodSelection{
  const far=new Map<number,FarFormInstance[]>(),defer=new Set<number>(),full=new Map<number,number[]>(),seen=new Set<number>(),aggregates:SourceLodAggregate[]=[],heldParents=new Set<number>();
  const smallOut=new Set<string>();
+ const compileSourceParent=(group:readonly SourceLodInstance[]):SourceWholeConstruction|undefined=>{
+  // A union may simplify a complete source product, not repair an invalid
+  // opening/contact certificate by rebuilding a different compound ledger.
+  if(group.some(instance=>!sourceWholeConstructionRenderable(instance.construction)))return;
+  const members:CoherentParentMember[]=group.map(instance=>({mesh:instance.mesh,eid:instance.eid,construction:instance.construction!,sourceRevision:instance.sourceRevision,poseRevision:instance.poseRevision}));
+  const result=cache.coherentParents.getOrCompile(members);return result.status==='parent'?result.product.construction:undefined;
+ };
  // Only a complete form smaller than ONE native cell may merge. A narrow
  // two-row house still holds its own construction, whatever its class.
  const maximumX=16*LOD_TIER_HOLD*width/Math.max(1,pageWidth),maximumY=17*LOD_TIER_HOLD*height/Math.max(1,pageHeight);
@@ -628,7 +673,7 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
 
   // aggregate (nothing inside one cell can be spelled as an opening).
   if(box&&!pending&&box[2]-box[0]<maximumX&&box[3]-box[1]<maximumY){
-   const construction=composeParentConstruction(node.instances);
+   const construction=compileSourceParent(node.instances);
    const executable=construction&&sourceWholeConstructionExecutable(construction,clip,width,height,pageWidth,pageHeight,nativePart);
 
    // that the old one-cell parent is unsafe. Only a known replacement that
@@ -681,7 +726,7 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
   const groupBox=unionBox(group.map(instance=>projectedBox(instance.bounds!,clip,width,height)));
   if(!groupBox||!parentBox(groupBox,held.has(groupKey)?PARENT_LEAVE_ROWS:PARENT_ENTER_ROWS,width,height,pageWidth,pageHeight)||
    !group.every(instance=>profileSafe(instance.mesh))||!parentAdequate(group,clip,width,height,pageWidth,pageHeight,groupBox))return false;
-  const construction=composeParentConstruction(group);
+  const construction=compileSourceParent(group);
   const executable=construction&&sourceWholeConstructionExecutable(construction,clip,width,height,pageWidth,pageHeight,nativePart);
   // Keep the certified incumbent parent while source-program compilation is
   // still old/unknown. A known partial/invalid replacement remains ineligible

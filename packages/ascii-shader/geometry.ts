@@ -366,7 +366,7 @@ export class MaterialGeometryTransport{
    * indirect slice. Prepare their counts together, then write the same posed
    * records directly from synthetic point fragments into bounded work windows.
    * Empty GPU slices issue no points and never clear/copy a capacity-sized MRT. */
-  encodeAll(encoder:GPUCommandEncoder,draws:readonly MaterialGeometryDraw[],consume:(batches:readonly RetainedMaterialGeometryBatch[])=>void):void{
+  encodeAll(encoder:GPUCommandEncoder,draws:readonly MaterialGeometryDraw[],consume:(batches:readonly RetainedMaterialGeometryBatch[])=>void,prepareWindows?:(windows:readonly (readonly RetainedMaterialGeometryBatch[])[])=>void):void{
     if(this.disposed)throw Error('MAIN geometry transport is disposed');
     const specs:{draw:MaterialGeometryDraw;capacity:number;first:number;bound:number}[]=[];
     for(const draw of draws){
@@ -387,7 +387,7 @@ export class MaterialGeometryTransport{
     const maximum=Math.min(this.device.limits.maxBufferSize,this.device.limits.maxStorageBufferBindingSize),bytes=specs.length*stride;
     // Metadata has no subject quota either. Extremely large command sets keep
     // the existing ordered source-sized transport rather than omit a draw.
-    if(bytes>maximum){for(const draw of draws)this.encode(encoder,draw,batch=>{consume([this.retain(encoder,batch)]);this.releaseBatches();});return;}
+    if(bytes>maximum){for(const draw of draws)this.encode(encoder,draw,batch=>{const retained=this.retain(encoder,batch);prepareWindows?.([[retained]]);consume([retained]);this.releaseBatches();});return;}
     const lease=this.metadataCursor++;let metadataPage=this.metadataPages[lease];
     if(!metadataPage||metadataPage.size<bytes){if(metadataPage)this.parameterImages.push(metadataPage);metadataPage=this.device.createBuffer({label:'MAIN native geometry batch metadata and indirect records',size:Math.min(maximum,2**Math.ceil(Math.log2(Math.max(stride,bytes)))),usage:GPUBufferUsage.STORAGE|GPUBufferUsage.UNIFORM|GPUBufferUsage.INDIRECT});this.metadataPages[lease]=metadataPage;}
     const layout=this.storageLayout??=this.device.createBindGroupLayout({entries:[
@@ -427,6 +427,12 @@ export class MaterialGeometryTransport{
       if(windowBytes>=8*1024*1024)endWindow();
     }
     endWindow();
+    // All retained batches are now immutable inputs for the relation owner.
+    // Publish the complete ordered window set once, before count preparation
+    // or the first transport pass. The callback receives the exact batch
+    // objects later passed to consume; it may pre-size per-window consumers
+    // without decoding geometry or allocating another GPU copy.
+    prepareWindows?.(windows.map(records=>records.map(record=>record.batch)));
     // All metadata is immutable for this encoder after this pass. The two
     // writable ranges of each record are disjoint and aligned; render binds
     // the same buffer only for uniform/indirect reads, never as writable.

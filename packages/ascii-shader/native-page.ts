@@ -103,7 +103,12 @@ export class NativePage {
         }
         if(!completeInk&&claimed.size!==glyph!.points.length)error(neighborhood.id,`unowned ink in ${candidate.id}`);
         const existing=identities.get(candidate.id);
-        if(existing&&(existing.x!==candidate.x||existing.row!==candidate.row||existing.text!==candidate.text))error(neighborhood.id,`conflicting occurrence identity ${candidate.id}`);
+        if(existing&&(existing.x!==candidate.x||existing.row!==candidate.row||existing.text!==candidate.text)){
+          // Keep the producer failure intact, but expose both conflicting
+          // inputs. Never stringify whole glyph masks or page-sized records.
+          const address=(value:NativeOccurrence)=>`${JSON.stringify(value.text)} x=${value.x} row=${value.row} spans=${JSON.stringify(value.contributions.slice(0,4).map(part=>part.parameter??null))}`;
+          error(neighborhood.id,`conflicting occurrence identity ${candidate.id}; frame ${serial}; first ${address(existing)}; next ${address(candidate)}`);
+        }
         identities.set(candidate.id,candidate);
         const key=`${candidate.row}:${candidate.x}`,shared=positions.get(key);
         if(shared){

@@ -258,7 +258,9 @@ function specializeSoftProducer(code:string,kind:'legacy'|'program'):string{
    const prologue=body.slice(start,end);
    if(start<0||end<0||!prologue.includes('programmedWholeSourcePart(')||!prologue.includes('softRunAnchor='))
     throw Error('Playback compiler legacy soft producer interface changed');
-   return (body.slice(0,start)+' softRunAnchor=finiteRunStart(run);\n'+body.slice(end)).replaceAll(',canonicalReady);',',false);');
+   return (body.slice(0,start)+' softRunAnchor=finiteRunStart(run);\n'+body.slice(end))
+    .replaceAll(',canonicalReady,nativeInstruction);',',false,0xffffffffu);')
+    .replaceAll(',canonicalReady);',',false);');
   });
   code=rewriteFunction(code,'softPortion',body=>{
    const start=' let base=run.range.x;let programFeature=runProgramFeature(run);var role=runRole(run);';
@@ -269,8 +271,11 @@ function specializeSoftProducer(code:string,kind:'legacy'|'program'):string{
 `+body.slice(to);
    body=body.replace(` var sourceA=canonical.a;var sourceB=canonical.b;
  if(!canonicalReady||canonical.valid==0u){sourceA=softWholeA(run,sourcePair);sourceB=softWholeB(run,sourcePair);}`,' var sourceA=softWholeA(run,sourcePair);var sourceB=softWholeB(run,sourcePair);');
-   body=removeUntil(body,` if(programFeature!=0u&&sourcePartPrepared(run)!=NONE&&programmedWholePart(runID,run,role,size,row,portion,seen,sourcePair,sourceQ,priority,canonicalReady,canonical)){return;}
-`,' // ONE UNIT PER RUN');
+   // This block belongs entirely to programmed playback. Its admission may
+   // evolve independently; remove it by its section interface, not a frozen
+   // predicate. The remaining retained-word branches are impossible here.
+   body=removeUntil(body,' // Programmed source parts consume',' // ONE UNIT PER RUN');
+   if(body.includes('retainedSource'))body=body.replace(' // ONE UNIT PER RUN',' let retainedSource=false;\n // ONE UNIT PER RUN');
    body=body.replace(' var dir=select(softNativeDirection(chord),runDirection,programFeature!=0u&&!canonicalReady);',' var dir=softNativeDirection(chord);');
    body=body.replaceAll('(programFeature!=0u&&runProgramD5(run))||(programFeature==0u&&curvedRun&&abs(row-lastUprightRow)==1&&upright)','(curvedRun&&abs(row-lastUprightRow)==1&&upright)');
    body=body.replaceAll('(programFeature!=0u&&runProgramD5(run))||(programFeature==0u&&d5Swap(grammar[unit],row))','d5Swap(grammar[unit],row)');
@@ -291,7 +296,7 @@ function specializeSoftProducer(code:string,kind:'legacy'|'program'):string{
   // Retain the actual programmed row reader (including source-owned junction
   // assignment). Rebuilding this block here silently restored an older reader
   // after the source owner changed it. Only the impossible legacy branch goes.
-  let prologue=body.slice(at,to).replace(start,' let base=run.range.x;var role=runRole(run);var terrain=terrainRun(run);');
+  let prologue=body.slice(at,to).replace(start,' let base=run.range.x;let programFeature=runProgramFeature(run);var role=runRole(run);var terrain=terrainRun(run);');
   prologue=removeUntil(prologue,' if(programFeature==0u){',' else if(canonicalReady){');
   prologue=replace(prologue,' else if(canonicalReady){',' if(canonicalReady){');
   body=body.slice(0,at)+prologue+body.slice(to);
@@ -299,7 +304,8 @@ function specializeSoftProducer(code:string,kind:'legacy'|'program'):string{
 `,' // Programmed source parts consume');
   body=body.replace(' if(programFeature!=0u&&sourcePartPrepared(run)!=NONE&&programmedWholePart(runID,run,role,size,row,portion,seen,sourcePair,sourceQ,priority,canonicalReady,canonical)){return;}',' if(sourcePartPrepared(run)!=NONE&&programmedWholePart(runID,run,role,size,row,portion,seen,sourcePair,sourceQ,priority,canonicalReady,canonical)){return;}');
   body=body.replace(' var dir=select(softNativeDirection(chord),runDirection,programFeature!=0u&&!canonicalReady);',' var dir=select(softNativeDirection(chord),runDirection,!canonicalReady);');
-  body=removeUntil(body,' if(programFeature==0u&&abs(chord.y)>=9.0){',' let column=softColumn');
+  const columnMarker=body.includes(' var column=softColumn(table,role,size,dir);')?' var column=softColumn':' let column=softColumn';
+  body=removeUntil(body,' if(programFeature==0u&&abs(chord.y)>=9.0){',columnMarker);
   body=body.replaceAll('(programFeature!=0u&&runProgramD5(run))||(programFeature==0u&&curvedRun&&abs(row-lastUprightRow)==1&&upright)','runProgramD5(run)');
   body=body.replaceAll('(programFeature!=0u&&runProgramD5(run))||(programFeature==0u&&d5Swap(grammar[unit],row))','runProgramD5(run)');
   body=body.replaceAll('(programFeature!=0u&&runProgramD5(run))||(programFeature==0u&&d5Swap(grammar[record],row))','runProgramD5(run)');

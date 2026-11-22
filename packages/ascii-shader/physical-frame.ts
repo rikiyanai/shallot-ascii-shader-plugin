@@ -7,6 +7,7 @@ import {constructionSupports} from './construction-support.ts';
 import {FieldReadback,ResidentConstructionField,type ConstructionFieldReadback,type DrawingFieldView} from './field-readback.ts';
 import type {SurfaceField,SurfaceAttachment} from './surface-fields.ts';
 import {formDepths,type FormParentGroup,type FormSourceBound} from './form-depths.ts';
+import type {FormLodScope} from './form-lod-state.ts';
 import {FormLodLifetimes} from './form-lod-lifetimes.ts';
 import type {NativeLabel} from './semantic-text.ts';
 import type {PresentationMode} from './text/text-frame.ts';
@@ -26,9 +27,11 @@ import {compileSourceFaceMaterialClasses} from './source-material.ts';
 import type {MeshSourceComplex} from './source-complex.ts';
 import {sourceResidencyEdgeCount} from './source-transfer.ts';
 import {exportResidentFrame,type ResidentFrameState,type ResidentNativeSnapshot,residentFrameState} from './resident-native-frame.ts';
-import {ParentGroupCache,ParentHolds,remapSourceWholeConstruction,type SourceLodSelection} from './source-lod.ts';
+import {ParentGroupCache,ParentHolds,remapSourceWholeConstruction,type FarFormInstance,type SourceLodSelection} from './source-lod.ts';
+import {isCoherentParentRejected} from './coherent-parent-union.ts';
 import type {SourceFarForms} from './gpu-source-far-forms.ts';
 import {discardPartAnchorAttempt} from './part-anchor-replay.ts';
+import {gpuReadbackFailure} from './gpu-native-tape.ts';
 
 /** Retain this exact pose for deferred/relabelled native playback. The
  * direct snapshot pack reads the retained table as storage, not a copy-only
@@ -134,6 +137,52 @@ interface Job {
  pending?:readonly CompositionGeometry[];
  /** The same-view representation frontier consumed by articulation. */
  lod?:SourceLodSelection;
+ /** The exact form-table inputs retained with this field for a same-pose retry.
+  * A rejected coherent parent must clear the parent admission in the same
+  * field table before relations/articulation are encoded again. */
+ formScope?:FormLodScope;sourceBounds?:readonly FormSourceBound[];
+}
+
+/**
+ * Remove only GPU-rejected coherent parent products from a retained physical
+ * job. Their complete members become full producers; unrelated far members,
+ * ordinary overflow retries and the job's source/field pose stay untouched.
+ * The returned selection is immutable, so a retry cannot mutate the selection
+ * still held by a displayed or newer job.
+ */
+export function restoreRejectedParentChildren(lod:SourceLodSelection|undefined):SourceLodSelection|undefined{
+ if(!lod?.parents?.length)return lod;
+ const rejected=lod.parents.filter(parent=>isCoherentParentRejected(parent.construction));
+ if(!rejected.length)return lod;
+ const rejectedKeys=new Set(rejected.map(parent=>parent.key));
+ const full=new Map<number,readonly number[]>();
+ for(const [mesh,eids] of lod.full??[])full.set(mesh,[...eids]);
+ const addFull=(mesh:number,eid:number):void=>{
+  const eids=full.get(mesh)??[];
+  if(!eids.includes(eid))full.set(mesh,[...eids,eid]);
+ };
+ const far=new Map<number,readonly FarFormInstance[]>();
+ for(const [mesh,instances] of lod.far){
+  const retained:FarFormInstance[]=[];
+  for(const instance of instances){
+   if(instance.parent!==undefined&&rejectedKeys.has(instance.parent))addFull(mesh,instance.eid);
+   else retained.push(instance);
+  }
+  if(retained.length)far.set(mesh,retained);
+ }
+ for(const parent of rejected)for(const member of parent.members)addFull(member.mesh,member.eid);
+ const heldParents=lod.heldParents?new Set([...lod.heldParents].filter(key=>!rejectedKeys.has(key))):lod.heldParents;
+ return {...lod,far,full,parents:lod.parents.filter(parent=>!rejectedKeys.has(parent.key)),heldParents};
+}
+/** Build the exact parent-owner packet consumed by FormDepths for this
+ * physical source cohort. Producer rows are normalized to their field owner
+ * tag exactly as in the initial frame encode; ordinary entity owners retain
+ * their domain. Keeping this shared prevents a retry from dropping unrelated
+ * parents or changing the owner identity that formParentSelected hashes. */
+export function physicalFormParentGroups(lod:SourceLodSelection|undefined,parentDomains:ReadonlySet<number>):readonly FormParentGroup[]{
+ return (lod?.parents??[]).map(node=>({members:node.members.map(member=>[
+  (parentDomains.has(member.mesh)?((member.mesh|0x80000000)>>>0):member.mesh),member.eid
+ ] as const)}));
 }
 interface DisplayedResident {snapshot:ResidentNativeSnapshot;targets:Targets;}
 interface DisplayedFrame {frame?:PhysicalTextFrame;resident?:DisplayedResident;targets:Targets;}
@@ -225,9 +274,15 @@ export class PhysicalFrame {
  // encode transfers retirement work to a host transaction. The host may
  // discard its callback, so that closure must never be the sole owner.
  private readonly retirementBatches=new Set<RetirementBatch>();
+ private readonly abandonedJobs=new Map<RetirementBatch,Job[]>();
  private lastEncode?:RetirementBatch;
  private shownSnapshot?:ResidentNativeSnapshot;
  private registration?:Promise<void>;private serial=0;private displayed?:DisplayedFrame;
+ /** Complete-incumbent relation pipelines are prepared only after a retained
+  * cohort proves it needs them. While this promise is pending, no new field
+  * job or relation writer is started; the previous publication remains the
+  * authoritative frame. */
+ private relationPreparation?:Promise<void>;
  // THE DRAWING'S SUN STEPS (crawl, 2026-11-11). A game's day cycle turns the
  // sun a little every frame (Y8: about 0.2 degrees a second). Every text
  // decision that reads the light (n.L bands, tone regions, shade sides) was
@@ -343,8 +398,8 @@ export class PhysicalFrame {
   else if(typeof location!=='undefined'&&new URL(location.href).searchParams.get('grammar')!=='legacy')throw Error('Compiled PhysicalFrame requires await PhysicalFrame.create()');
   // MEASUREMENT ONLY (T2(a) sizing, 2026-11-12): called by a review tool, never per frame.
   Object.assign(this.controller,{instanceCensus:()=>this.instanceCensus()});
-  Object.defineProperty(this.controller,'pending',{enumerable:true,get:()=>!this.disposed&&((this.controller.ascii&&!this.presented)||this.inflight.length>0||!!this.registration)});
-  Object.defineProperty(this.controller,'pendingStage',{enumerable:true,get:()=>this.registration?'Compiling visible sources':this.inflight.length?'Building text frame':!this.presented?'Waiting for first text frame':undefined});
+  Object.defineProperty(this.controller,'pending',{enumerable:true,get:()=>!this.disposed&&((this.controller.ascii&&!this.presented)||this.inflight.length>0||!!this.registration||!!this.relationPreparation)});
+  Object.defineProperty(this.controller,'pendingStage',{enumerable:true,get:()=>this.registration?'Compiling visible sources':this.relationPreparation?'Preparing complete source relations':this.inflight.length?'Building text frame':!this.presented?'Waiting for first text frame':undefined});
   this.controller.pause=paused=>{this.controller.paused=paused;};
   this.gpuServices=prepared?.services;
   this.transport=this.gpuServices?.transport??new PhysicalSourceTransport(device,'gpu-csr',this.playback?'summary':'full');this.relations=this.gpuServices?.relations??new SurfaceRelations(device,32768,!!this.playback);this.visibility=this.gpuServices?.visibility??new RelationVisibility(device,32768,131072,false);
@@ -547,7 +602,20 @@ export class PhysicalFrame {
    const farForms:SourceFarForms={domain:0,instances:[],aggregates,producers:producerDomains.length?{domains:producerDomains,perspective}:undefined};
    classes.push({domain:0,type:'far-aggregate',topologyRevision:0,farForms});
   }
- private encodeRelations(encoder:GPUCommandEncoder,job:Job):void{
+ private beginRelationPreparation():void{
+  if(this.relationPreparation)return;
+  let preparation:Promise<void>;
+  try{preparation=this.relations.prepareNativeCompleteFallback();}
+  catch(error){const message=error instanceof Error?error.message:String(error);if(this.controller.errors.at(-1)!==message)this.controller.errors.push(message);this.controller.onState();return;}
+  this.relationPreparation=preparation;
+  void preparation.then(()=>{
+   if(this.relationPreparation===preparation){this.relationPreparation=undefined;this.started=undefined;this.controller.onState();}
+  },error=>{
+   if(this.relationPreparation===preparation)this.relationPreparation=undefined;
+   if(!this.disposed){const message=error instanceof Error?error.message:String(error);if(this.controller.errors.at(-1)!==message)this.controller.errors.push(message);this.controller.onState();}
+  });
+ }
+ private encodeRelations(encoder:GPUCommandEncoder,job:Job):boolean{
   this.relations.begin(encoder,job.sourceView,job.sourceField,2);
 
   // sources, so the owner gates (no-texel owner, far producer row) run here too.
@@ -565,6 +633,15 @@ export class PhysicalFrame {
   // the host (surface-relations.ts HOST-SIZED STAGE SETS).
   const extent=(source:PhysicalResidentBatch)=>({indices:source.source.geometry.indices.length,instances:source.batch.source.instanceCapacity!});
   this.relations.reservePartAnchors(seen);
+  // A tight device cohort may need the separate complete-incumbent native
+  // relation pipelines. Check immediately after host reservation and before
+  // frontier admission, contacts, relation passes, anchors, or any other
+  // relation writer. The
+  // current encoder is abandoned; the next host encoder retries this pose (or
+  // the current live pose after supersession) once preparation resolves.
+  if(this.relations.completeIncumbentFallbackNeeded()&&!this.relations.nativeCompleteFallbackReady()){
+   this.beginRelationPreparation();return false;
+  }
   // Final same-pose parent admission compacts each source frontier before
   // contacts are packed. Rejected candidates leave their incumbent children
   // in place; all later relation/anchor/interior consumers reuse this list.
@@ -604,7 +681,7 @@ export class PhysicalFrame {
    const literals:readonly ArticulationLiteral[]|ArticulationLiteralFeed=(job.tone?.immediate??job.toneMembers)?.length===0
     ?this.construction.playbackLiterals(job.labels,[],[])
     :{subscribe(resolve,reject){job.toneLiterals={resolve,reject};}};
-   job.played=this.playback.enqueueSource(encoder,this.visibility,classes,job.sourceField,width,height,'camera-0',job.view.owners,job.view.rect,literals,job.tone?.gpu,[],undefined,job.partAnchorTable);void job.played.catch(()=>{});return;
+   job.played=this.playback.enqueueSource(encoder,this.visibility,classes,job.sourceField,width,height,'camera-0',job.view.owners,job.view.rect,literals,job.tone?.gpu,[],undefined,job.partAnchorTable);void job.played.catch(()=>{});return true;
   }
   const size=16+job.capacity*RELATION_WORDS*4+job.intervalCapacity*16;
   if(size>this.device.limits.maxBufferSize)throw Error('Complete physical source readback needs device-sized chunks');
@@ -613,6 +690,7 @@ export class PhysicalFrame {
   encoder.copyBufferToBuffer(this.visibility.lines,0,staging,16,job.capacity*RELATION_WORDS*4);
   encoder.copyBufferToBuffer(this.visibility.intervals,0,staging,16+job.capacity*RELATION_WORDS*4,job.intervalCapacity*16);
   job.staging=staging;
+  return true;
  }
  // LABEL-ONLY JOB (frame cost, 2026-11-13). Every still-view input but the
  // labels equal (still(input,true)) and the kept full job displayed: only
@@ -671,7 +749,7 @@ export class PhysicalFrame {
    this.finish(job);
   }
  }
- private finish(job:Job):void{
+ private finish(job:Job,submitTransport=true):void{
   job.toneLiterals?.reject(Error('Native physical job retired'));job.toneLiterals=undefined;
   // The displayed full job keeps its tone members for label-only jobs.
   if(job.tone?.gpu&&!this.relabels.has(job)&&job===this.lastStartedJob&&this.displayed?.targets===job.targets&&this.kept?.job!==job){this.releaseKept();this.kept={job,tone:job.tone};}
@@ -684,7 +762,7 @@ export class PhysicalFrame {
   if(job.staging){if(job.staging.mapState==='mapped')job.staging.unmap();job.staging.destroy();job.staging=undefined;}
   // The source-pose buffers survive ALL allocation stages of this one job.
   // Only the terminal source fence releases them, never a new live tick.
-  this.transport.submitted();
+  if(submitTransport)this.transport.submitted();
  }
  private releaseKept():void{
   if(!this.kept)return;
@@ -696,7 +774,7 @@ export class PhysicalFrame {
   toneField(this.device).encodeReadbacks(input.encoder);
   this.playback?.encode(input.encoder);
   const started=performance.now();
-  const uniforms:GPUBuffer[]=[];const jobs:Job[]=[];let job:Job|undefined;
+  const uniforms:GPUBuffer[]=[];const jobs:Job[]=[];const abandoned:Job[]=[];let relationAttempt=false;let job:Job|undefined;
   // Own presentation allocations immediately, including an encode that
   // throws before it can return the host's submission callback.
   const retirement:RetirementBatch={buffers:uniforms,targets:[],snapshots:[],fields:[],outputs:[]};
@@ -709,7 +787,7 @@ export class PhysicalFrame {
    try{this.relations.ensureCapacity(extent.relations);if(extent.triangles)this.relations.ensureContactCapacity(extent.triangles);this.visibility.ensureCapacity(this.relations.lineCapacity,extent.intervals);}catch(error){report(error);}
   }
   for(const retained of this.inflight.filter(other=>other.retry)){
-   const extent=retained.retry!;retained.retry=undefined;
+   const extent=retained.retry!;
    try{
     if(extent.anchor)this.relations.ensurePartAnchorDemand(extent.anchor);
     if(extent.standingOwnerDemand!==undefined)this.playback?.ensureStandingOwnerCapacity(extent.standingOwnerDemand);
@@ -720,7 +798,19 @@ export class PhysicalFrame {
     // this exact pose is no longer resident. Its extents grew above; the
     // newer pose publishes, or a fresh job starts when none is in flight.
     if(this.posed!==retained.pose){this.started=undefined;this.settle(retained);continue;}
-    this.encodeRelations(input.encoder,retained);jobs.push(retained);
+    const restoredLod=restoreRejectedParentChildren(retained.lod);
+    if(restoredLod!==retained.lod){
+     retained.lod=restoredLod;
+     // FormDepths is field-owned and was already reduced for this retained
+     // pose. Re-run the same field/source-bound admission with no rejected
+     // parent groups before relations and articulation read it; otherwise the
+     // old parent bit would still suppress the restored child producers.
+     formDepths(this.device).encode(input.encoder,retained.sourceField,retained.formScope,
+      physicalFormParentGroups(retained.lod,new Set(retained.sources.map(source=>source.domain))),retained.sourceBounds??[]);
+    }
+    relationAttempt=true;
+    const encoded=this.encodeRelations(input.encoder,retained);
+    if(encoded){retained.retry=undefined;jobs.push(retained);}
    }catch(error){report(error);this.started=undefined;this.settle(retained);}
   }
   let sourcesReady=false,pending:readonly CompositionGeometry[]=[];
@@ -734,7 +824,7 @@ export class PhysicalFrame {
   // failure releases every resident of that cohort, so a new job here destroyed
   // the retry's published tape ("MAIN sealed native scalar tape" used in submit
   // while destroyed). The new job starts at the next host frame.
-  const busy=jobs.length>0||this.inflight.length>=(this.playback?PhysicalFrame.IN_FLIGHT:1)||this.inflight.some(other=>other.retry||this.relabels.has(other));
+  const busy=!!this.relationPreparation||jobs.length>0||this.inflight.length>=(this.playback?PhysicalFrame.IN_FLIGHT:1)||this.inflight.some(other=>other.retry||this.relabels.has(other));
   if(!busy&&!this.controller.paused&&!this.still(input)&&!(this.inflight.length===0&&(job=this.relabel(input)))){
    try{const admitted=this.admit(input);if(admitted){pending=admitted;sourcesReady=true;}}catch(error){const message=error instanceof Error?error.message:String(error);if(this.controller.errors.at(-1)!==message)this.controller.errors.push(message);this.controller.onState();}
   }
@@ -849,9 +939,7 @@ export class PhysicalFrame {
    // exact producer-tagged owner groups that this same pose may aggregate.
    // Unknown/interior views pass no groups and remain on the incumbent.
    const parentDomains=new Set(instances.map(instance=>instance.domain));
-   const parentGroups:FormParentGroup[]=(lod?.parents??[]).map(node=>({members:node.members.map(member=>[
-    (parentDomains.has(member.mesh)?((member.mesh|0x80000000)>>>0):member.mesh),member.eid
-   ] as const)}));
+   const parentGroups=physicalFormParentGroups(lod,parentDomains);
    const formScope=this.playback?this.lodLifetimes.scope('camera-0',this,TONE_ROW*source.height/input.height):undefined;
 
    // source-revision bound under its certified source/model pose (all eight
@@ -871,12 +959,23 @@ export class PhysicalFrame {
    job={serial,engineFrame:input.engineFrame,targets,read,tone,sunShadow:input.sunShadow,components,sources:instanceBatches,inView:this.transport.inView,sourceField:source,sourceView:{clipFromWorld:input.clipFromWorld.slice(),eye:pose.eye,direction:pose.forward,perspective:pose.perspective,pageExtent:[input.width,input.height]},capacity:0,intervalCapacity:0,
     inspection:full&&targets.inspection?{target:targets.inspection,field:{width:full.width,height:full.height,textures:full.field,worldFromClip:input.worldFromClip,sources:new Map(),attachments:[]}}:undefined,
     fieldSet:this.fieldRing.find(set=>set.field===targets.field),inspectionSet:full,pose:posed,pending,
-    geometry:geometries.map(g=>snapshots.get(g.owner)??{...g,worldFromSource:g.worldFromSource?.slice()}),labels:input.labels??[],mode:input.mode,cpuEncodeMs:0,view:{field:undefined as never,camera:'camera-0',rect,owners:new Map(),pose,light},lod};
+    geometry:geometries.map(g=>snapshots.get(g.owner)??{...g,worldFromSource:g.worldFromSource?.slice()}),labels:input.labels??[],mode:input.mode,cpuEncodeMs:0,view:{field:undefined as never,camera:'camera-0',rect,owners:new Map(),pose,light},lod,formScope,sourceBounds};
    // A full job overwrites the visibility buffers: label-only jobs of the kept job end here.
-   this.releaseKept();
-   this.encodeRelations(input.encoder,job);this.inflight.push(job);this.started=this.startKey(input,light,pending);this.lastStartedJob=job;
+   relationAttempt=true;
+   const encoded=this.encodeRelations(input.encoder,job);
+   if(encoded){
+    this.releaseKept();
+    this.inflight.push(job);this.started=this.startKey(input,light,pending);this.lastStartedJob=job;jobs.push(job);
+   }else{
+    // The source field and transport writes were encoded, but no relation
+    // consumer was legal yet. Keep the current publication authoritative and
+    // retire this unpublishable pair only after this host submission fence.
+    this.started=undefined;
+    abandoned.push(job);this.abandonedJobs.set(retirement,abandoned);this.retiredTargets.push(job.targets);
+    if(job.fieldSet){const index=this.fieldRing.indexOf(job.fieldSet);if(index>=0)this.fieldRing.splice(index,1);this.retiredFields.push(job.fieldSet);}
+    if(job.inspectionSet){const index=this.inspectionRing.indexOf(job.inspectionSet);if(index>=0)this.inspectionRing.splice(index,1);this.retiredFields.push(job.inspectionSet);}
+   }
   }
-  if(job)jobs.push(job);
   const shown=this.displayed;
   let nextPresented=this.presented;
   // EXTENT (resize, 2026-11-12). The blit scales its source to the host
@@ -907,6 +1006,7 @@ export class PhysicalFrame {
    else if(input.target)this.copy(input.encoder,inspect?mesh.comparison??this.paper():this.paper(),input.target,input.targetWidth,input.targetHeight,uniforms,stale(mesh));
   }
   else if(input.target){const pass=input.encoder.beginRenderPass({colorAttachments:[{view:input.target,loadOp:'clear',storeOp:'store',clearValue:{r:1,g:1,b:1,a:1}}]});pass.end();}
+  for(const abandonedJob of abandoned)if(this.meshOnly===abandonedJob.targets)this.meshOnly=undefined;
   const retiredBuffers=this.retiredBuffers.splice(0),retiredTargets=this.retiredTargets.splice(0),retiredSnapshots=this.retiredSnapshots.splice(0),retiredFields=this.retiredFields.splice(0),retiredOutputs=this.retiredOutputs.splice(0);
   for(const buffer of retiredBuffers)retirement.buffers.push(buffer);
   retirement.targets=retiredTargets;retirement.snapshots=retiredSnapshots;retirement.fields=retiredFields;retirement.outputs=retiredOutputs;
@@ -954,9 +1054,15 @@ export class PhysicalFrame {
     this.visibility.submitted();
     toneField(this.device).submitted();
     this.retireBatch(retirement,!this.disposed);this.publication.submitted();
-    if(jobs.length){this.relations.submitted();this.mask.submitted();}
+    if(jobs.length||relationAttempt){this.relations.submitted();this.mask.submitted();}
+   const pendingAbandoned=this.abandonedJobs.get(retirement)??[];this.abandonedJobs.delete(retirement);
+   for(const pending of pendingAbandoned)this.finish(pending,false);
+   if(pendingAbandoned.length&&!jobs.length)this.transport.submitted();
    }).then(()=>{for(const encoded of jobs)void this.collect(encoded).catch(error=>failed(encoded,error));},error=>{
     this.retireBatch(retirement,false);
+    const pendingAbandoned=this.abandonedJobs.get(retirement)??[];this.abandonedJobs.delete(retirement);
+    for(const pending of pendingAbandoned)this.finish(pending,false);
+    if(pendingAbandoned.length&&!jobs.length)this.transport.submitted();
     if(!jobs.length&&!this.disposed){const message=error instanceof Error?error.message:String(error);if(this.controller.errors.at(-1)!==message)this.controller.errors.push(message);this.controller.onState();}
     for(const encoded of jobs)failed(encoded,error);
    });
@@ -967,14 +1073,15 @@ export class PhysicalFrame {
   * earlier batches already have their own submission fence. */
  discardFrame():void{
   const batch=this.lastEncode;this.lastEncode=undefined;
-  if(batch)this.retireBatch(batch,false);
+  if(batch){this.retireBatch(batch,false);const abandoned=this.abandonedJobs.get(batch)??[];this.abandonedJobs.delete(batch);for(const job of abandoned)this.finish(job,false);if(abandoned.length)this.transport.submitted();}
  }
  private async collect(job:Job):Promise<void>{
   const staging=job.staging,relationReadback=job.relationReadback;
   try{
    if(this.playback){await this.collectRetained(job);return;}
    if(!staging&&!relationReadback)throw Error('Physical text job has no source graph readback');
-   const [field,packed]=await Promise.all([job.field?Promise.resolve(job.field):job.read.collect(),relationReadback?relationReadback.collect():staging!.mapAsync(GPUMapMode.READ).then(()=>undefined)]);if(this.disposed)return;job.field=field;
+   const packedReadback=relationReadback?relationReadback.collect():staging!.mapAsync(GPUMapMode.READ).catch(error=>{throw gpuReadbackFailure('physical source graph mapAsync',error,{lifecycle:this.disposed?'disposed':'active',frame:`${job.targets.width}x${job.targets.height}`,camera:'camera-0',count:'unavailable',capacity:job.capacity,bufferBytes:staging!.size});}).then(()=>undefined);
+   const [field,packed]=await Promise.all([job.field?Promise.resolve(job.field):job.read.collect(),packedReadback]);if(this.disposed)return;job.field=field;
    const memory=packed?.memory??staging!.getMappedRange(),status=new Uint32Array(memory,0,4);
    if(status[1]){
     const sourceCount=status[3]!,intervalCount=status[0]!;
@@ -1081,5 +1188,5 @@ export class PhysicalFrame {
   const frame=this.controller.frames.get(0);return frame?Promise.resolve(frame):new Promise((resolve,reject)=>this.waiting.add({resolve,reject}));
  }
  setTextSink(sink:((frame:PhysicalTextFrame)=>void)|null):void{this.sink=sink;}
- dispose():void{this.disposed=true;this.releaseKept();for(const batch of [...this.retirementBatches])this.retireBatch(batch,false);this.displayed?.resident?.snapshot.results.forEach(result=>result.resident?.release());this.playback?.dispose();this.construction.dispose();for(const job of this.inflight.splice(0)){job.snapshot?.results.forEach(result=>result.resident?.release());job.snapshot=undefined;this.finish(job);}this.sources.forEach(source=>this.release(source));this.sources.clear();this.fieldUniforms?.buffer.destroy();this.fieldUniforms=undefined;this.retiredBuffers.forEach(buffer=>buffer.destroy());for(const target of [...this.resources])this.destroy(target);for(const set of [...this.retiredFields.splice(0),...this.fieldRing.splice(0),...this.inspectionRing.splice(0)])this.destroyFields(set);this.paperTexture?.destroy();this.paperTexture=undefined;for(const texture of [...this.retiredOutputs.splice(0),...(this.shownOutput?[this.shownOutput]:[])])texture.destroy();this.shownOutput=undefined;if(this.gpuServices)this.gpuServices.dispose();else{this.transport.dispose();this.relations.dispose();this.visibility.dispose();this.mask.dispose();}this.publication.dispose();for(const request of this.waiting)request.reject(Error('MAIN physical source epoch was retired'));this.waiting.clear();}
+ dispose():void{this.disposed=true;this.releaseKept();for(const batch of [...this.retirementBatches])this.retireBatch(batch,false);for(const [batch,jobs]of this.abandonedJobs){this.abandonedJobs.delete(batch);for(const job of jobs)this.finish(job,false);if(jobs.length)this.transport.submitted();}this.displayed?.resident?.snapshot.results.forEach(result=>result.resident?.release());this.playback?.dispose();this.construction.dispose();for(const job of this.inflight.splice(0)){job.snapshot?.results.forEach(result=>result.resident?.release());job.snapshot=undefined;this.finish(job);}this.sources.forEach(source=>this.release(source));this.sources.clear();this.fieldUniforms?.buffer.destroy();this.fieldUniforms=undefined;this.retiredBuffers.forEach(buffer=>buffer.destroy());for(const target of [...this.resources])this.destroy(target);for(const set of [...this.retiredFields.splice(0),...this.fieldRing.splice(0),...this.inspectionRing.splice(0)])this.destroyFields(set);this.paperTexture?.destroy();this.paperTexture=undefined;for(const texture of [...this.retiredOutputs.splice(0),...(this.shownOutput?[this.shownOutput]:[])])texture.destroy();this.shownOutput=undefined;if(this.gpuServices)this.gpuServices.dispose();else{this.transport.dispose();this.relations.dispose();this.visibility.dispose();this.mask.dispose();}this.publication.dispose();for(const request of this.waiting)request.reject(Error('MAIN physical source epoch was retired'));this.waiting.clear();}
 }

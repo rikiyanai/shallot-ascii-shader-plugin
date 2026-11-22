@@ -6,6 +6,9 @@ import {FORM_DEPTH_WGSL,LOD_TIER_HOLD,formDepths} from './form-depths.ts';
 import {inverseMatrix} from './composition.ts';
 import type {SourceSmallParent} from './source-small-parent.ts';
 import {packSmallConstructionKindAndEnds} from './role-grammar-format.ts';
+import {withCoherentSourceParts} from './coherent-parent-gpu.ts';
+import {coherentParentProductOf} from './coherent-parent-union.ts';
+import {coherentCorrespondenceEntries,encodeCoherentCorrespondence,type CoherentCorrespondencePart} from './coherent-parent-correspondence.ts';
 
 
 
@@ -277,6 +280,8 @@ fn producerColumn(input:Input,local:u32){
 }
 `;
 
+/** Exact assembled module consumed by the runtime pipeline and validators. */
+export const SOURCE_FAR_FORMS_PIPELINE_SHADER=withCoherentSourceParts(SOURCE_FAR_FORMS_SHADER);
 const programs=new DeviceComputePrograms(device=>{
  const layout=device.createBindGroupLayout({label:'MAIN compiled far aggregates',entries:[
   {binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:'uniform'}},
@@ -288,7 +293,7 @@ const programs=new DeviceComputePrograms(device=>{
   {binding:8,visibility:GPUShaderStage.COMPUTE,buffer:{type:'read-only-storage'}},
  ]});
  return {resources:layout,plans:new Map([['emit',()=>({label:'MAIN compiled far aggregates',layout:device.createPipelineLayout({bindGroupLayouts:[layout]}),
-  compute:{entryPoint:'emit',module:device.createShaderModule({label:'MAIN source far forms',code:SOURCE_FAR_FORMS_SHADER})}})]])};
+  compute:{entryPoint:'emit',module:device.createShaderModule({label:'MAIN source far forms',code:SOURCE_FAR_FORMS_PIPELINE_SHADER})}})]])};
 });
 export async function prepareSourceFarForms(device:GPUDevice,progress?:ComputePipelineProgress):Promise<void>{await programs.prepare(device,progress);}
 const pairLess=(a:readonly [number,number],b:readonly [number,number])=>a[0]-b[0]||a[1]-b[1];
@@ -325,6 +330,11 @@ function relationParts(value:SourceWholeConstruction):SourceWholePartRef[]|undef
 const floatWord=new Float32Array(1),uintWord=new Uint32Array(floatWord.buffer);
 const floatBits=(value:number):number=>{floatWord[0]=value;return uintWord[0]!;};
 const IDENTITY_POSE=[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1] as const;
+const coherentCorrespondencePackets=new WeakMap<SourceWholeConstruction,Uint32Array>();
+interface PackedCoherentProgram {readonly words:Uint32Array;readonly parts:number;readonly revision:number;readonly signature:number;readonly correspondence:number;readonly mode:number;}
+// Only generation-owned coherent products qualify. Legacy callers may mutate
+// their ordinary construction objects and retain their existing packing path.
+const coherentSourcePrograms=new WeakMap<SourceWholeConstruction,PackedCoherentProgram>();
 const partCounts=(part:SourceWholeConstruction['parts'][number]):number=>(part.contributors.length|((part.geometry?.length??0)<<16)|(part.closed?0x80000000:0))>>>0;
 /** Missing pose is older metadata, never permission to project rest geometry
  * at the world origin. Keep the incumbent until the owning adapter is wired. */
@@ -349,7 +359,19 @@ export function farAggregateRecords(sources:readonly SourceFarForms[],rect:{x:nu
    // residency, so keep the incumbent parent profile until its replacement is
    // actually populated and connected.
    if(aggregate.construction&&!sourceWholeConstructionRenderable(aggregate.construction))continue;
-   rows.push({identity:[0,aggregate.key>>>0],members:[...aggregate.members].sort(pairLess),box:aggregate.box,mode:0,column:0,construction:aggregate.construction});
+   // Source-Lod owns aggregate members as named records. Lower them once at
+   // this producer seam to the tuple layout used by the resident member-key
+   // table; treating the records as iterables throws before the first frame.
+   const members=aggregate.members.map(member=>{
+    // The local far packet type is the resident tuple layout, while the
+    // source-lod adapter supplies its named `{mesh,eid}` records. Accept both
+    // at this lowering seam so the producer cannot throw on a valid selector
+    // result and the type remains honest for direct far callers.
+    if(Array.isArray(member))return [member[0]!,member[1]!] as const;
+    const named=member as unknown as {readonly mesh:number;readonly eid:number};
+    return [named.mesh,named.eid] as const;
+   }).sort(pairLess);
+   rows.push({identity:[0,aggregate.key>>>0],members,box:aggregate.box,mode:0,column:0,construction:aggregate.construction});
   }
   if(source.producers?.domains.length)producers=source.producers;
  }
@@ -362,13 +384,18 @@ export function farAggregateRecords(sources:readonly SourceFarForms[],rect:{x:nu
  // Every column record of the producer aggregate reads ONE shared domain list.
  const placed=new Map<object,number>();
  rows.forEach((row,i)=>{let offset=placed.get(row.members);if(offset===undefined){if(keyList.length&1)keyList.push(0);offset=keyList.length/2;placed.set(row.members,offset);for(const [a,b]of row.members)keyList.push(a>>>0,b>>>0);}
-  const base=i*16;inputs.set([row.identity[0]>>>0,row.identity[1]>>>0,offset,row.members.length],base);floats.set(row.box.slice(0,4),base+4);inputs.set([row.mode,row.column,0,posedProgram(row.construction)?2:row.construction?1:0],base+8);
+  const cachedProgram=row.construction?coherentSourcePrograms.get(row.construction):undefined;
+  const base=i*16;inputs.set([row.identity[0]>>>0,row.identity[1]>>>0,offset,row.members.length],base);floats.set(row.box.slice(0,4),base+4);inputs.set([row.mode,row.column,0,cachedProgram?.mode??(posedProgram(row.construction)?2:row.construction?1:0)],base+8);
   if(row.smallParent&&row.smallParent.positiveEnd!=='open'&&row.smallParent.negativeEnd!=='open'){
    const kindEnds=packSmallConstructionKindAndEnds(row.smallParent.kind,row.smallParent.positiveEnd,row.smallParent.negativeEnd);
    inputs[base+10]=kindEnds;inputs[base+11]=3;inputs[base+14]=row.sourceRevision??0;
   }
+  if(cachedProgram){
+   const programOffset=keyList.length;for(const word of cachedProgram.words)keyList.push(word);
+   inputs.set([programOffset,cachedProgram.parts,cachedProgram.revision,cachedProgram.signature],base+12);inputs[base+10]=cachedProgram.correspondence;return;
+  }
   if(row.construction){const sourceParts=row.construction.parts,relations=relationParts(row.construction);if(!relations)return;const parts=[...sourceParts,...relations],programOffset=keyList.length,hasRelations=relations.length>0,compound=!!row.construction.compound;const signature=()=>{let h=2166136261>>>0;const mix=(word:number)=>{h=Math.imul(h^(word>>>0),16777619)>>>0;};mix(row.construction!.revision);mix(parts.length);for(const [index,part] of parts.entries()){mix(part.feature);mix(part.entryRef);mix(part.context);mix(roleCode(part.role));mix((part.relationKind==='contact'?RELATION_CONTACT_BIT|RELATION_ROLE_BIT:part.relationKind?RELATION_ROLE_BIT:hasRelations?RELATION_PARENT_BIT:0)|(compound?COMPOUND_PARENT_BIT:0));mix(part.ports[0]);mix(part.ports[1]);const geometry=part.geometry??[],packed=partCounts(part);mix(packed);for(const contributor of part.contributors){mix(contributor[0]);mix(contributor[1]);}if(part.worldFromSource)for(const value of Array.from(part.worldFromSource))mix(floatBits(value));for(const point of geometry){mix(floatBits(point[0]));mix(floatBits(point[1]));mix(floatBits(point[2]));}}return h||1;};
-   keyList.push(0x50524731,row.construction.revision>>>0,parts.length>>>0,signature());
+   const programSignature=signature();keyList.push(0x50524731,row.construction.revision>>>0,parts.length>>>0,programSignature);
    // Each part's contributor pairs occupy one contiguous source-owned slice.
    // The shader hashes/reads `count` pairs from `first`; a globally deduped
    // table would make a part's slice run into the next part whenever their
@@ -394,7 +421,17 @@ export function farAggregateRecords(sources:readonly SourceFarForms[],rect:{x:nu
    // argument spread whose engine stack limit depends on scene density.
    for(const word of partWords)keyList.push(word);
    for(const word of payloadWords)keyList.push(word);
-   inputs.set([programOffset,parts.length,row.construction.revision>>>0,signature()],base+12);
+   const product=coherentParentProductOf(row.construction);
+   let coherentWords=product?coherentCorrespondencePackets.get(row.construction):undefined;
+   if(product&&!coherentWords){
+    const correspondenceParts:CoherentCorrespondencePart[]=parts.map(part=>({feature:part.feature,kind:part.relationKind??'part',contributors:part.contributors}));
+    coherentWords=encodeCoherentCorrespondence(coherentCorrespondenceEntries(product,row.members.map(([mesh,eid])=>({mesh,eid,construction:row.construction!})),row.construction),correspondenceParts);
+    coherentCorrespondencePackets.set(row.construction,coherentWords);
+   }
+   const coherentOffset=coherentWords?keyList.length-programOffset:0;if(coherentWords)for(const word of coherentWords)keyList.push(word);
+   inputs.set([programOffset,parts.length,row.construction.revision>>>0,programSignature],base+12);
+   inputs[base+10]=coherentOffset;
+   if(product)coherentSourcePrograms.set(row.construction,{words:Uint32Array.from(keyList.slice(programOffset)),parts:parts.length,revision:row.construction.revision>>>0,signature:programSignature,correspondence:coherentOffset,mode:inputs[base+11]!});
   }
  });
  if(keyList.length&1)keyList.push(0);

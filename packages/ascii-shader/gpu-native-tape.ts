@@ -70,6 +70,48 @@ export interface GpuNativeFontAddress {
   readonly atlasCode: number;
 }
 
+/** Context carried by a normal GPU readback owner.  Values are deliberately
+ * scalar so a driver object cannot smuggle an unbounded string into the UI. */
+export type GpuReadbackFailureContext = Readonly<Record<string, string|number|undefined>>;
+
+const GPU_READBACK_TEXT_LIMIT=256;
+function boundedReadbackText(value:unknown,limit=GPU_READBACK_TEXT_LIMIT):string{
+  try{
+    const text=typeof value==='string'?value:String(value);
+    return text.length>limit?`${text.slice(0,limit)}…`:text;
+  }catch{return '<unavailable>';}
+}
+function readbackErrorField(error:unknown,key:'name'|'message'):string{
+  try{
+    if(typeof error==='string')return key==='message'?boundedReadbackText(error):'UnknownError';
+    if(error instanceof Error){
+      const value=error[key];
+      if(typeof value==='string')return boundedReadbackText(value);
+    }
+    if(typeof error==='object'&&error!==null){
+      const value=(error as Record<string,unknown>)[key];
+      if(typeof value==='string')return boundedReadbackText(value);
+    }
+  }catch{/* A hostile cross-realm/driver error must not mask the cause. */}
+  return key==='name'?'UnknownError':'<unavailable>';
+}
+
+/** Format a bounded, owner-specific GPU readback failure without guessing a
+ * shader.  The original rejection is retained as `cause` for callers that
+ * need the platform error object. */
+export function gpuReadbackFailure(stage:string,error:unknown,context:GpuReadbackFailureContext={}):Error{
+  const fields:string[]=[];
+  try{
+    for(const [key,value] of Object.entries(context)){
+      if(value===undefined)continue;
+      const rendered=typeof value==='number'&&Number.isFinite(value)?String(value):boundedReadbackText(value);
+      fields.push(`${boundedReadbackText(key,64)}=${rendered}`);
+    }
+  }catch{/* Context is internal, but diagnostics must remain non-throwing. */}
+  const suffix=fields.length?` (${fields.join('; ')})`:'';
+  return Error(`GPU readback ${boundedReadbackText(stage,96)} failed${suffix}: ${readbackErrorField(error,'name')}: ${readbackErrorField(error,'message')}`,{cause:error});
+}
+
 export interface GpuNativeWord {
   readonly x: number;
   readonly row: number;
@@ -133,29 +175,47 @@ export class GpuNativeTapeReadback {
     return this.result ??= this.readImpl();
   }
 
+  private readFailure(stage:'count header'|'scalar tape', error:unknown):Error {
+    return gpuReadbackFailure(`GPU native tape export ${stage} mapAsync`,error,{lifecycle:this.disposed?'disposed during readback':'active',frame:`${this.tape.width}x${this.tape.height}`,capacity:this.tape.capacity,countOffsetBytes:this.tape.countOffsetBytes,countReadBytes:this.countRead.size,wordsReadBytes:this.wordsRead.size});
+  }
+
   private async readImpl(): Promise<readonly GpuNativeWord[]> {
-    await this.countRead.mapAsync(GPUMapMode.READ);
-    const count = new Uint32Array(this.countRead.getMappedRange())[0]!;
-    this.countRead.unmap();
-    if (count > this.tape.capacity) throw Error(`GPU native tape export count ${count} exceeds capacity ${this.tape.capacity}`);
-    if (!count) return [];
-    await this.wordsRead.mapAsync(GPUMapMode.READ);
     try {
-      const words = new Uint32Array(this.wordsRead.getMappedRange());
-      const result: GpuNativeWord[] = [];
-      for (let index = 0; index < count; index++) {
-        const at = index * GPU_NATIVE_WORD_STRIDE;
-        const x = words[at + 3]!, row = words[at + 4]!, fontAddress = words[at + 5]!;
-        const address = this.font[fontAddress];
-        if (!address) throw Error(`GPU native tape export has unknown font address ${fontAddress}`);
-        if (x + address.advance > this.tape.width || row * 17 + 17 > this.tape.height) {
-          throw Error(`GPU native tape export has an out-of-page word at ${x},${row}`);
-        }
-        result.push({x, row, fontAddress, text: address.text, codepoint: address.codepoint, advance: address.advance, foreground: words[at + 10]!});
+      await this.countRead.mapAsync(GPUMapMode.READ);
+    } catch(error) {
+      throw this.readFailure('count header',error);
+    }
+    let countMapped=true;
+    try {
+      const count = new Uint32Array(this.countRead.getMappedRange())[0]!;
+      if (count > this.tape.capacity) throw Error(`GPU native tape export count ${count} exceeds capacity ${this.tape.capacity}`);
+      if (!count) return [];
+      if (this.countRead.mapState==='mapped') this.countRead.unmap();
+      countMapped=false;
+      try {
+        await this.wordsRead.mapAsync(GPUMapMode.READ);
+      } catch(error) {
+        throw this.readFailure('scalar tape',error);
       }
-      return Object.freeze(result);
+      try {
+        const words = new Uint32Array(this.wordsRead.getMappedRange());
+        const result: GpuNativeWord[] = [];
+        for (let index = 0; index < count; index++) {
+          const at = index * GPU_NATIVE_WORD_STRIDE;
+          const x = words[at + 3]!, row = words[at + 4]!, fontAddress = words[at + 5]!;
+          const address = this.font[fontAddress];
+          if (!address) throw Error(`GPU native tape export has unknown font address ${fontAddress}`);
+          if (x + address.advance > this.tape.width || row * 17 + 17 > this.tape.height) {
+            throw Error(`GPU native tape export has an out-of-page word at ${x},${row}`);
+          }
+          result.push({x, row, fontAddress, text: address.text, codepoint: address.codepoint, advance: address.advance, foreground: words[at + 10]!});
+        }
+        return Object.freeze(result);
+      } finally {
+        if (this.wordsRead.mapState==='mapped') this.wordsRead.unmap();
+      }
     } finally {
-      this.wordsRead.unmap();
+      if (countMapped&&this.countRead.mapState==='mapped') this.countRead.unmap();
     }
   }
 

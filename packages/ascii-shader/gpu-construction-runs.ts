@@ -21,6 +21,10 @@ const JUMP_WORDS=4;
 const STYLE_WORDS=5;
 const EMPTY_ROW=0xffffffff,RETIRED_ROW=0xfffffffe;
 const ARENA_LABEL='MAIN resident compiled construction topology and work';
+// A face source vertex is emitted as a dedicated joint run. This bit is
+// outside the ordinary boundary flags and does not change the four-point face
+// packet or its canonical source ordering.
+export const FACE_JUNCTION_RUN=0x00800000;
 
 /**
  * Decode the producer-owned address used to index a source part's original
@@ -232,8 +236,10 @@ const FACE_MAGIC=${TOPOLOGY_FACE_MAGIC}u;const FACE_HIDDEN=${FACE_HIDDEN}u;
 fn faceHidden(word:u32)->bool{return (word&FACE_HIDDEN)!=0u;}
 // A FACE edge owns one source passage. Visibility partitions annotate that
 // passage; they never become its endpoints, lattice origin or feature ID.
-// The construction packet is therefore counted and assembled once per
-// original relation, even when the field reports several visible intervals.
+// Several relation records can describe that same source feature/port pair
+// after visibility and clipping. They are joined in the existing node arena
+// before count/reserve, so the packet is counted and assembled once while
+
 fn faceVisible(id:u32,r:Relation)->bool{
  let span=front(r);var part=partitions[id*2u];
  loop{if(part==0u){break;}let interval=intervals[part-1u];
@@ -247,6 +253,25 @@ fn faceEdge(r:Relation)->u32{
  let header=topologyHeader(r);if(header==NONE||work[header+${TOPOLOGY_FACE_MAGIC_WORD}u]!=FACE_MAGIC){return 0u;}
  if(r.key.w>=work[header+${TOPOLOGY_FACE_MAGIC_WORD+2}u]){return 0u;}
  return work[header+work[header+${TOPOLOGY_FACE_MAGIC_WORD+1}u]+r.key.w];
+}
+const FACE_GROUP_FAMILY=9u;
+const FACE_VERTEX_FAMILY=8u;
+const FACE_GROUP_VISIBLE=1u;
+fn faceGroupKey(r:Relation)->SourceKey{
+ let low=min(r.ports.x,r.ports.y);let high=max(r.ports.x,r.ports.y);
+ return SourceKey(vec4u(r.key.x,r.key.y,(r.key.z&0x80000000u)|FACE_GROUP_FAMILY,faceEdge(r)),low,vec3u(high,r.ports.z,r.ports.w));
+}
+// Face groups share the already allocated source-node dictionary. This is a
+// producer key, not a second fixed-size private hash. A full dictionary is a
+// real source-arena overflow and causes the normal hash growth retry; it never
+// falls back to the conflicting per-relation packet.
+fn facePacketGroup(id:u32,r:Relation)->u32{
+ // Ordinary owner witnesses always use endpoint zero. The unused endpoint
+ // one under that tag identifies a face-group witness atomically, so every
+ // probing reader reconstructs the actual held key, not its requested key
+ // family. Reinterpreting an ordinary junction witness as a face group would
+ // falsely merge them whenever their hashes collide.
+ return nodeFor(id*2u+1u,OWNER_NODE);
 }
 // Every edge of a planar VOLUME is a hard line, and so is a contact. Any other
 // source is hard edge by edge, and only an authored feature edge is. A facet
@@ -395,6 +420,7 @@ fn hash(key:SourceKey)->u32{
 }
 fn key(endpoint:u32,mode:u32)->SourceKey{
  let r=relations[endpoint/2u];var port=r.ports[endpoint&1u];
+ if(mode==OWNER_NODE&&(endpoint&1u)==1u){return faceGroupKey(r);}
  // One node per ordered pair of contacting source owners: the exact pair, no
  // port, parameter or face, so every contact segment of the pair reaches it.
 
@@ -406,7 +432,17 @@ fn key(endpoint:u32,mode:u32)->SourceKey{
  // Quantization only reconciles the adjoining triangles' f32 evaluation
  // of that same crossing; there is no screen-coordinate weld.
  let parameter=r.coordinates[endpoint&1u];
- var family=kind(r);if(mode==OWNER_NODE){port=NONE;family=4u;}else if(mode==JUNCTION_NODE){family=5u;}
+ // Face-owned edges use a dedicated source-vertex incidence family. This
+ // keeps their joint index out of ordinary outline continuation while still
+ // reusing the existing LINE_NODE linked-list arena.
+ var family=kind(r);
+ if(mode==LINE_NODE&&faceEdge(r)!=0u){
+  // Visibility fragments of one source edge have changing coordinates but
+  // the same source endpoint. Keep one incidence node per source vertex;
+  // facePacketGroup/least below removes duplicate edge groups at consumption.
+  return SourceKey(vec4u(r.key.x,r.key.y,(r.key.z&0x80000000u)|FACE_VERTEX_FAMILY,port),0u,vec3u(0u));
+ }
+ else if(mode==OWNER_NODE){port=NONE;family=4u;}else if(mode==JUNCTION_NODE){family=5u;}
  // ONE OUTLINE FAMILY (line repair step 1, 2026-11-12). A silhouette and an
  // occluding contour are one outline; which of them a segment is, is a label
  // of that segment (assemble: the run's class), not a reason to start a new
@@ -748,7 +784,14 @@ fn authoredPairFill(r:Relation,node:u32){
   // self-visibility cannot change the form's producer or exhaust its packet.
   // A face-owned edge counts as one box edge (faceEdge); a compiled-out one
   // counts nothing.
-  let faceWord=faceEdge(r);let faced=faceWord!=0u;
+  let faceWord=faceEdge(r);let faced=faceWord!=0u&&!faceHidden(faceWord);
+  if(faced){
+   let group=facePacketGroup(id,r);work[at+8u]=group;
+   if(group!=NONE){
+    junctionRepresentative(group,id*2u);
+    if(faceVisible(id,r)){atomicOr(&nodes[group].degree,FACE_GROUP_VISIBLE);}
+   }
+  }
 
   // never into the owner's round/box/face packet.
   if(!authoredPaired(r)&&!faceHidden(faceWord)&&((form==2u&&k==0u)||(form==1u&&(k==0u||k==2u))||faced)){
@@ -758,7 +801,7 @@ fn authoredPairFill(r:Relation,node:u32){
    // visibility is zero or only a sliver. Reserve the complete original
    // packet; visibility is carried by point flags and clips emitted units
    // later. A face packet has its descriptor pair plus one draw pair.
-   if(faced){visible=faceVisible(id,r);n=4u;}
+   if(faced){n=0u;}
    else if(form==1u){n=2u;}
    // The owner's representative is the least endpoint by SOURCE CONTENT
    // (choose, as a junction's), never the lowest relation index: the index is
@@ -794,6 +837,9 @@ fn authoredPairFill(r:Relation,node:u32){
   // through pointer doubling, so a fork never scans the whole owner.
   work[at+10u+end]=atomicExchange(&nodes[node].second,endpoint+1u);
   atomicAdd(&nodes[node].degree,1u);
+  // The face-family line node is only the source-vertex index. Its minimum
+  // endpoint is the single producer representative consumed by anchors().
+  if(faceEdge(r)!=0u&&!faceHidden(faceEdge(r))){junctionRepresentative(node,endpoint);}
   // A silhouette, crease and interior turn retain separate continuation
   // rules, but their ORIGINAL common vertex owns one real junction. Do not
   // manufacture a join from coincident screen coordinates or edge crossings.
@@ -901,6 +947,22 @@ fn straightMate(e:u32,node:u32)->u32{
   work[at+4u+end]=endpoint;
  }
 }
+// FACE PACKET RESERVE. Incidence has published all source feature/port groups
+// and their aggregate visibility. This separate dispatch picks one stable
+// representative per group and adds exactly its descriptor+draw footprint to
+// the owning construction. Hidden-first/later-live therefore remains one
+// packet, while the live bit is the union of every relation in that group.
+@compute @workgroup_size(64) fn facePacketReserve(@builtin(global_invocation_id) gid:vec3u){
+ let id=gid.x+gid.y*p.table.z*64u;if(id>=count()||sourceStatus[1]!=0u){return;}
+ let at=linkAt(id);if(work[at+7u]==0u){return;}let r=relations[id];let faceWord=faceEdge(r);
+ if(faceWord==0u||faceHidden(faceWord)){return;}
+ let group=work[at+8u];let owner=work[at+6u];if(group==NONE||owner==NONE){return;}
+ if(atomicLoad(&nodes[group].least)!=id*2u){return;}
+ atomicAdd(&nodes[owner].second,4u);
+ junctionRepresentative(owner,id*2u);
+ if((atomicLoad(&nodes[group].degree)&FACE_GROUP_VISIBLE)!=0u){atomicOr(&nodes[owner].degree,1u);}
+}
+
 // Doubled source pointers find a run's terminal endpoints/component identity
 // in logarithmic dispatches. No serial CPU walk or world-size readback.
 // CONVERGED ROUNDS RETURN (frame cost, 2026-11-13). Round r (p.sourceExtent.w,
@@ -1268,12 +1330,63 @@ fn contactAnchor(id:u32,r:Relation){
  if(node!=NONE){let rows=real(atomicLoad(&nodes[node].maxY))-real(atomicLoad(&nodes[node].minY));if(rows>=0.0){band=select(select(2u,1u,rows<119.0),0u,rows<51.0);}}
   runs[slot]=Run(vec4u(base,1,flags,band),vec4u(identity,standing.x,standing.y,identity),vec4u(work[program],work[program+1u],work[program+2u],work[program+3u]),vec4u(work[program+4u],work[program+5u],surface,0x10000001u),vec4u(0u));
 }
+// FACE SOURCE-VERTEX JOINT INDEX. Face packets can contain more than 128
+// source edges, so their joints cannot be recovered by the native reader's
+// fixed edge bitset. The face-family LINE_NODE chain is the compiled source
+// incidence index. One representative endpoint per source vertex walks that
+// chain once, counts its face contributors, projects their posed legs on the
+// GPU, and emits a joint-only run. No all-source scan or screen weld occurs.
+fn faceVertexCandidate(endpoint:u32,owner:u32)->bool{
+ let edge=endpoint/2u;let at=linkAt(edge);let q=relations[edge];let group=work[at+8u];
+ // A visibility fragment is not another source leg. The packet-group
+ // representative is the one source edge admitted to this vertex; its
+ // group's visibility bit is the union of all retained fragments.
+ return work[at+7u]!=0u&&work[at+6u]==owner&&group!=NONE&&atomicLoad(&nodes[group].least)==edge*2u&&faceEdge(q)!=0u&&!faceHidden(faceEdge(q));
+}
+fn faceVertexCount(node:u32,owner:u32)->u32{
+ var total=0u;var member=atomicLoad(&nodes[node].second);
+ loop{if(member==0u){break;}let endpoint=member-1u;
+  if(faceVertexCandidate(endpoint,owner)){total++;}
+  member=work[linkAt(endpoint/2u)+10u+(endpoint&1u)];
+ }
+ return total;
+}
+fn faceVertexAnchor(id:u32,r:Relation,at:u32){
+ let owner=work[at+6u];if(owner==NONE){return;}
+ let low=real(atomicLoad(&nodes[owner].minY));let high=real(atomicLoad(&nodes[owner].maxY));
+ let size=select(select(2u,1u,high-low<119.0),0u,high-low<51.0);
+ for(var end=0u;end<2u;end++){
+  if(select(r.a.w,r.b.w,end==1u)<.00001){continue;}
+  let endpoint=id*2u+end;let node=nodeFor(endpoint,LINE_NODE);
+  if(node==NONE||atomicLoad(&nodes[node].least)!=endpoint){continue;}
+  let edges=faceVertexCount(node,owner);if(edges<2u){continue;}
+  let total=edges*2u;let base=atomicAdd(&nodes[p.extent.z].first,total);let slot=atomicAdd(&nodes[p.extent.z].second,1u);
+  if(base+total>p.extent.y){atomicOr(&nodes[p.extent.z].degree,2u);}
+  if(slot>=p.sourceExtent.z){atomicOr(&nodes[p.extent.z].degree,4u);}
+  if(base+total>p.extent.y||slot>=p.sourceExtent.z){continue;}
+  var output=base;var member=atomicLoad(&nodes[node].second);
+  loop{if(member==0u){break;}let incident=member-1u;
+   if(faceVertexCandidate(incident,owner)){
+    let edge=incident/2u;let q=relations[edge];let side=incident&1u;let group=work[linkAt(edge)+8u];let live=(atomicLoad(&nodes[group].degree)&FACE_GROUP_VISIBLE)!=0u;
+    points[output]=sourcePoint(q,f32(side),0.0,live);
+    points[output+1u]=sourcePoint(q,f32(1u-side),1.0,false);output+=2u;
+   }
+   member=work[linkAt(incident/2u)+10u+(incident&1u)];
+  }
+  // The source vertex port, not this frame's relation index, is the joint's
+  // retained identity. Duplicate visibility fragments therefore publish the
+  // same native passage even when their dispatch order changes.
+  let vertex=r.ports[end];let identity=(r.key.x*0x9e3779b9u)^(r.key.y*0x85ebca6bu)^vertex^0x40000000u;
+  runs[slot]=Run(vec4u(base,total,${FACE_JUNCTION_RUN}u|0x100000u,size),vec4u(identity,r.key.x|(r.key.z&0x80000000u),r.key.y,vertex),vec4u(0u),vec4u(0u),vec4u(0u));
+ }
+}
 @compute @workgroup_size(64) fn anchors(@builtin(global_invocation_id) gid:vec3u){
  let id=gid.x+gid.y*p.table.z*64u;if(id>=count()||sourceStatus[1]!=0u){return;}
  let r=relations[id];let at=linkAt(id);if(work[at+7u]==0u){return;}
  if(kind(r)==4u){contactAnchor(id,r);return;}
 
  if(authoredPaired(r)){let pair=nodeFor(id*2u,PAIR_NODE);if(pair!=NONE&&(atomicLoad(&nodes[pair].degree)&0x80000000u)!=0u){return;}}
+ let faceWord=faceEdge(r);if(faceWord!=0u){if(!faceHidden(faceWord)){faceVertexAnchor(id,r,at);}return;}
  if(shape(r)!=0u){return;}
  let owner=work[at+6u];if(owner==NONE){return;}
  let low=real(atomicLoad(&nodes[owner].minY));let high=real(atomicLoad(&nodes[owner].maxY));
@@ -1360,13 +1473,12 @@ fn contactAnchor(id:u32,r:Relation){
  // deformed field or a chunk carries hundreds of interior creases, and those
  // are its drawing. The unreserved owner keeps the per-edge runs (assemble).
  if(box&&(!planarVolume(r)||total>128u)){return;}
- // THE FACE OWNER: one reserved construction of every face-owned edge of the
- // owner (all its wall faces: a corner two faces share is one vertex of one
- // packet, spelled once by boxJunctions), read by articulation's box program
- // (hardBoundaryConstruction) with the face bit 0x200000. An owner with more
- // face edges than the box program reads (BOX_EDGES, 256) keeps today's
- // per-edge runs for them (D1: the terminal alternative, never a blank).
- if(face&&total>512u){return;}
+ // THE FACE OWNER: one reserved construction of every face-owned source
+ // feature/port group (all its wall faces: a corner two faces share is one
+ // vertex of one packet), read by articulation's box program with the face
+ // bit 0x200000. There is no fixed face-count escape hatch here: if the
+ // source-sized run/point arena cannot hold the complete packet, the normal
+ // allocation status requests growth and the incumbent remains intact.
  let base=atomicAdd(&nodes[p.extent.z].first,total);let slot=atomicAdd(&nodes[p.extent.z].second,1u);
  if(base+total>p.extent.y){atomicOr(&nodes[p.extent.z].degree,2u);}
  if(slot>=p.sourceExtent.z){atomicOr(&nodes[p.extent.z].degree,4u);}
@@ -1400,6 +1512,14 @@ fn pairBefore(a:u32,b:u32)->bool{
  if(rx.x!=ry.x){return rx.x<ry.x;}
  return rx.y<ry.y;
 }
+fn facePacketBefore(a:u32,b:u32)->bool{
+ let x=points[a];let y=points[b];
+ if(pointFeatureId(x)!=pointFeatureId(y)){return pointFeatureId(x)<pointFeatureId(y);}
+ let xa=points[a+1u];let ya=points[b+1u];
+ let xl=min(x.visible.z,xa.visible.z);let yl=min(y.visible.z,ya.visible.z);
+ if(xl!=yl){return xl<yl;}
+ return max(x.visible.z,xa.visible.z)<max(y.visible.z,ya.visible.z);
+}
 @compute @workgroup_size(64) fn canonPackets(@builtin(global_invocation_id) gid:vec3u){
  let id=gid.x+gid.y*p.table.z*64u;
  if(id>=min(atomicLoad(&nodes[p.extent.z].second),p.sourceExtent.z)||sourceStatus[1]!=0u){return;}
@@ -1408,23 +1528,34 @@ fn pairBefore(a:u32,b:u32)->bool{
  // whole-part correspondence must not be re-ordered by a visibility-derived
  // parameter sort; legacy packets retain canonical sorting below.
  if((run.range.w>>5u)!=0u){return;}
+ // A face descriptor and finite draw pair are ONE four-point packet. Their
+ // position.w values have different meanings (clip w versus source phase).
+ // Sort whole packets by source feature/ports, never the two pairs apart.
+ // Retaining atomic assembly order would also make bounded joint readers
+ // change their source subset between otherwise identical frames.
+ let face=(flags&0x200000u)!=0u;let stride=select(2u,4u,face);
  if((flags&0x10000u)!=0u||(flags&0x120000u)==0u){return;}
- let base=run.range.x;let pairs=run.range.y/2u;if(pairs<2u||base+pairs*2u>p.extent.y){return;}
+ let base=run.range.x;let pairs=run.range.y/stride;if(pairs<2u||base+pairs*stride>p.extent.y){return;}
  var gap=1u;while(gap*3u+1u<pairs){gap=gap*3u+1u;}
  loop{
   for(var i=gap;i<pairs;i++){
-   let a=points[base+i*2u];let b=points[base+i*2u+1u];
+   let a=points[base+i*stride];let b=points[base+i*stride+1u];
+   var c=a;var d=b;if(face){c=points[base+i*stride+2u];d=points[base+i*stride+3u];}
    var j=i;
    loop{
     if(j<gap){break;}
     let k=j-gap;
     // Compare the held pair with the pair at k (both written back below).
-    points[base+j*2u]=a;points[base+j*2u+1u]=b;
-    if(!pairBefore(base+j*2u,base+k*2u)){break;}
-    points[base+j*2u]=points[base+k*2u];points[base+j*2u+1u]=points[base+k*2u+1u];
+    points[base+j*stride]=a;points[base+j*stride+1u]=b;
+    if(face){points[base+j*stride+2u]=c;points[base+j*stride+3u]=d;}
+    var before=false;if(face){before=facePacketBefore(base+j*stride,base+k*stride);}else{before=pairBefore(base+j*stride,base+k*stride);}
+    if(!before){break;}
+    points[base+j*stride]=points[base+k*stride];points[base+j*stride+1u]=points[base+k*stride+1u];
+    if(face){points[base+j*stride+2u]=points[base+k*stride+2u];points[base+j*stride+3u]=points[base+k*stride+3u];}
     j=k;
    }
-   points[base+j*2u]=a;points[base+j*2u+1u]=b;
+   points[base+j*stride]=a;points[base+j*stride+1u]=b;
+   if(face){points[base+j*stride+2u]=c;points[base+j*stride+3u]=d;}
   }
   if(gap==1u){break;}gap=(gap-1u)/3u;
  }
@@ -1440,6 +1571,8 @@ fn pairBefore(a:u32,b:u32)->bool{
  // A face-owned edge fills its owner's reserved face construction as a box
  // edge; a compiled-out face edge is drawn by nothing (slice 1b).
  let faceWord=faceEdge(r);if(faceHidden(faceWord)){return;}
+ let faceGroup=select(NONE,work[at+8u],faceWord!=0u);
+ if(faceWord!=0u&&(faceGroup==NONE||atomicLoad(&nodes[faceGroup].least)!=id*2u)){return;}
  let round=form==2u&&kind(r)==0u;let box=(form==1u&&(kind(r)==0u||kind(r)==2u))||faceWord!=0u;
  let reserved=(round||box)&&!authored;let owner0=work[at+6u];
  if(reserved&&(owner0==NONE||(atomicLoad(&nodes[owner0].degree)&0x80000000u)!=0u)){
@@ -1452,7 +1585,7 @@ fn pairBefore(a:u32,b:u32)->bool{
   // A face edge reserves one descriptor pair and one draw pair for its whole
   // source passage. The partition list is visibility data, not an endpoint
   // stream. A volume edge always reserves its original endpoint pair too.
-  var faceHasVisible=false;if(faceWord!=0u){faceHasVisible=faceVisible(id,r);n=4u;}
+  var faceHasVisible=false;if(faceWord!=0u){faceHasVisible=(atomicLoad(&nodes[faceGroup].degree)&FACE_GROUP_VISIBLE)!=0u;n=4u;}
   else if(box){n=2u;}
   if(n==0u){return;}
   var output=atomicLoad(&nodes[owner].least)+atomicAdd(&nodes[owner].second,n);
@@ -1694,7 +1827,7 @@ export const CONSTRUCTION_RUN_WORDS=20;
 function sourceRunPipelinePlan(device:GPUDevice){
  const layout=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:'uniform'}},...[1,2,3,4].map(binding=>({binding,visibility:GPUShaderStage.COMPUTE,buffer:{type:'read-only-storage' as const}})),...[5,6,7,8].map(binding=>({binding,visibility:GPUShaderStage.COMPUTE,buffer:{type:'storage' as const}}))]});
  const module=(entryPoint:string)=>device.createShaderModule({label:'MAIN retained source construction runs '+entryPoint,code:isolateComputeEntry(GPU_CONSTRUCTION_RUNS_SHADER,entryPoint)}),pipeline=device.createPipelineLayout({bindGroupLayouts:[layout]});
- return {layout,plans:new Map(['initialize','incidence','authoredPairValidate','authoredPairReserveStage','connect','jump','finishJumps','roundReserve','anchors','assemble','canonPackets'].map(entryPoint=>[entryPoint,()=>({layout:pipeline,compute:{module:module(entryPoint),entryPoint}})]))};
+ return {layout,plans:new Map(['initialize','incidence','facePacketReserve','authoredPairValidate','authoredPairReserveStage','connect','jump','finishJumps','roundReserve','anchors','assemble','canonPackets'].map(entryPoint=>[entryPoint,()=>({layout:pipeline,compute:{module:module(entryPoint),entryPoint}})]))};
 }
 function indexedRunPipelinePlan(device:GPUDevice){
  const layout=device.createBindGroupLayout({entries:[0,1,2,3,4,5].map(binding=>({binding,visibility:GPUShaderStage.COMPUTE,buffer:{type:binding===0?'uniform':binding===4?'storage':'read-only-storage'} as const}))});
@@ -1946,7 +2079,7 @@ export class GpuConstructionRuns {
    const pipeline=this.pipelines.get(name)!,group=this.device.createBindGroup({layout:this.layout,entries:list.map((buffer,binding)=>({binding,resource:{buffer}}))});
    const pass=encoder.beginComputePass({label:`MAIN GPU construction ${name}`});pass.setPipeline(pipeline);pass.setBindGroup(0,group);pass.dispatchWorkgroups(Math.min(columns,Math.ceil(amount/64)),Math.ceil(Math.ceil(amount/64)/columns));pass.end();
   };
-  dispatch('initialize',linkA,linkB,Math.max(hashCapacity,runCapacity));dispatch('incidence',linkA,linkB,capacity);dispatch('authoredPairValidate',linkA,linkB,capacity);dispatch('authoredPairReserveStage',linkA,linkB,capacity);dispatch('connect',linkA,linkB,capacity);
+  dispatch('initialize',linkA,linkB,Math.max(hashCapacity,runCapacity));dispatch('incidence',linkA,linkB,capacity);dispatch('facePacketReserve',linkA,linkB,capacity);dispatch('authoredPairValidate',linkA,linkB,capacity);dispatch('authoredPairReserveStage',linkA,linkB,capacity);dispatch('connect',linkA,linkB,capacity);
 
 
 

@@ -12,7 +12,7 @@ import {MaterialGeometryTransport,type MaterialGeometryDraw,type RetainedMateria
 import {prepareExampleGpuServices,type ExampleGpuRelationProfile} from './gpu-startup.ts';
 import type {SourceConstructionClass} from './gpu-construction-runs.ts';
 import type {SourceFarForms} from './gpu-source-far-forms.ts';
-import {SurfaceRelations,RELATION_WORDS,type PartAnchorDemandReadback} from './surface-relations.ts';
+import {SurfaceRelations,RELATION_WORDS,needsCompleteNativeRelationFallback,type PartAnchorDemandReadback} from './surface-relations.ts';
 import {discardPartAnchorAttempt} from './part-anchor-replay.ts';
 import {MeshSourceCache,isGpuIndexedResident,isCompiledFarForm,type ResidentGpuIndexedSource,type ResidentRelationSource} from './source-cache.ts';
 import {selectSourceLod,fitsParentTier,ParentHolds,ParentGroupCache,mergeSourceLod,remapSourceWholeConstruction,type SourceLodSelection} from './source-lod.ts';
@@ -41,6 +41,18 @@ import {applyMobileUiAppearance,supportsTouchControls} from './input/controls.ts
 import {exportResidentFrame,residentFrameState,type ResidentNativeSnapshot,type ResidentFrameState} from './resident-native-frame.ts';
 import {AppearanceHash,StillParts,StillWorld} from './still-view.ts';
 
+/** Capability admission runs after every scene/plugin initialize hook and
+ * before MAIN prepares any GPU relation pipeline. It intentionally inspects
+ * producer metadata, never an example name: a registered independent-quad
+ * producer with posed-coincident contacts needs the chart/contact closure. */
+export function exampleGpuRelationProfile(world:World):ExampleGpuRelationProfile{
+ for(const mesh of world.resource(Meshes).values()){
+  const source=mesh.gpuIndexedSource;
+  if(source?.edgeContactClass==='posed-coincident'&&source.topology.indexPattern==='independent-quads')return 'producer-capable';
+ }
+ return 'ordinary';
+}
+
 interface ComparisonView {readonly camera:string;readonly rect:{x:number;y:number;width:number;height:number};readonly extent:readonly [number,number];readonly clipFromWorld:readonly number[];readonly viewFromWorld:readonly number[];readonly sources:readonly number[]}
 interface ComparisonSource {readonly world:number;readonly target:number;readonly serial:number;readonly engineFrame:number;readonly entities:readonly (readonly [number,number])[];readonly views:readonly ComparisonView[]}
 export interface MainTextFrame extends PresentedNativeFrame {readonly comparison:ComparisonSource;readonly construction:{readonly sourceLines:number;readonly omitted:readonly string[];readonly metrics:NativeFrame['metrics']}}
@@ -49,7 +61,7 @@ type ResidentMainSnapshot=ResidentNativeSnapshot&{readonly comparison:Comparison
 type SourceDefinition=Pick<CompositionGeometry,'positions'|'indices'|'revision'>;
 interface CameraRecord {played?:Promise<ArticulationResult>;toneLiterals?:{resolve:(literals:readonly ArticulationLiteral[],tone?:GpuToneMembers)=>void;reject:(error:unknown)=>void};tone?:ToneReadback;toneSource?:{field:SurfaceField;clip:Float32Array;release?:()=>void};classes?:readonly SourceToneClass[];geometry?:readonly CompositionGeometry[];definitions?:ReadonlyMap<number,SourceDefinition>;pose?:DrawingFieldView['pose'];light?:readonly number[];fog?:readonly number[];inks?:Uint32Array;labels?:readonly NativeLabel[];field?:ConstructionFieldReadback;unresolved?:readonly string[];staging?:GPUBuffer;relationReadback?:ProjectedRelationReadback;partAnchorDemand?:PartAnchorDemandReadback;camera:string;cameraEntity:number;depth:GPUTextureView;rect:{x:number;y:number;width:number;height:number};width:number;height:number;capacity:number;intervalCapacity:number;visibility:number;owners:Map<number,number>}
 interface TargetState {publication:NativePublication<MainTextFrame>;presentation:NativePresentation;resident?:ResidentMainSnapshot;still?:{parts:StillParts;world:StillWorld;frame:number;serial:number};appearance?:AppearanceHash;native?:GPUTexture;scaledPage?:GPUTexture;pending:boolean;serial:number;width:number;height:number;frame?:NativeFrame;error?:string}
-interface TargetJob {cpuEncodeMs?:number;state:TargetState;source:GPUTexture;native?:GPUTexture;mask:GPUTexture;records:CameraRecord[];width:number;height:number;serial:number;engineFrame:number;error?:string;comparison:ComparisonSource}
+interface TargetJob {cpuEncodeMs?:number;state:TargetState;source:GPUTexture;native?:GPUTexture;mask:GPUTexture;records:CameraRecord[];width:number;height:number;serial:number;engineFrame:number;error?:string;comparison:ComparisonSource;retirementRegistered?:boolean;/** The frame has been submitted and the queue fence owns these resources. */retirementSubmitted?:boolean;retired?:boolean}
 export interface MainRendererController {
   ascii:boolean;underlay:boolean;overlay:boolean;mode:PresentationMode;
   paused:boolean;pause(paused:boolean):void;
@@ -72,7 +84,7 @@ interface MainState {
   status?:HTMLElement;notice?:HTMLElement;
   transport:MaterialGeometryTransport;graph:SurfaceRelations;sources:MeshSourceCache<SourceComplexRetention>;visibility:RelationVisibility[];
   relationExtent:number;intervalExtents:number[];
-  construction:NativeConstruction;playback?:GpuArticulation;fields:Map<number,SurfaceFields>;blit:TextureBlit;mask:ConstructionMask;targets:Map<number,TargetState>;jobs:TargetJob[];
+  construction:NativeConstruction;playback?:GpuArticulation;fields:Map<number,SurfaceFields>;blit:TextureBlit;mask:ConstructionMask;targets:Map<number,TargetState>;jobs:TargetJob[];abandonedJobs:Set<TargetJob>;
   displayedSnapshots:Map<number,ResidentMainSnapshot>;retiredSnapshots:ResidentMainSnapshot[];
   registration?:Promise<void>;
   primaryFields:WeakMap<View,{field:SurfaceField;frame:number;ready:boolean;materials:readonly MaterialGeometryDraw[];selection:SourceLodSelection|undefined}>;
@@ -84,19 +96,33 @@ let nextWorld=0;
 const stateKey={create:()=>({current:undefined as MainState|undefined})};
 const glyphs=nativeFont.glyphs;
 
-/** Admit the relation capability from registered producer metadata after all
- * scene/plugin initialize hooks and before MAIN prepares its GPU closures. */
-export function exampleGpuRelationProfile(world:World):ExampleGpuRelationProfile{
- for(const mesh of world.resource(Meshes).values()){
-  const source=mesh.gpuIndexedSource;
-  if(source?.edgeContactClass==='posed-coincident'&&source.topology.indexPattern==='independent-quads')return 'producer-capable';
- }
- return 'ordinary';
-}
-
 function fail(state:MainState,error:unknown):void{
   const message=error instanceof Error?error.message:String(error);if(state.controller.errors.at(-1)===message)return;state.controller.errors.push(message);if(state.controller.errors.length>64)state.controller.errors.shift();console.error('MAIN construction:',message);
   if(state.status)publishFrameState(state.controller,state.status,state.notice);
+}
+/** A target skipped after one stacked camera has already recorded commands is
+ * not an ordinary failed job. Its candidate mask/native textures and literal
+ * feeds belong to the open host encoder and must survive until that encoder's
+ * queue fence. The old displayed target state is intentionally untouched. */
+function retireSkippedTarget(job:TargetJob):void{
+ if(job.retired)return;
+ job.retired=true;
+ const attempts=job.records.map(record=>({played:record.played,cancel(){record.toneLiterals?.reject(Error('Native camera target was skipped before publication'));record.toneLiterals=undefined;}}));
+ void discardPartAnchorAttempt(attempts).finally(()=>{
+  job.native?.destroy();job.native=undefined;job.mask.destroy();
+  for(const record of job.records){record.relationReadback?.dispose();record.relationReadback=undefined;record.partAnchorDemand?.dispose();record.partAnchorDemand=undefined;record.tone?.dispose();record.tone=undefined;record.field?.dispose();record.field=undefined;record.toneSource?.release?.();record.toneSource=undefined;if(record.staging?.mapState==='mapped')record.staging.unmap();record.staging?.destroy();record.staging=undefined;}
+ });
+}
+/** Bind skipped-target retirement to the owning frame fence. The callback is
+ * one-shot even if disposal races the fence's success/rejection handler. */
+export function scheduleSkippedTargetRetirement<T extends {retirementSubmitted?:boolean;retired?:boolean}>(jobs:readonly T[],fence:Promise<void>|undefined,retire:(job:T)=>void):void{
+ // Submission ownership begins when this callback runs, not when the queue
+ // fence settles. Disposal before this point may retire the unsent job; after
+ // this point the fence must be allowed to settle before destruction.
+ const submitted=jobs.filter(job=>!job.retirementSubmitted&&!job.retired);
+ for(const job of submitted)job.retirementSubmitted=true;
+ const release=():void=>{for(const job of submitted){if(job.retired)continue;retire(job);}};
+ if(fence)void fence.then(release,release);else release();
 }
 /** Resolve phase identity once from the same material cohort for both the
  * primary appearance and the construction consumer. No scene-specific path. */
@@ -146,8 +172,6 @@ function sourceLod(world:World,view:View,materials:readonly MaterialGeometryDraw
 
   // native cell is ONE far representation; otherwise its children are visited.
   const workset=sourceViewWorkset(world,view.slot,staging.subarray(offset+32,offset+35),bounds=>fitsParentTier(bounds,clip,view.width,view.height,rect0.width,rect0.height));if(!workset)return;
- const phases=world.resource(PhaseGeometryCapture).views.get(view)??[];
- const known=materials.every(draw=>draw.mesh!==undefined&&!!draw.sourceGeometry&&!draw.gpuIndexedSource)&&phases.every(draw=>draw.renderer.geometryAdapter==='standard-material');
  const rect=view.viewport??{width:view.surfaceTexture?.width??view.width,height:view.surfaceTexture?.height??view.height};
 
  // semantic residual, this revision); unknown keeps the incumbent (not safe).
@@ -158,16 +182,49 @@ function sourceLod(world:World,view:View,materials:readonly MaterialGeometryDraw
  const holdScope=state.lodLifetimes.scope(eid,world.ref(eid),0,false);
  // This workset names entity placements, so split-straddling singles may
  // join certified parents. Producer-row adapters keep the selector's default.
- const drawsByMesh=new Map<number,MaterialGeometryDraw>();for(const draw of materials)if(draw.mesh!==undefined&&!drawsByMesh.has(draw.mesh))drawsByMesh.set(draw.mesh,draw);
- const decorate=(value:typeof workset.instances[number])=>{const draw=value.mesh===undefined?undefined:drawsByMesh.get(value.mesh);return {...value,construction:draw?state.sources.wholeConstruction(draw,value.mesh,value.eid,value.worldFromSource):undefined,smallParent:draw?state.sources.smallParent(draw):undefined};};
- const instances=workset.instances.map(decorate),parents=workset.parents?.map(parent=>({...parent,instances:parent.instances.map(decorate)}));
+ // LOD admission is per engine-owned source instance.  The old `known` bit
+ // combined every material and phase in the view, so one non-standard or
+ // GPU-indexed producer disabled every unrelated regular source.  Conversely,
+ // GPU-indexed sources have their own generation/chart consumer and must not
+ // enter the CPU source-parent path merely because the engine supplied a
+ // conservative cull sphere.  A missing authority is deliberately flattened
+ // to the complete incumbent; no rest bound or phase-adapter inference is
+ // substituted here.
+ const sourceMeshes=new Set<number>(),gpuIndexedMeshes=new Set<number>();
+ const drawsByMesh=new Map<number,MaterialGeometryDraw>();
+ for(const draw of materials)if(draw.mesh!==undefined){
+  if(draw.gpuIndexedSource)gpuIndexedMeshes.add(draw.mesh);
+  else if(draw.sourceGeometry){sourceMeshes.add(draw.mesh);if(!drawsByMesh.has(draw.mesh))drawsByMesh.set(draw.mesh,draw);}
+ }
+ type EngineSourceViewInstance=typeof workset.instances[number]&{readonly boundsAuthority?:string};
+ const authorityOf=(value:typeof workset.instances[number]):EngineSourceViewInstance=>value as EngineSourceViewInstance;
+ const certified=(value:typeof workset.instances[number])=>{const candidate=authorityOf(value);return sourceMeshes.has(candidate.mesh)&&!gpuIndexedMeshes.has(candidate.mesh)&&!!candidate.bounds&&candidate.bounds.length>=6&&candidate.boundsAuthority!==undefined;};
+ const decorate=(value:typeof workset.instances[number])=>{
+  const draw=value.mesh===undefined?undefined:drawsByMesh.get(value.mesh),admitted=certified(value);
+  // Keep a settling producer's explicit pending state so the selector's
+  // bounded warmup remains intact.  Unknown, GPU-indexed and unowned values
+  // instead become an ordinary full-detail incumbent, not a deferred/blank
+  // source and not a parent candidate.
+  const incumbent=admitted||value.boundsPending?value:{...value,bounds:undefined,boundsAuthority:undefined,boundsPending:false};
+  return {...incumbent,construction:admitted&&draw?state.sources.wholeConstruction(draw,value.mesh,value.eid,value.worldFromSource):undefined,smallParent:admitted&&draw?state.sources.smallParent(draw):undefined};
+ };
+ const instances=workset.instances.map(decorate),parents:{readonly bounds:readonly number[];readonly instances:ReturnType<typeof decorate>[];readonly key?:number}[]|undefined=workset.parents?[]:undefined;
+ // A parent is only a valid representation when every member is admitted to
+ // the same CPU source consumer.  Otherwise descend to all its members; a
+ // mixed parent/child output would suppress unsupported members or draw twice.
+ if(workset.parents)for(const parent of workset.parents){
+  const members=parent.instances.map(decorate);
+  if(members.every(certified))parents!.push({...parent,instances:members});
+  else instances.push(...members);
+ }
+ const lodMembers=[...instances,...(parents??[]).flatMap(parent=>parent.instances)];
  // The source selector asks the already-prepared resident grammar, never
  // rebuilds/searches the authoring role bank. GpuArticulation owns this seam.
- const nativePart=state.playback?.wholePartAvailable.bind(state.playback);
+ const nativePart=state.playback?.wholePartAvailable?.bind(state.playback);
 
  // the complete source size the form-table writer resolves held levels from.
- const bounds=workset.instances.flatMap(instance=>instance.bounds&&instance.bounds.length>=6&&!instance.boundsPending?[{mesh:instance.mesh,eid:instance.eid,bounds:instance.bounds}]:[]);
- const selection=selectSourceLod(instances,staging.subarray(offset,offset+16),view.width,view.height,rect.width,rect.height,workset.exterior&&known,staging[offset+30]!==0,parents,parentHolds.get(holdScope),profileSafe,member=>world.ref(member),cache,true,
+ const bounds=lodMembers.flatMap(instance=>instance.bounds&&instance.bounds.length>=6&&!instance.boundsPending&&certified(instance)?[{mesh:instance.mesh,eid:instance.eid,bounds:instance.bounds}]:[]);
+ const selection=selectSourceLod(instances,staging.subarray(offset,offset+16),view.width,view.height,rect.width,rect.height,workset.exterior,staging[offset+30]!==0,parents,parentHolds.get(holdScope),profileSafe,member=>world.ref(member),cache,true,
   (parent,rows,width)=>state.playback?.smallConstructionAvailable(parent,rows,width)===true,parentHolds.getSmall(holdScope),nativePart);
  parentHolds.set(holdScope,selection.heldParents??new Set(),selection.heldSmall??new Set());
 
@@ -283,6 +340,28 @@ function build(world:World):void{
     // A moved camera owns its current dependencies, not the previous view's
     // still-running background compilation. prepare keeps that work resident.
     state.registration=undefined;
+    // Native indirect membership does not expose its live count to the host.
+    // Before appending a multi-instance deforming source, admit the complete
+    // incumbent boundary/contour pipelines asynchronously. The previous text
+    // publication and the current primary field remain retained while this
+    // source capability is prepared; append never compiles or drops it.
+    const needsNativeFallback=[...materialViews].some(([eid,materials])=>{
+      const selection=sourceLods.get(eid);
+      return materials.some(draw=>{
+        const source=state.sources.acquire(draw,selection);
+        if(!source||isCompiledFarForm(source)||('kind' in source&&source.state==='empty'))return false;
+        return needsCompleteNativeRelationFallback(draw,source);
+      });
+    });
+    if(needsNativeFallback&&!state.graph.nativeCompleteFallbackReady()){
+      const preparation=state.graph.prepareNativeCompleteFallback();state.registration=preparation;
+      void preparation.then(()=>{if(state.registration===preparation)state.registration=undefined;},error=>{if(state.registration===preparation)state.registration=undefined;if(!state.disposed)fail(state,error);});
+      // No target jobs have been allocated in this build yet. Preserve the
+      // previous frame's state.jobs until its own frame-submit callback drains
+      // it; clearing that array here would orphan its native/mask resources
+      // while this capability compiles.
+      return;
+    }
     for(const source of state.sources.takeCompiled()){
       installed++;
       if(isGpuIndexedResident(source)||state.playback)continue;
@@ -350,9 +429,10 @@ function build(world:World):void{
   const byTarget=new Map<number,[number,View][]>();
   for(const [eid,view]of world.resource(Views)){if(!displayView(view)||!view.present||!view.depth||!view.surfaceTexture||view.target===undefined)continue;let list=byTarget.get(view.target);if(!list){list=[];byTarget.set(view.target,list);}list.push([eid,view]);}
   const presenting=[...byTarget.values()].flatMap(list=>list.length>1?[...list].sort(([a],[b])=>cameraOrder(b)-cameraOrder(a)):list);
+  const skippedTargets=new Set<number>();
   for(const [eid,view]of presenting){
     if(!displayView(view)||!view.present||!view.depth||!view.surfaceTexture||view.target===undefined)continue;
-    const target=view.target;let targetState=state.targets.get(target);
+    const target=view.target;if(skippedTargets.has(target))continue;let targetState=state.targets.get(target);
     if(!targetState){targetState={publication:new NativePublication<MainTextFrame>(device,glyphs),presentation:new NativePresentation(glyphs,nativeFont.fontSha256),pending:false,serial:0,width:0,height:0};state.targets.set(target,targetState);}
     targetState.width=view.surfaceTexture.width;targetState.height=view.surfaceTexture.height;
     if(targetState.pending||stillTargets.has(target))continue;
@@ -436,21 +516,38 @@ function build(world:World):void{
       if(isGpuIndexedResident(source)&&source.state==='empty')continue;
       materialSources.set(draw,source);
     }
+    let relationPreparation:Promise<void>|undefined;
+    const relationCohortItem=(retained:RetainedMaterialGeometryBatch)=>{
+      const source=materialSources.get(retained.source)!;
+      const selectedOwners=retained.source.nativeVisibleInstanceFrontier?undefined:state.playback?fullMembers(retained.source):selectedEntities;
+      return {batch:retained,source,domain:source.domain,selectedOwners};
+    };
     state.transport.encodeAll(encoder,[...materialSources.keys()],batches=>{
-      const posedBatches:{batch:RetainedMaterialGeometryBatch;source:ResidentRelationSource;domain:number}[]=[];
+      if(relationPreparation)return;
+      state.graph.beginRelationCohort();
+      const posedBatches:{batch:RetainedMaterialGeometryBatch;source:ResidentRelationSource;domain:number;selectedOwners?:readonly number[]}[]=[];
       for(const retained of batches){
-        const source=materialSources.get(retained.source)!;
+        const item=relationCohortItem(retained),source=item.source;
         if(isGpuIndexedResident(source)){
           if(!retained.gpuPose)throw Error('GPU indexed source '+source.id+' has no material-stage pose');
           if(!gpuPoses.has(source.domain)){
             gpuPoses.set(source.domain,state.sources.pose(source,retained.gpuPose).pose.vertices);
           }
         }
-        posedBatches.push({batch:retained,source,domain:source.domain});
+        posedBatches.push(item);
       }
     // Native GPU counts still own every draw. Unlike physical static batches,
     // these must not host-reserve faces from instance/vertex capacities.
       state.graph.reservePartAnchors(posedBatches);
+      // A complete cohort must be admitted before its first relation writer.
+      // Do not route an over-budget/unknown source through the split consumer,
+      // and do not publish a blank job while the separate incumbent module is
+      // compiling; the target keeps its last publication and retries this same
+      // pose when registration resolves.
+      if(state.graph.completeIncumbentFallbackNeeded()&&!state.graph.nativeCompleteFallbackReady()){
+        relationPreparation=state.graph.prepareNativeCompleteFallback();
+        return;
+      }
       // The engine's packed membership and exact indirect slice are the only
       // certified native frontier. Compact it before contacts, relations,
       // anchors and interior work; those consumers reuse the same list.
@@ -460,9 +557,20 @@ function build(world:World):void{
 
       // only for its full members (GPU owner selection); its far members are
       // the far-form class below. Without a far form every member stays full.
-      try{for(const item of posedBatches){const selectedOwners=item.batch.source.nativeVisibleInstanceFrontier?undefined:state.playback?fullMembers(item.batch.source):selectedEntities;state.graph.append(encoder,item.batch,item.source,relationView,item.domain,selectedOwners,pass);}}
+      try{for(const item of posedBatches){state.graph.append(encoder,item.batch,item.source,relationView,item.domain,item.selectedOwners,pass);}}
       finally{pass.end();}
-    });
+    },windows=>state.graph.prepareRelationCohorts(windows.map(batches=>batches.map(relationCohortItem))));
+    if(relationPreparation){
+      state.graph.finish(encoder,false);
+      state.registration=relationPreparation;
+      void relationPreparation.then(()=>{if(state.registration===relationPreparation)state.registration=undefined;},error=>{if(state.registration===relationPreparation)state.registration=undefined;if(!state.disposed)fail(state,error);});
+      // The first camera may already have recorded mask/native copies and
+      // literal feeds into this target's open encoder. Keep the whole target
+      // job in the fence-owned abandoned ledger; destroying it here makes the
+      // later submit read a destroyed resource and can strand its feeds.
+      state.abandonedJobs.add(job);jobs.delete(target);skippedTargets.add(target);
+      continue;
+    }
     const partAnchorDemand=state.graph.finish(encoder);
     const multisampled=world.storage(Camera).antialias.get(eid)!==0;
     const visible=state.visibility[Number(multisampled)]!;
@@ -730,6 +838,11 @@ function present(world:World,views:readonly View[]):void{
   };
   const snapshotLease=ledger.retainSnapshots(submittedResident.map(([,snapshot])=>snapshot),releaseRetired);
   const jobs=state.jobs;state.jobs=[];
+  // A stacked target can be removed from `jobs` after an earlier camera has
+  // already recorded commands. Register each abandoned target once; its
+  // resources stay in the state ledger until this submission's fence settles.
+  const abandoned=[...state.abandonedJobs].filter(job=>!job.retirementRegistered);
+  for(const job of abandoned)job.retirementRegistered=true;
   world.onFrameSubmit(()=>{
 
     // fence publishes nothing (the prior page stays displayed and exported,
@@ -755,7 +868,9 @@ function present(world:World,views:readonly View[]):void{
       finally{snapshotLease.release();releaseRetiredSnapshots();}
     };
     const fence=world.frameFence;
+    const retire=(job:TargetJob):void=>{state.abandonedJobs.delete(job);retireSkippedTarget(job);};
     if(fence)void fence.then(()=>settle(true),()=>settle(false));else settle(true);
+    scheduleSkippedTargetRetirement(abandoned,fence,retire);
     state.playback?.submitted();
     // Resource bookkeeping stays at submission, but a retired snapshot that is
     // still DISPLAYED or owned by a pending fence is released later.
@@ -874,7 +989,9 @@ async function publishRetained(state:MainState,job:TargetJob):Promise<void>{
   if(overflow.triangles)state.graph.ensureContactCapacity(overflow.triangles);
   if(overflow.flags===2){state.relationExtent=Math.max(state.relationExtent,overflow.relations);state.intervalExtents[record.visibility]=Math.max(state.intervalExtents[record.visibility]!,overflow.intervals);}
   for(const result of results)result.resident?.release();
-  if(rowGrowth||standingGrowth)job.state.still=undefined;
+  // A rejected generation can no longer reuse its old parent frontier. The
+  // next live job must select its complete children before relation work.
+  job.state.still=undefined;
   job.native?.destroy();job.mask.destroy();return;
  }
  if(rowGrowth||standingGrowth){
@@ -928,19 +1045,20 @@ export function mainRenderer(options:{ascii?:boolean;rows?:number;geometryCapaci
       // ?grammar=legacy keeps the CPU producer reachable until it is deleted.
       const compiled=options.compiledPlayback??new URL(location.href).searchParams.get('grammar')!=='legacy';
       // All scene/plugin initialize hooks have completed before warm. Admit
-      // the relation capability from registered mesh producers now, so the
-      // required shader closure is compiled before the first frame.
+      // the relation capability from the registered mesh producers now, so
+      // required shader closures are compiled before the first frame rather
+      // than discovered during append.
       const relationProfile=exampleGpuRelationProfile(world);
       const services=await prepareExampleGpuServices(device,options.geometryCapacity??1048576,compiled,(p,stage)=>{publishStartup(stage);onProgress?.(p/2);},startupAbort.signal,relationProfile);
       let state:MainState;
-      try{state={matrix,displayedSnapshots:new Map(),retiredSnapshots:[],world:++nextWorld,transport:services.transport,graph:services.graph,sources:services.sources,visibility:services.visibility,relationExtent:32768,intervalExtents:[131072,131072],construction:new NativeConstruction(glyphs,options.whitespace??'preformatted'),primaryFields:new WeakMap(),lodLifetimes:new FormLodLifetimes(),fields:new Map(),blit:new TextureBlit(device),mask:services.mask,targets:new Map(),jobs:[],controller:{ascii:options.ascii??true,overlay:new URL(location.href).searchParams.get('overlay')==='1',mode:'text',pendingSince:startupSince,get rows(){return matrix.rows;},set rows(rows){if(rows!==undefined&&(!Number.isInteger(rows)||rows<1||rows>matrix.maxRows))throw Error(`Rows must be an integer from 1 to ${matrix.maxRows}`);matrix.rows=rows;},get pending(){const published=this.frames.size>0||this.residentFrames.size>0;return !state.disposed&&(!published||!!state.registration||this.paused&&!state.pauseLatched||[...state.targets.values()].some(target=>target.pending));},get pendingStage(){if(state.registration)return 'Compiling visible sources';if([...state.targets.values()].some(target=>target.pending))return 'Publishing text frame';return undefined;},underlay:new URL(location.href).searchParams.get('underdrawing')==='1',paused:false,pause(paused){if(paused===this.paused)return;state.pauseLatched=false;this.paused=paused;if(paused)world.pause();else world.resume();},frames:new Map(),residentFrames:new Map(),async exportText(){const entries=[...state.displayedSnapshots];if(!entries.length)return [...this.frames.values()];return Promise.all(entries.map(async([target,snapshot])=>{const frame={...await exportResidentFrame(snapshot),comparison:snapshot.comparison};if(state.displayedSnapshots.get(target)===snapshot)this.frames.set(target,frame);return frame;}));},requestPresentation(){return presentationLedger(this).demand();},graphs:new Map(),errors:[]},serial:0,disposed:false,liveOwners:new Set(),semanticOwners:new Set(),pauseLatched:false};}
+      try{state={matrix,displayedSnapshots:new Map(),retiredSnapshots:[],world:++nextWorld,transport:services.transport,graph:services.graph,sources:services.sources,visibility:services.visibility,relationExtent:32768,intervalExtents:[131072,131072],construction:new NativeConstruction(glyphs,options.whitespace??'preformatted'),primaryFields:new WeakMap(),lodLifetimes:new FormLodLifetimes(),fields:new Map(),blit:new TextureBlit(device),mask:services.mask,targets:new Map(),jobs:[],abandonedJobs:new Set(),controller:{ascii:options.ascii??true,overlay:new URL(location.href).searchParams.get('overlay')==='1',mode:'text',pendingSince:startupSince,get rows(){return matrix.rows;},set rows(rows){if(rows!==undefined&&(!Number.isInteger(rows)||rows<1||rows>matrix.maxRows))throw Error(`Rows must be an integer from 1 to ${matrix.maxRows}`);matrix.rows=rows;},get pending(){const published=this.frames.size>0||this.residentFrames.size>0;return !state.disposed&&(!published||!!state.registration||this.paused&&!state.pauseLatched||[...state.targets.values()].some(target=>target.pending));},get pendingStage(){if(state.registration)return 'Compiling visible sources';if([...state.targets.values()].some(target=>target.pending))return 'Publishing text frame';return undefined;},underlay:new URL(location.href).searchParams.get('underdrawing')==='1',paused:false,pause(paused){if(paused===this.paused)return;state.pauseLatched=false;this.paused=paused;if(paused)world.pause();else world.resume();},frames:new Map(),residentFrames:new Map(),async exportText(){const entries=[...state.displayedSnapshots];if(!entries.length)return [...this.frames.values()];return Promise.all(entries.map(async([target,snapshot])=>{const frame={...await exportResidentFrame(snapshot),comparison:snapshot.comparison};if(state.displayedSnapshots.get(target)===snapshot)this.frames.set(target,frame);return frame;}));},requestPresentation(){return presentationLedger(this).demand();},graphs:new Map(),errors:[]},serial:0,disposed:false,liveOwners:new Set(),semanticOwners:new Set(),pauseLatched:false};}
       catch(error){services.dispose();throw error;}
       world.resource(stateKey).current=state;
 
       world.onDispose(()=>presentationLedger(state.controller).dispose());
       // Register lifetime cleanup BEFORE awaiting driver compilation: an
       // initialization failure or retired world cannot strand its resources.
-      world.onDispose(()=>{state.disposed=true;state.playback?.dispose();state.construction.dispose();disposeControls?.();state.fields.forEach(field=>field.dispose());services.dispose();state.targets.forEach(t=>{t.publication.dispose();t.appearance?.dispose();t.native?.destroy();t.scaledPage?.destroy();});});
+      world.onDispose(()=>{state.disposed=true;for(const job of [...state.abandonedJobs])if(!job.retirementSubmitted&&!job.retired){state.abandonedJobs.delete(job);retireSkippedTarget(job);}state.playback?.dispose();state.construction.dispose();disposeControls?.();state.fields.forEach(field=>field.dispose());services.dispose();state.targets.forEach(t=>{t.publication.dispose();t.appearance?.dispose();t.native?.destroy();t.scaledPage?.destroy();});});
       // Both scene and Y8 defaults use retained GPU construction. The CPU
       // producer is reachable only through the explicit legacy override.
       if(compiled){
