@@ -9,12 +9,14 @@ const COHERENT_PARENT_SECONDARY_FLAG=0x40u;
 // Native-word and source-visibility ownership. Ordinary runs do not carry the
 // marker and therefore retain the existing identity.yz-only behavior. A
 // coherent parent run has one primary owner in identity.yz and the optional
-// second source member in correspondence.xy; the run is still emitted once.
+// second source member in correspondence.xy (kind-4 contacts keep their
+// canonical receiver in paper.xy); the run is still emitted once.
 fn coherentRunOwner(run:Run,owner:vec2u)->bool{
  let ordinary=(owner.x&0xdfffffffu)==run.identity.y&&owner.y==run.identity.z;
  if((run.range.z&COHERENT_PARENT_RUN_FLAG)==0u){return ordinary;}
  let primary=vec2u(run.identity.y&0xdfffffffu,run.identity.z);
- let secondary=vec2u(run.correspondence.x&0xdfffffffu,run.correspondence.y);
+ let canonicalContact=(run.range.z&0x04000000u)!=0u&&(run.part.y&0x1fffffffu)==4u;
+ let secondary=select(vec2u(run.correspondence.x&0xdfffffffu,run.correspondence.y),vec2u(run.paper.x&0xdfffffffu,run.paper.y),canonicalContact);
  let normalized=vec2u(owner.x&0xdfffffffu,owner.y);
  let hasSecondary=(run.range.z&COHERENT_PARENT_SECONDARY_FLAG)!=0u;
  return all(normalized==primary)||(hasSecondary&&all(normalized==secondary));

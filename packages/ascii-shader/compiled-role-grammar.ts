@@ -1052,10 +1052,9 @@ export function packFeatureGrammar(font:readonly NativeGlyph[],width:number,poli
  }
  const growthAt=wholeGrowthTableOffset(packedSmallRecords.length);
  // Compile whole words and their paper once, in the SAME retained-entry order
- // used by softPartRecord. An authored empty row keeps the complete incumbent
- // until that programme can represent it; it must not shift later entry IDs.
+ // used by softPartRecord. Authored empty rows remain present zero-atom rows;
+ // they do not erase a complete programme or shift later entry IDs.
  const nativeRows=packNativeRowPrograms(partEntries.map((entry,index)=>{
-  if(entry.native.rows.some(row=>!nativeRoleText(row).trim()))return undefined;
   return compileNativeRowUnits(font,{
    role:entry.role,context:{tangentIn:entry.context.tangent_in,tangentOut:entry.context.tangent_out,
     curvature:entry.context.curvature,inside:entry.context.inside,paper:entry.context.paper},

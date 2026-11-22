@@ -39,7 +39,7 @@ fn nativeWholeRowFits(record:u32,whole:vec4i,sourceRow:i32)->bool{
  let base=wholePartWordBase();let partRows=i32(grammar[record+5u]);let nativeRow=wholePartNativeRow(sourceRow,whole.w,partRows);
  let rowAddr=nativeWholeRow(record,nativeRow);if(rowAddr==NONE){return false;}
  let extra=u32(whole.z)-(grammar[record+4u]&0xffffu);let growth=nativeRowGrowth(base,rowAddr,extra);if(growth.w==NONE){return false;}
- let first=nativeWholeAtoms(base,rowAddr);let count=grammar[rowAddr+11u];if(count==0u){return false;}
+ let first=nativeWholeAtoms(base,rowAddr);let count=grammar[rowAddr+11u];if(count==0u){return grammar[rowAddr+9u]==0u;}
  var previousEnd=-2147483647;
  for(var atom=0u;atom<count;atom++){
   let at=first+atom*${NATIVE_ROW_ATOM_STRIDE}u;let copies=nativeWholeCopies(rowAddr,at,growth);

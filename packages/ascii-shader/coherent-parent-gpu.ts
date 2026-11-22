@@ -159,14 +159,25 @@ fn coherentSourceParts(input:Input,local:u32)->bool{
   var top=1e30;var bottom=-1e30;
   for(var segment=0u;segment<segments;segment++){
    var a=sourcePoint(input,pose,geometry,segment,count,feature);var b=sourcePoint(input,pose,geometry,(segment+1u)%count,count,feature);
+   if(contact){
+    if(segment==0u){a.visible.z=programWord(input,base+4u);}
+    if(segment+1u==segments){b.visible.z=programWord(input,base+5u);}
+   }
    if(contour){a.visible.w=segment+1u;b.visible.w=segment+1u;a.visible.z=segment;b.visible.z=(segment+1u)%count;a.position.w=f32(segment)/f32(segments);b.position.w=f32(segment+1u)/f32(segments);}
    if(closed&&segment+1u==count){b.position.w=1.0;}
    points[at.x+segment*2u]=a;points[at.x+segment*2u+1u]=b;top=min(top,min(a.position.y,b.position.y));bottom=max(bottom,max(a.position.y,b.position.y));
   }
   let rows=u32(clamp(floor(top)+16384.0,0.0,65535.0))|(u32(clamp(ceil(bottom)+16384.0,0.0,65535.0))<<16u);
   let pathFlags=select(0x80000000u|0x40000002u,0x04000000u|(2u<<8u)|role,contact)|${COHERENT_PARENT_RUN_FLAG}u|select(0u,${COHERENT_PARENT_SECONDARY_FLAG}u,hasSecondary);
+  let receiverOwner=select(primary,secondary,hasSecondary);
+  let receiverDomain=(receiverOwner.x&0x1fffffffu)|(receiverOwner.x&0x80000000u);
+  let receiver=vec4u(receiverDomain,receiverOwner.y,feature,programWord(input,base+4u));
+  let part=select(vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(feature,4u,0u,0u),contact);
+  let legacyPaper=vec4u(0u,count,rows,role|select(0u,0x80000000u,relation)|select(0u,0x40000000u,contact)|select(0u,0x20000000u,relationParent)|select(0u,0x10000000u,compoundParent)|select(0u,${SOURCE_COARSE_CONTOUR_FLAG}u,contour));
+  let paper=select(legacyPaper,receiver,contact);
   let lineage=select(coherentFirstAlias(input,i),coherentFirstRelatedFeature(input,i,feature),relation);
-  runs[at.y]=Run(vec4u(at.x,pointCount,pathFlags,(feature<<5u)|(role<<2u)),vec4u(feature,primary,feature),vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(0u,count,rows,role|select(0u,0x80000000u,relation)|select(0u,0x40000000u,contact)|select(0u,0x20000000u,relationParent)|select(0u,0x10000000u,compoundParent)|select(0u,${SOURCE_COARSE_CONTOUR_FLAG}u,contour)),vec4u(secondary,input.program.z,lineage));
+  let correspondence=select(vec4u(secondary,input.program.z,lineage),vec4u(feature,programWord(input,base+4u),programWord(input,base+5u),lineage),contact);
+  runs[at.y]=Run(vec4u(at.x,pointCount,pathFlags,(feature<<5u)|(role<<2u)),vec4u(feature,primary,feature),part,paper,correspondence);
  }}
  return sourceMode;
 }`;

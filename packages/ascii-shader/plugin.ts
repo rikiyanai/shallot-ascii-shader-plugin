@@ -784,7 +784,11 @@ function canvasChange(state:MainState|undefined,view:View):string{
   if(presentedCanvas.get(view.context!)!==canvasKey(state,view))return 'target';
   if(view.target===undefined)return 'unbound';
   const target=state.targets.get(view.target);
-  if(!target||target.error||!target.resident&&!target.frame)return 'first';
+  if(!target||target.error)return 'first';
+  // A targetless frame still flushes pending GPU work. Do not repeatedly
+  // acquire/clear the canvas while awaiting the first page; an already-ready
+  // page below must remain presentable even while its successor is pending.
+  if(!target.resident&&!target.frame)return target.pending?'':'first';
   if(target.resident)return state.displayedSnapshots.get(view.target)!==target.resident?'page':'';
   return target.publication.frame!==controller.frames.get(view.target)?'page':'';
 }

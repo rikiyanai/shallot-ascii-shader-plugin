@@ -7,7 +7,7 @@
   "sourceSha256": "a7b19015afa28463f382830ea24efb2bf626939f2daed47ed8d9d6d79782e64d",
   "cursorThreshold": 40,
   "toneWords": 3002,
-  "byteLength": 9443483,
+  "byteLength": 9445671,
   "typedLengths": {
     "instructions": 156672,
     "articulatedInstructions": 156672,
@@ -20,13 +20,13 @@
     "partPaper": 14548,
     "circleProgram": 84,
     "gaps": 29508,
-    "farStrip": 503620,
+    "farStrip": 504167,
     "hardJunctions": 34816,
     "terrainInstructions": 156672,
     "pairedFlanks": 20,
     "foliageEdges": 32
   },
-  "compilerSha256": "01b811f544f8cc60203b687a52fcacba5ef2ef1b7418ac704e219b414bf617ab",
+  "compilerSha256": "f31d99b9a906e9ad4f1b1176c73c667155efd034684f377d2e87b61f9a622129",
   "inputSha256": {
     "assets/glyphs/compiled/aahub-role-grammar-3493185.v1.json": "5bc42ffbb4b48b4ee3e8c0226bd8fe0dc24eae2f67fe77b7e24a3f2487b51714",
     "assets/glyphs/compiled/aahub-role-lookup-3493185.v1.json": "a7b19015afa28463f382830ea24efb2bf626939f2daed47ed8d9d6d79782e64d",
@@ -39,17 +39,17 @@
     "packages/shallot-main/native-glyphs.json": "971d2f0e274b6a5234d357ab96493b8f2f0c77ad9be6b086d1dd91d86c83ca91",
     "packages/shallot-main/compiled-tone-passages.ts": "ee0b4aa0cb3415059acb0939cc5ee05e7549eb83873908ffb1cb5c6d7d54998d",
     "packages/shallot-main/compiled-small-construction.ts": "00483f1072dc923d21f2022d05fa7e6ad20182b360c8c51a58df41940bb13363",
-    "packages/shallot-main/compiled-native-row-units.ts": "f71e126203ca658e10d9cc9802ac63c7bbec89ccef4a2876bd1914a654fae31a",
+    "packages/shallot-main/compiled-native-row-units.ts": "34729ce45c42947ce4407ca4c601fd3db8e9b8a4efa8f63abb511f5740cfe8cc",
     "packages/shallot-main/native-row-program-format.ts": "e2d9e2e8a1df4aed88071e6c1157db7c18e908a41ddd89f142233a629d4bb3cf",
     "assets/glyphs/compiled/aahub-tone-passages-3493185.v1.json": "f0ba743a28e506acd42b8e952dcf4cf89f62a93a86bda4139e66583833f24fed",
-    "packages/shallot-main/compiled-role-grammar.ts": "eaf27b2e314a867c6a6bfe5ea81215ce0f4590eebcbadfb72e2d63a268570f91",
+    "packages/shallot-main/compiled-role-grammar.ts": "8878833f49470ac9931de98ef3c71b4daabff2da2d45babee3d0339bcb00115e",
     "packages/shallot-main/role-grammar-format.ts": "ef26049df86bf783f2c595e703da59969bf88490bbd8fa8445d8d4d07f216a75",
     "packages/shallot-main/packed-role-grammar.ts": "489bd6798f51ebbd150807ffa38443aff91a2fb0a8637dbae2936d02bcf7d507",
     "tools/compile-main-role-bank.mjs": "b9136e9e195e6e4f11b935b2ea75122540cd7c4bd80c1336cc7759b3bb73f20c"
   },
-  "artifactSha256": "32289d1de914ac907f4148027e29ad4bb915c538107e9ee6a5d071eeddd5782d",
-  "gzipByteLength": 653050,
-  "gzipBytes": 653050,
-  "compressedArtifactSha256": "7536926d693ed7f3c7b5e8f913f5d69c8274f68dabce25add1113e94d6f8d64a",
+  "artifactSha256": "aae2344756e8847e31f4d5f743300a59bdc4db84a5610a3f9561a572faeda9e1",
+  "gzipByteLength": 653548,
+  "gzipBytes": 653548,
+  "compressedArtifactSha256": "90bac580d0ba31f345b9cbd5a7ffff04871112dea03bcb85bfd495c8e47dac19",
   "generatedBy": "tools/compile-main-role-bank.mjs"
 }

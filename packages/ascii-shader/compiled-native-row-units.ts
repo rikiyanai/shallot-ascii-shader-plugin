@@ -176,7 +176,7 @@ const parseRow=(row:string,rowPen:number,font:ReadonlyMap<string,{glyph:NativeGl
  }
  finish();
  const ink=words.flatMap(word=>word.atoms.map(atom=>[atom.x,atom.x+atom.advance] as const));
- if(!ink.length)throw Error('Native row contains no ink');
+ if(!ink.length){const fallback=Number.isFinite(rowPen)?rowPen:0;return {words,gaps,left:fallback,right:fallback};}
  return {words,gaps,left:Math.min(...ink.map(pair=>pair[0])),right:Math.max(...ink.map(pair=>pair[1]))};
 };
 const glyphAtoms=(word:Word):readonly NativeRowUnitAtom[]=>Object.freeze(word.atoms.map(atom=>Object.freeze({scalar:atom.scalar,glyph:atom.glyph,x:atom.x,advance:atom.advance})));
@@ -326,12 +326,14 @@ export function compileNativeRowUnits(font:readonly NativeGlyph[],source:NativeR
  if(source.rows.length!==source.rowPenX.length||!source.rows.length)throw Error('Native row source has mismatched or empty rows');
  const glyphMap=new Map<string,{glyph:NativeGlyph;index:number}>(); font.forEach((glyph,index)=>glyphMap.set(glyph.text,{glyph,index}));
  const parsedRows=source.rows.map((row,index)=>parseRow(row,source.rowPenX[index]!,glyphMap));
- const sourceOrigin=Math.min(...parsedRows.map(parsed=>parsed.left));
- const constructionRight=Math.max(...parsedRows.map(parsed=>parsed.right));
+ const nonEmptyRows=parsedRows.filter(parsed=>parsed.words.length>0);if(!nonEmptyRows.length)throw Error('Native row source contains no ink rows');
+ const sourceOrigin=Math.min(...nonEmptyRows.map(parsed=>parsed.left));
+ const constructionRight=Math.max(...nonEmptyRows.map(parsed=>parsed.right));
  const constructionWidth=constructionRight-sourceOrigin;
  const maxGrowthPx=options.maxGrowthPx??Math.max(0,NATIVE_PAGE_WIDTH-constructionWidth);
- const seam=sharedSeam(parsedRows,sourceOrigin,constructionWidth);
- const rows=parsedRows.map((parsed,row)=>compileRow(source,row,parsed,sourceOrigin,seam,policy,maxGrowthPx));
+ const normalizedRows=parsedRows.map(parsed=>parsed.words.length?parsed:{...parsed,left:sourceOrigin,right:sourceOrigin});
+ const seam=sharedSeam(normalizedRows,sourceOrigin,constructionWidth);
+ const rows=normalizedRows.map((parsed,row)=>compileRow(source,row,parsed,sourceOrigin,seam,policy,maxGrowthPx));
  const height=compileHeightProgram(rows,seam);
  return Object.freeze({role:source.role,context:Object.freeze({...source.context}),morphology:source.morphology,policy,rows:Object.freeze(rows),sourceOrigin,constructionWidth,seam,sourceWidth:Object.freeze({min:Math.min(...rows.map(row=>row.authoredWidth)),max:Math.max(...rows.map(row=>row.authoredWidth))}),maxGrowthPx,height});
 }

@@ -28,7 +28,7 @@ import type {SourceWholePartRole} from './source-lod.ts';
 import {compileComputePipelines,prepareComputePipelines,DeviceComputePrograms,type ComputePipelinePlan,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {CONSTRUCTION_POINT_WGSL,POINT_SOURCE_CHART_WGSL,SPAN_SOURCE_TAG,NATIVE_SPAN_SOURCE} from './source-coordinates.ts';
 import {TONE_PASSAGES} from './compiled-tone-passages.ts';
-import {nativeWholeInk,type NativeGlyph,type NativeNeighborhood,type NativeOccurrence} from './native-page.ts';
+import {nativeWholeInk,type NativeDiagnosticProvenance,type NativeGlyph,type NativeNeighborhood,type NativeOccurrence} from './native-page.ts';
 import type {SurfaceField} from './surface-fields.ts';
 import {FORM_DEPTH_WGSL,FORM_DEPTH_HEADER_ROW,NEAR_FROM_ROWS,FAR_STRIP_BELOW_ROWS,LOD_TIER_HOLD,formDepths} from './form-depths.ts';
 import type {NativeSupport} from './native-presentation.ts';
@@ -905,6 +905,10 @@ fn expandWord(row:RowWord)->Word{
    word.data[20]|=${NATIVE_SPAN_SOURCE}u;
   }
   if((run.part.y&0x1fffffffu)==4u){for(var i=0u;i<4u;i++){word.data[28u+i]=run.paper[i];}}
+  // Canonical parent contacts use the otherwise non-span payload words for
+  // BOTH ordered ports. Receiver/feature/first-port alone aliases contacts
+  // sharing the first endpoint; a hash or transient run index cannot fix it.
+  if((run.range.z&0x04000020u)==0x04000020u&&(run.part.y&0x1fffffffu)==4u){word.data[22]=run.correspondence.y;word.data[23]=run.correspondence.z;}
   if(run.range.y>0u){let a=finiteRunStart(run).position;let b=finiteRunEnd(run).position;
    word.data[24]=bitcast<u32>(a.x);word.data[25]=bitcast<u32>(a.y);word.data[26]=bitcast<u32>(b.x);word.data[27]=bitcast<u32>(b.y);}
  }
@@ -8854,6 +8858,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
     const receiver=`${context.camera}/${receiverDomain}/${receiverProducer?'producer-row':'entity'}/${receiverLifetime}`;
     owners.push(receiver);supportOwners.push({reference:receiverLifetime,source:receiverDomain,kind:receiverProducer?'producer-row':'entity'});
     contact=`/receiver-${receiver}/face-${memory[at+30]}/port-${memory[at+31]}`;
+    if((memory[at+20]!&0x04000020)===0x04000020)contact+=`/ports-${memory[at+22]}-${memory[at+23]}`;
    }
    const sourceLocal=memory[at+9]===0&&memory[at+15]===2;
    const sourceEdge=memory[at+9]===0&&(memory[at+15]===1||sourceLocal);
@@ -8905,7 +8910,8 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
     if(glyph.points.length){
      const contributions:NativeOccurrence['contributions'][number][]=[form===3?{source:id,kind:'region',pixels:nativeWholeInk(glyph)}:{source:id,kind:'path',pixels:nativeWholeInk(glyph),parameter:[values[at+2]!,values[at+2]!]}];
      if(contributor)contributions.push({source:contributor,kind:'path',pixels:nativeWholeInk(glyph)});
-     entry.atoms.push({id:ordinal,text:glyph.text,x,row,foreground:memory[at+10]!,contributions});
+     const provenance:NativeDiagnosticProvenance={gpuRunIndex:runIndex,packedWordIndex:index,wordReference:word,advance:memory[at+7]!,flags:memory[at+20]!,sourceRun:memory[at+21]!,sourceStart:[values[at+24]!,values[at+25]!],sourceEnd:[values[at+26]!,values[at+27]!],sourceScalar};
+     entry.atoms.push({id:ordinal,text:glyph.text,x,row,foreground:memory[at+10]!,contributions,provenance});
     }
     x+=glyph.advance;
    }

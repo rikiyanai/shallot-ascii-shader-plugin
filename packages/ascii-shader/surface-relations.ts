@@ -4838,7 +4838,9 @@ export class SurfaceRelations {
             const bound=[...part[0]!.bound];bound[0]=table.buffer;
             pass.setPipeline(pipeline);pass.setBindGroup(0,this.group(table.groups,stage,pipeline,bindings,bound));
             if(stage==='prepareInterior')pass.dispatchWorkgroups(part.length);
-            else if(part.length===1&&part[0]!.dynamic&&indirectOffset!==undefined)pass.dispatchWorkgroupsIndirect(this.batchDispatch!,part[0]!.base2[2]!+indirectOffset);
+            // base2.z addresses the shader's u32 argument array; the WebGPU
+            // indirect API takes bytes. Stage offsets are already byte-based.
+            else if(part.length===1&&part[0]!.dynamic&&indirectOffset!==undefined)pass.dispatchWorkgroupsIndirect(this.batchDispatch!,part[0]!.base2[2]!*4+indirectOffset);
             else{const count=Math.ceil(total/64);pass.dispatchWorkgroups(Math.min(count,limit),Math.ceil(count/limit));}
           }
         }

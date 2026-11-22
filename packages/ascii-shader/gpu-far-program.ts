@@ -1,7 +1,8 @@
-import {farPlayback,CONTOUR_RETRY_WGSL} from './gpu-playback-program.ts';
+import {farPlayback,CONTOUR_RETRY_WGSL,SOURCE_PARENT_VISIBLE_SPAN_WGSL} from './gpu-playback-program.ts';
+import {COHERENT_PARENT_RUN_FLAG} from './coherent-parent-native-gpu.ts';
 export {SOURCE_CONTOUR_NATIVE_RETRY} from './gpu-playback-program.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
-import {SOURCE_WHOLE_NATIVE_ROW_PLAN_MAX,SOURCE_COARSE_CONTOUR_FLAG} from './source-lod.ts';
+import {SOURCE_WHOLE_NATIVE_ROW_PLAN_MAX,SOURCE_COARSE_CONTOUR_FLAG,sourceWholePaperOf} from './source-lod.ts';
 import {SMALL_CONSTRUCTION_WGSL} from './gpu-small-construction.ts';
 import type {SourceConstructionClass} from './gpu-construction-runs.ts';
 
@@ -16,9 +17,13 @@ export const FAR_PLAN_WORDS=8;
 export function sourceContourRetryCapacity(classes:readonly SourceConstructionClass[],runCount:number):number{
  let capacity=0;
  for(const source of classes)if('farForms' in source)for(const aggregate of source.farForms?.aggregates??[]){
-  for(const part of aggregate.construction?.parts??[])capacity+=Math.max(1,part.contributors.length);
+  const value=aggregate.construction;
+  // Every required parent part may refuse, including contacts/openings.
+  // Packing deduplicates some relation records, so this is conservative and
+  // still bounded by the existing run allocation, never a fine-run arena.
+  for(const part of [...(value?.parts??[]),...(value?.openings??[]),...(value?.contacts??[]),...(value?.protectedVoids??[]),...(value?sourceWholePaperOf(value):[])])capacity+=Math.max(1,part.contributors.length);
  }
- return Math.min(runCount,capacity);
+ return Math.min(runCount*2,capacity);
 }
 export const FAR_PLAN_BASE='p.farLoops.w';
 export const FAR_PLAN_LAYOUT=['kind','away','priority','span.x','span.y','span.z','span.w','profileLoops'] as const;
@@ -157,7 +162,7 @@ fn scheduledRunWorkgroup(group:vec3u,family:u32)->u32{
 `;
 
 function planPrepare(source:string,admission=''):string{
- const combined=farPlayback(source)+(admission?'\n'+admission:''),incumbent=functionText(combined,'featurefar');
+ const combined=farPlayback(source,'functions')+(admission?'\n'+admission:''),incumbent=functionText(combined,'featurefar');
  const boundary=incumbent.indexOf(' lineTier=away;');if(boundary<0)throw Error('Missing incumbent far eligibility boundary');
  const open=incumbent.indexOf('{'),body=incumbent.slice(open+1,boundary);
  const tail=admission
@@ -233,7 +238,7 @@ function planEntry(name:'featurefarTerrain'|'featurefarStanding',kind:1|3):strin
 }
 
 function emitter(source:string,name:'featurefarTerrain'|'featurefarStanding',kind:1|3):string{
- const combined=farPlayback(source);
+ const combined=farPlayback(source,'functions');
  const skyline=specializeSkyline(combined,kind);
  const code=replaceFunction(replaceFunction(combined,'farSkyline',skyline),'featurefar',planEntry(name,kind))+
   '\n'+specializeUnits(combined,kind)+'\n'+specializeColumns(combined,kind)+'\n'+specializeCell(combined,kind);
@@ -247,7 +252,7 @@ export type FarKindStages={prepare:string;terrain:string;standing:string;entries
 export function buildFarKindStages(source:string):FarKindStages{
  const rawStanding=cooperativeStanding(emitter(source,'featurefarStanding',3),source),bounds=deriveFarProfileLoopBounds(rawStanding);
  const nativeAdmission=nativeWholeAdmissionFunction(rawStanding);
- const admission=admissionClosure(rawStanding+'\n'+nativeAdmission,farPlayback(source),['farNativeWholeAdmission'])+'\nfn contourSource(run:Run)->bool{return (run.paper.w&'+SOURCE_COARSE_CONTOUR_FLAG+'u)!=0u&&(run.paper.w&0xf0000000u)==0u;}\nfn contourNativeBankCovered(run:Run)->bool{return contourSource(run)&&farNativeWholeAdmission(run);}';
+ const admission=admissionClosure(rawStanding+'\n'+nativeAdmission,farPlayback(source,'functions'),['farNativeWholeAdmission'])+'\nfn contourSource(run:Run)->bool{return (run.paper.w&'+SOURCE_COARSE_CONTOUR_FLAG+'u)!=0u&&(run.paper.w&0xf0000000u)==0u;}\nfn contourNativeBankCovered(run:Run)->bool{return contourSource(run)&&farNativeWholeAdmission(run);}';
  const prepare=isolateComputeEntry(lowerPrepareProfileLoops(planPrepare(source,admission),bounds),'featurefarPrepare');
  const terrain=emitter(source,'featurefarTerrain',1),standing=isolateComputeEntry(lowerStandingProfileLoops(rawStanding,bounds),'featurefarStanding');
  return {prepare,terrain,standing,entries:[{entryPoint:'featurefarPrepare',code:prepare},{entryPoint:'featurefarTerrain',code:terrain},{entryPoint:'featurefarStanding',code:standing}]};
@@ -473,12 +478,22 @@ fn farCompoundParent(runID:u32,run:Run,priority:u32)->bool{
    if(smallConstructionPlayback(safeRunID,smallRun,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);return;}
   }
  }
- if((run.paper.w&0x10000000u)!=0u){if(farCompoundParent(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}return;}
+ if((run.paper.w&0x10000000u)!=0u){
+  let emitted=farCompoundParent(safeRunID,run,priority);
+  if(emitted){atomicStore(&counts[farStatus(safeRunID)],1u);}
+  else if((run.range.z&${COHERENT_PARENT_RUN_FLAG}u)!=0u&&sourceParentVisibleSpan(run)){atomicStore(&counts[farStatus(safeRunID)],1u);farRecordContourRetry(run);}
+  return;
+ }
  // Preserve the incumbent relation-only path for older products. The explicit
  // compound bit above is the only branch that suppresses skyline fallback for
  // ordinary outer parts; relation-free and legacy relation parents retain the
  // existing consumer behavior.
- if((run.paper.w&0x80000000u)!=0u){if(farNativePart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}return;}
+ if((run.paper.w&0x80000000u)!=0u){
+  let emitted=farNativePart(safeRunID,run,priority);
+  if(emitted){atomicStore(&counts[farStatus(safeRunID)],1u);}
+  else if((run.range.z&${COHERENT_PARENT_RUN_FLAG}u)!=0u&&sourceParentVisibleSpan(run)){atomicStore(&counts[farStatus(safeRunID)],1u);farRecordContourRetry(run);}
+  return;
+ }
  if((run.paper.w&${SOURCE_COARSE_CONTOUR_FLAG}u)!=0u){if(farNativePart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}return;}
  if(farNativePart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);return;}
  if(farSkylineStanding(safeRunID,run,span,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}
@@ -498,5 +513,5 @@ fn farCompoundParent(runID:u32,run:Run,priority:u32)->bool{
  const declarations=`var<workgroup> farCachedCells:array<SkyCell,${cells}>;\nvar<workgroup> farWorkgroupKind:u32;\nvar<private> farCacheBase:i32;\n// Native whole-part and retry consumers share the existing invocation-local caches.\n// The hard-boundary producer is owned by PATH hard, not this far-standing stage.\nvar<private> softBlockCacheBase:u32=0xffffffffu;\nvar<private> softBlockCacheCount:u32;\nvar<private> softBlockCacheBounds:vec2u;\nvar<private> boxHold:array<vec4i,24>;\nvar<private> boxHolds:u32;\nvar<private> boxDrawn:array<u32,8>;\nvar<private> boxRowLid:array<vec4f,16>;\nvar<private> boxRowLids:u32;\n`+wordState+wordConstant;
  const canonicalFunctions=retainCanonicalFunctions(canonical,standing,['softPartRecord','markSoftPartPaper','wholePartRowGrowth','wholePartAtomX','wholePartMember','spanPartWord','spanPartSourceWord','interpolatePoint',
   'wholePartHeightRowsFit','nativeWholeRowsFit','nativeWholeEmit','nativeWholeRow']);
- return isolateComputeEntry(standing+'\n'+nativeBridge+'\n'+CONTOUR_RETRY_WGSL+'\n'+SMALL_CONSTRUCTION_WGSL+'\n'+canonicalFunctions+'\n'+base+'\n'+compute+'\n'+declarations+'\n'+WORKGROUP_SCHEDULER_WGSL,'featurefarStanding');
+ return isolateComputeEntry(standing+'\n'+nativeBridge+'\n'+CONTOUR_RETRY_WGSL+SOURCE_PARENT_VISIBLE_SPAN_WGSL+'\n'+SMALL_CONSTRUCTION_WGSL+'\n'+canonicalFunctions+'\n'+base+'\n'+compute+'\n'+declarations+'\n'+WORKGROUP_SCHEDULER_WGSL,'featurefarStanding');
 }

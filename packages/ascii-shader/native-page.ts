@@ -16,6 +16,22 @@ export interface NativeOccurrence {
   readonly foreground?:number;
   /** One intact occurrence may contribute different ink to several sources. */
   readonly contributions:readonly InkContribution[];
+  /** Optional native-export provenance for bounded producer-conflict errors.
+   * This is diagnostic metadata only: identity, admission, deduplication and
+   * fallback decisions must never consume it. */
+  readonly provenance?:NativeDiagnosticProvenance;
+}
+export interface NativeDiagnosticProvenance {
+  readonly gpuRunIndex:number;
+  readonly packedWordIndex:number;
+  readonly wordReference:number;
+  readonly advance:number;
+  readonly flags:number;
+  /** The source-run identity transported in packed data[21]. */
+  readonly sourceRun:number;
+  readonly sourceStart:readonly [number,number];
+  readonly sourceEnd:readonly [number,number];
+  readonly sourceScalar?:number;
 }
 export interface NativeContact {
   readonly id:string;readonly from:string;readonly to:string;
@@ -107,7 +123,12 @@ export class NativePage {
           // Keep the producer failure intact, but expose both conflicting
           // inputs. Never stringify whole glyph masks or page-sized records.
           const address=(value:NativeOccurrence)=>`${JSON.stringify(value.text)} x=${value.x} row=${value.row} spans=${JSON.stringify(value.contributions.slice(0,4).map(part=>part.parameter??null))}`;
-          error(neighborhood.id,`conflicting occurrence identity ${candidate.id}; frame ${serial}; first ${address(existing)}; next ${address(candidate)}`);
+          const provenance=(value:NativeOccurrence)=>{
+            const data=value.provenance;if(!data)return '';
+            const scalar=data.sourceScalar===undefined?'':` sourceScalar=${data.sourceScalar}`;
+            return ` originalGPUrunIndex=${data.gpuRunIndex} packedWordIndex=${data.packedWordIndex} wordReference=${data.wordReference} advance=${data.advance} flags=0x${data.flags.toString(16)} data21=${data.sourceRun} sourceStart=${JSON.stringify(data.sourceStart)} sourceEnd=${JSON.stringify(data.sourceEnd)}${scalar}`;
+          };
+          error(neighborhood.id,`conflicting occurrence identity ${candidate.id}; frame ${serial}; first ${address(existing)}${provenance(existing)}; next ${address(candidate)}${provenance(candidate)}`);
         }
         identities.set(candidate.id,candidate);
         const key=`${candidate.row}:${candidate.x}`,shared=positions.get(key);

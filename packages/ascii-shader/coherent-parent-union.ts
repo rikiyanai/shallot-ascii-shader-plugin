@@ -385,7 +385,8 @@ export function compileCoherentParent(members:readonly CoherentParentMember[]):C
  const list=(kind:'openings'|'contacts'|'protectedVoids'|'paper'):SourceWholeOpening[]=>{
   const values:SourceWholeOpening[]=[];
   for(const member of members){
-   for(const value of member.construction[kind]??[]){
+   const nested=kind==='paper'?member.construction.parts.flatMap(part=>(part.paper??[]).map(value=>({...value,worldFromSource:value.worldFromSource??part.worldFromSource}))):[];
+   for(const value of [...(member.construction[kind]??[]),...nested]){
     const relationContributors=exactContributorSet(value.contributors,known);if(!relationContributors)return [];
     const mapped=relationWorld(value,member);if(!mapped)return [];
     values.push({...mapped,contributors:relationContributors});
@@ -399,7 +400,7 @@ export function compileCoherentParent(members:readonly CoherentParentMember[]):C
  if((members.some(member=>member.construction.openings.length>0)&&openings.length===0)||
     (members.some(member=>member.construction.contacts.length>0)&&contacts.length===0)||
     (members.some(member=>member.construction.protectedVoids.length>0)&&protectedVoids.length===0)||
-    (members.some(member=>member.construction.paper?.length)&&paperSource.length===0))return {status:'children',reason:'invalid-relation'};
+    (members.some(member=>member.construction.paper?.length||member.construction.parts.some(part=>part.paper?.length))&&paperSource.length===0))return {status:'children',reason:'invalid-relation'};
 
  const passages:CoherentPassage[]=[];let passageContributorFailure=false;
  const addPassage=(work:PartWork,geometry:readonly SourceWholePoint[],refs:readonly PartSegment[],full:boolean)=>{
@@ -459,6 +460,7 @@ export function compileCoherentParent(members:readonly CoherentParentMember[]):C
     ['hole',work.member.construction.openings],
     ['hole',work.member.construction.protectedVoids],
     ['paper',work.member.construction.paper??[]],
+    ['paper',(work.part.paper??[]).map(value=>({...value,worldFromSource:value.worldFromSource??work.pose}))],
    ];
    for(const [kind,values] of relationLists)for(const value of values){
     const mapped=relationWorld(value,work.member);
@@ -534,8 +536,9 @@ export function compileCoherentParent(members:readonly CoherentParentMember[]):C
  const contactFeatures=[...new Set(contacts.map(value=>value.feature))];
  const anchors=[...new Set(contacts.flatMap(value=>value.ports))];
  const hasRelations=openingFeatures.length>0||contactFeatures.length>0||allPaper.length>0;
- const compound=hasRelations&&outerFeatures.length&&openingFeatures.length&&contactFeatures.length&&anchors.length?{
-  kind:'planar-openings-contact' as const,outerFeatures,openingFeatures,contactFeatures,anchorVertices:anchors,
+ const contactOnly=!openingFeatures.length&&contactFeatures.length>0&&!protectedVoids.length&&!paperSource.length;
+ const compound=hasRelations&&outerFeatures.length&&contactFeatures.length&&anchors.length&&(openingFeatures.length>0||contactOnly)?{
+  kind:(contactOnly?'planar-contact':'planar-openings-contact') as 'planar-contact'|'planar-openings-contact',outerFeatures,openingFeatures,contactFeatures,anchorVertices:anchors,
  }:undefined;
  if(hasRelations&&!compound)return {status:'children',reason:'invalid-relation'};
  const revision=featureHash(sourceFeatures,members.reduce((hash,member)=>mix(hash,member.construction.revision),2166136261));

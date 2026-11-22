@@ -18,8 +18,8 @@ const MAX_LIST=1<<20;
 const MAX_GEOMETRY_POINTS=1<<22;
 const ROLE_TO_WORD:Readonly<Record<SourceWholePartRole,number>>={cap:0,turn:1,flank:2,return:3};
 const WORD_TO_ROLE:readonly SourceWholePartRole[]=['cap','turn','flank','return'];
-const COMPOUND_TO_WORD:Readonly<Record<SourceWholeCompound['kind'],number>>={'planar-openings-contact':1};
-const WORD_TO_COMPOUND:readonly (SourceWholeCompound['kind']|undefined)[]=[undefined,'planar-openings-contact'];
+const COMPOUND_TO_WORD:Readonly<Record<SourceWholeCompound['kind'],number>>={'planar-openings-contact':1,'planar-contact':2};
+const WORD_TO_COMPOUND:readonly (SourceWholeCompound['kind']|undefined)[]=[undefined,'planar-openings-contact','planar-contact'];
 
 const assertU32=(value:number,label:string):number=>{
  if(!Number.isSafeInteger(value)||value<0||value>0xffffffff)throw new RangeError(`Invalid whole construction ${label}`);

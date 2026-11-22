@@ -1,5 +1,5 @@
 import type {SurfaceField} from './surface-fields.ts';
-import {PARENT_MAX_COLUMNS,SOURCE_COARSE_CONTOUR_FLAG,SOURCE_CONTACT_BOUNDARY_FLAG,SOURCE_CONTACT_LINE_CLASS,sourceWholeConstructionRenderable,type FarFormInstance,type SourceWholeConstruction,type SourceWholeOpening,type SourceWholePartRef,type SourceWholePartRole} from './source-lod.ts';
+import {PARENT_MAX_COLUMNS,SOURCE_COARSE_CONTOUR_FLAG,SOURCE_CONTACT_BOUNDARY_FLAG,SOURCE_CONTACT_LINE_CLASS,sourceWholeConstructionRenderable,sourceWholePaperOf,type FarFormInstance,type SourceWholeConstruction,type SourceWholeOpening,type SourceWholePartRef,type SourceWholePartRole} from './source-lod.ts';
 import {DeviceComputePrograms,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {CONSTRUCTION_POINT_WGSL} from './source-coordinates.ts';
 import {FORM_DEPTH_WGSL,LOD_TIER_HOLD,formDepths} from './form-depths.ts';
@@ -324,7 +324,7 @@ const relationFloatValue=new Float32Array(1),relationFloatWord=new Uint32Array(r
 const relationFloatBits=(value:number):number=>{relationFloatValue[0]=value;return relationFloatWord[0]!;};
 const relationKey=(item:SourceWholeOpening):string=>`${item.feature}:${item.ports.join(',')}:${item.contributors.map(pair=>`${pair[0]}:${pair[1]}`).join(',')}:${item.worldFromSource?Array.from(item.worldFromSource,relationFloatBits).join(','):''}:${item.geometry?.map(point=>point.map(relationFloatBits).join(',')).join(';')??''}`;
 const relationListKey=(kind:SourceWholePartRef['relationKind'],item:SourceWholeOpening):string=>`${kind==='contact'?'contact':'boundary'}:${relationKey(item)}`;
-const relationLists=(value:SourceWholeConstruction):readonly (readonly [readonly SourceWholeOpening[],SourceWholePartRef['relationKind']])[]=>[[value.openings,'opening'],[value.contacts,'contact'],[value.protectedVoids,'protected-void'],[value.paper??[],'paper']];
+const relationLists=(value:SourceWholeConstruction):readonly (readonly [readonly SourceWholeOpening[],SourceWholePartRef['relationKind']])[]=>[[value.openings,'opening'],[value.contacts,'contact'],[value.protectedVoids,'protected-void'],[sourceWholePaperOf(value),'paper']];
 function relationParts(value:SourceWholeConstruction):SourceWholePartRef[]|undefined{
  const seen=new Set<string>(),result:SourceWholePartRef[]=[];
  for(const [items,relationKind] of relationLists(value))for(const relation of items){

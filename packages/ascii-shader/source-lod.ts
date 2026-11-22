@@ -112,11 +112,17 @@ export interface SourceWholeOpening {
  * and every required contact/ground anchor are all present in the same source
  * revision.  Other relation classes deliberately retain their children. */
 export interface SourceWholeCompound {
- readonly kind:'planar-openings-contact';
+ readonly kind:'planar-openings-contact'|'planar-contact';
  readonly outerFeatures:readonly number[];
  readonly openingFeatures:readonly number[];
  readonly contactFeatures:readonly number[];
  readonly anchorVertices:readonly number[];
+}
+/** Paper attached to a part has that part's pose unless it names its own.
+ * Every selector/lowerer must see this same list; union compilation is not
+ * guaranteed to precede direct principal/far playback. */
+export function sourceWholePaperOf(value:SourceWholeConstruction):readonly SourceWholeOpening[]{
+ return [...(value.paper??[]),...value.parts.flatMap(part=>(part.paper??[]).map(paper=>({...paper,worldFromSource:paper.worldFromSource??part.worldFromSource})))];
 }
 /** Source-owned parent construction. The optional-looking arrays are required
  * by the contract so an empty value means "known empty", not "unknown". */
@@ -434,13 +440,15 @@ export type SourceWholeNativePartAdmission=(role:SourceWholePartRole,context:num
  * the selector's separate executable gate below. */
 export function sourceWholeCompoundReady(value:SourceWholeConstruction|SourceWholeConstructionTemplate|undefined):value is (SourceWholeConstruction|SourceWholeConstructionTemplate)&{readonly compound:SourceWholeCompound}{
  const compound=value?.compound;
- if(!compound||compound.kind!=='planar-openings-contact'||!compound.outerFeatures.length||!compound.openingFeatures.length||!compound.contactFeatures.length||!compound.anchorVertices.length)return false;
+ const contactOnly=compound?.kind==='planar-contact';
+ if(!compound||(compound.kind!=='planar-openings-contact'&&!contactOnly)||!compound.outerFeatures.length||!compound.contactFeatures.length||!compound.anchorVertices.length||(!contactOnly&&!compound.openingFeatures.length)||(contactOnly&&compound.openingFeatures.length!==0))return false;
  const u32=(word:number)=>Number.isSafeInteger(word)&&word>=0&&word<=U32_MAX;
  const distinct=(values:readonly number[])=>values.every(u32)&&new Set(values).size===values.length;
  if(!distinct(compound.outerFeatures)||!distinct(compound.openingFeatures)||!distinct(compound.contactFeatures)||!distinct(compound.anchorVertices))return false;
  const parts=new Set(value.parts.map(part=>part.feature)),openings=new Set(value.openings.map(item=>item.feature)),contacts=new Set(value.contacts.map(item=>item.feature));
  const exact=(declared:readonly number[],actual:ReadonlySet<number>)=>declared.length===actual.size&&declared.every(feature=>actual.has(feature));
  const contactPorts=new Set(value.contacts.flatMap(contact=>contact.ports));
+ if(contactOnly&&(value.openings.length>0||value.protectedVoids.length>0||!!value.paper?.length||value.parts.some(part=>part.paper?.length)))return false;
  return exact(compound.outerFeatures,parts)&&exact(compound.openingFeatures,openings)&&exact(compound.contactFeatures,contacts)&&exact(compound.anchorVertices,contactPorts);
 }
 /** Validate only the resident source metadata. This never inspects mesh data,
@@ -491,7 +499,7 @@ export function sourceWholeConstructionRenderable(value:SourceWholeConstruction|
  // children remain available; a camera-local contour retry supplies an
  // explicit owner scope rather than weakening this malformed-generation guard.
  if(isCoherentParentRejected(value))return false;
- const relation=[...value.openings,...value.contacts,...value.protectedVoids,...(value.paper??[])];
+ const relation=[...value.openings,...value.contacts,...value.protectedVoids,...sourceWholePaperOf(value)];
  // A relation is a replacement construction, not a hint to inherit the first
  // part's native turn.  If its own compiled passage is incomplete, the caller
  // must retain/descend to the incumbent children rather than silently drawing
@@ -541,7 +549,7 @@ export function sourceWholeConstructionProductHash(value:SourceWholeConstruction
  */
 export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|undefined,clip:ArrayLike<number>,width:number,height:number,pageWidth:number,pageHeight:number,nativePart?:SourceWholeNativePartAdmission,requireNative=false):value is SourceWholeConstruction{
  if(!sourceWholeConstructionRenderable(value))return false;
- const relation=[...value.openings,...value.contacts,...value.protectedVoids,...(value.paper??[])];
+ const relation=[...value.openings,...value.contacts,...value.protectedVoids,...sourceWholePaperOf(value)];
  // A relation-bearing parent must lower every ordinary part as well: a
  // profile-only parent would close the relation while its children are gone.
  // Relation-free legacy residents may still keep their incumbent profile.
@@ -559,7 +567,7 @@ export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|
  const parts:{readonly part:SourceWholePartRef|SourceWholeOpening;readonly contact:boolean;readonly sourcePart:boolean}[] = [];
  parts.push(...value.parts.map(part=>({part,contact:false,sourcePart:true})),...value.openings.map(part=>({part,contact:false,sourcePart:false})),
   ...value.contacts.map(part=>({part,contact:true,sourcePart:false})),...value.protectedVoids.map(part=>({part,contact:false,sourcePart:false})),
-  ...(value.paper??[]).map(part=>({part,contact:false,sourcePart:false})));
+  ...sourceWholePaperOf(value).map(part=>({part,contact:false,sourcePart:false})));
  const direction=(delta:readonly [number,number]):number=>Math.round((((Math.atan2(delta[1]!,delta[0]!)/(Math.PI*2))+1)%1)*8)&7;
  const rowPlanComplete=(projected:readonly (readonly [number,number])[],closed:boolean,low:number,high:number):boolean=>{
   const covered=new Uint8Array(Math.max(0,high-low+1)),segments=closed?projected.length:projected.length-1;
@@ -624,9 +632,9 @@ export function composeParentConstruction(members:readonly SourceLodInstance[]):
  const identities=members.map(member=>[member.mesh,member.eid] as const),known=new Set(identities.map(pairKey));
  if(known.size!==identities.length)return undefined;
  const programs=members.map(member=>member.construction!);
- const relationPrograms=programs.filter(program=>program.openings.length||program.contacts.length||program.protectedVoids.length||program.paper?.length);
+ const relationPrograms=programs.filter(program=>program.openings.length||program.contacts.length||program.protectedVoids.length||sourceWholePaperOf(program).length);
  const validContributor=(pairs:readonly (readonly [number,number])[])=>pairs.length>0&&pairs.every(pair=>known.has(pairKey(pair)));
- if(programs.some(program=>program.parts.some(part=>!validContributor(part.contributors)||(part.paper??[]).some(item=>!validContributor(item.contributors)))||[...program.openings,...program.contacts,...program.protectedVoids,...(program.paper??[])].some(item=>!validContributor(item.contributors))))return undefined;
+ if(programs.some(program=>program.parts.some(part=>!validContributor(part.contributors)||(part.paper??[]).some(item=>!validContributor(item.contributors)))||[...program.openings,...program.contacts,...program.protectedVoids,...sourceWholePaperOf(program)].some(item=>!validContributor(item.contributors))))return undefined;
  const parts=programs.flatMap(program=>program.parts);
  const openings=programs.flatMap(program=>program.openings),contacts=programs.flatMap(program=>program.contacts),protectedVoids=programs.flatMap(program=>program.protectedVoids);
  const floatValue=new Float32Array(1),floatWord=new Uint32Array(floatValue.buffer),bits=(value:number)=>{floatValue[0]=value;return floatWord[0]!;};
@@ -637,10 +645,11 @@ export function composeParentConstruction(members:readonly SourceLodInstance[]):
   if(program.compound){mix(1);for(const feature of program.compound.outerFeatures)mix(feature);for(const feature of program.compound.openingFeatures)mix(feature);for(const feature of program.compound.contactFeatures)mix(feature);for(const vertex of program.compound.anchorVertices)mix(vertex);}
   return next;
  },2166136261)>>>0;
- const paper=programs.flatMap(program=>program.paper??[]);
+ const paper=programs.flatMap(program=>sourceWholePaperOf(program));
  const compounds=programs.map(program=>program.compound).filter((value):value is SourceWholeCompound=>!!value);
- const compound=relationPrograms.length&&compounds.length===programs.length?{
-  kind:'planar-openings-contact' as const,
+ const contactOnly=!openings.length&&contacts.length>0&&!protectedVoids.length&&!paper.length&&compounds.every(value=>value.kind==='planar-contact');
+ const compound=relationPrograms.length&&compounds.length===programs.length&&(openings.length>0||contactOnly)?{
+  kind:(contactOnly?'planar-contact':'planar-openings-contact') as SourceWholeCompound['kind'],
   outerFeatures:[...new Set(compounds.flatMap(value=>value.outerFeatures))],
   openingFeatures:[...new Set(compounds.flatMap(value=>value.openingFeatures))],
   contactFeatures:[...new Set(compounds.flatMap(value=>value.contactFeatures))],

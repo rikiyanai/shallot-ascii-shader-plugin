@@ -1,4 +1,5 @@
 import {isolateComputeEntry} from './gpu-compute-program.ts';
+import {COHERENT_PARENT_RUN_FLAG} from './coherent-parent-native-gpu.ts';
 
 export const PLAYBACK_FAMILIES=['path','planar','round'] as const;
 export type PlaybackFamily=typeof PLAYBACK_FAMILIES[number];
@@ -15,7 +16,30 @@ export const PATH_HARD_PLAYBACK='pathHard' as const;
 export const PATH_PROGRAM_PLAYBACK='pathProgram' as const;
 /** Existing PATH hard consumer writes the camera-local contour retry. */
 export const SOURCE_CONTOUR_NATIVE_RETRY=64;
-export const CONTOUR_RETRY_WGSL="var<private> farSourceContourEmitted:bool;\nfn farRecordContourRetry(run:Run){\n let base=p.farLoops.w+p.extent.z*8u;\n let slot=atomicAdd(&counts[base],1u);\n if(slot<p.standing.w){let row=p.standing.y+slot/p.standing.z;let field=(slot%p.standing.z)*2u;rowWords[row].data[field]=run.identity.y;rowWords[row].data[field+1u]=run.identity.z;}\n atomicOr(&counts[rowCount()],64u);\n}\n";
+export const CONTOUR_RETRY_WGSL=/* wgsl */`var<private> farSourceContourEmitted:bool;
+fn farRecordContourOwner(owner:vec2u){
+ let base=p.farLoops.w+p.extent.z*8u;
+ let slot=atomicAdd(&counts[base],1u);
+ if(slot<p.standing.w){let row=p.standing.y+slot/p.standing.z;let field=(slot%p.standing.z)*2u;rowWords[row].data[field]=owner.x;rowWords[row].data[field+1u]=owner.y;}
+}
+fn farRecordContourRetry(run:Run){
+ farRecordContourOwner(run.identity.yz);
+ if((run.range.z&0x60u)==0x60u){
+  let contact=(run.range.z&0x04000000u)!=0u&&(run.part.y&0x1fffffffu)==4u;
+  let secondary=select(run.correspondence.xy,run.paper.xy,contact);
+  if(any(secondary!=run.identity.yz)){farRecordContourOwner(secondary);}
+ }
+ atomicOr(&counts[rowCount()],64u);
+}
+`;
+export const SOURCE_PARENT_VISIBLE_SPAN_WGSL=/* wgsl */`fn sourceParentVisibleSpan(run:Run)->bool{
+ for(var pair=0u;pair+1u<run.range.y;pair+=2u){
+  let a=points[run.range.x+pair];let b=points[run.range.x+pair+1u];
+  if((pointVisible(a)||pointVisible(b))&&length(b.position.xy-a.position.xy)>.00001){return true;}
+ }
+ return false;
+}
+`;
 export type PathPlaybackClass='soft'|'softProgram'|'hard'|'anchor'|'pair'|'boundary';
 
 /**
@@ -372,6 +396,19 @@ function specializeSoftProducer(code:string,kind:'legacy'|'program'):string{
   return stripNonProgrammedCanonicalContext(code);
  }
  code=rewriteFunction(code,'softRunPlayback',body=>body.replace('if(runProgramFeature(run)==0u){directionSegments(run);}',''));
+ // Every admitted current entry now carries its complete prepared native row
+ // program, including authored zero-atom rows. Playback reads that plan; it
+ // does not rediscover legacy row-growth construction for every row.
+ code=rewriteFunction(code,'programmedWholePart',()=>`
+ let prepared=sourcePartPrepared(run);if(prepared==NONE||!sourcePartPreparedCanonicalRowsReady(runID,run)){return false;}
+ let record=atomicLoad(&counts[prepared+13u]);let whole=sourcePartPreparedLayout(prepared);if(whole.w<0){return false;}
+ let partRow=row-whole.y;if(partRow<0||partRow>=whole.w){return false;}
+ if(canonicalReady&&canonical.valid==0u){return false;}
+ if(!seen||portion>0u){return true;}
+ if(nativeWholeRow(record,0)==NONE){return false;}
+ var q=sourceQ;var sourceA=points[run.range.x+sourcePair*2u];var sourceB=points[run.range.x+sourcePair*2u+1u];if(canonicalReady){q=canonical.q;sourceA=canonical.a;sourceB=canonical.b;}
+ softWords+=nativeWholeEmit(record,whole,partRow,row,runID,q,priority,sourceA,sourceB,true);return true;
+`);
  code=rewriteFunction(code,'softPortion',body=>{
   const start=' let base=run.range.x;let programFeature=runProgramFeature(run);var role=runRole(run);';
   const end=' let enter=interpolatePoint(points[base+startPair*2u],points[base+startPair*2u+1u],startT);';
@@ -385,7 +422,7 @@ function specializeSoftProducer(code:string,kind:'legacy'|'program'):string{
   body=body.slice(0,at)+prologue+body.slice(to);
   body=removeUntil(body,` // The PART of the form this row of the outline lies on, by the run pass's
 `,' // Programmed source parts consume');
-  body=body.replace(' if(programFeature!=0u&&sourcePartPrepared(run)!=NONE&&programmedWholePart(runID,run,role,size,row,portion,seen,sourcePair,sourceQ,priority,canonicalReady,canonical)){return;}',' if(sourcePartPrepared(run)!=NONE&&programmedWholePart(runID,run,role,size,row,portion,seen,sourcePair,sourceQ,priority,canonicalReady,canonical)){return;}');
+  body=body.replace(' if(programFeature!=0u&&canonicalReady&&sourcePartPrepared(run)!=NONE&&programmedWholePart(runID,run,role,size,row,portion,seen,sourcePair,sourceQ,priority,true,canonical)){return;}','');
   body=body.replace(' var dir=select(softNativeDirection(chord),runDirection,programFeature!=0u&&!canonicalReady);',' var dir=select(softNativeDirection(chord),runDirection,!canonicalReady);');
   const columnMarker=body.includes(' var column=softColumn(table,role,size,dir);')?' var column=softColumn':' let column=softColumn';
   body=removeUntil(body,' if(programFeature==0u&&abs(chord.y)>=9.0){',columnMarker);
@@ -403,7 +440,7 @@ function specializeSoftProducer(code:string,kind:'legacy'|'program'):string{
 export const FAR_STATUS_WGSL=`fn farStatus(runID:u32)->u32{return drawnBase()+p.playback.z+p.extent.z*2u+runID;}
 `;
 function genericFamilyPlayback(source:string,family:PlaybackFamily):string{
- let code=source+'\n'+FAR_STATUS_WGSL;
+ let code=source+'\n'+FAR_STATUS_WGSL+(family==='planar'?CONTOUR_RETRY_WGSL+SOURCE_PARENT_VISIBLE_SPAN_WGSL:'');
  const queueFamily=PLAYBACK_FAMILIES.indexOf(family)+1;
  code=replace(code,'@compute @workgroup_size(64) fn featurecurves(@builtin(global_invocation_id) id:vec3u){\n let runID=scheduledRun(id);',`@compute @workgroup_size(64) fn featurecurves(@builtin(global_invocation_id) id:vec3u){\n let runID=scheduledRunFamily(id,${queueFamily}u);`);
  code=replace(code,' let boundary=wholeBoundaryFlags(run);\n',` let boundary=wholeBoundaryFlags(run);
@@ -417,6 +454,19 @@ function genericFamilyPlayback(source:string,family:PlaybackFamily):string{
  // per-invocation zero value made this loop empty in the combined kernel.
  if(family!=='planar')code=replace(code,BOX_HOLD_READ,'');
  if(family!=='round')code=replace(code,ROUND,'');
+ if(family==='planar'){
+  // Only an early selected coherent parent owns this all-or-children retry.
+  // Ordinary surface contacts keep their existing producer and lifetime path.
+  const contact=` if((boundary&0x100000u)!=0u){hardBoundaryConstruction(runID,run,priority,true);return;}
+ if((boundary&0x4000000u)!=0u){
+  let required=(run.range.z&${COHERENT_PARENT_RUN_FLAG}u)!=0u&&(run.part.y&0x1fffffffu)==4u;
+  farSourceContourEmitted=false;hardBoundaryConstruction(runID,run,priority,false);
+  if(required&&!farSourceContourEmitted&&sourceParentVisibleSpan(run)){farRecordContourRetry(run);}return;
+ }
+`;
+  code=replace(code,PLANAR,contact);
+  code=rewriteFunction(code,'emitMapped',body=>replace(body,' let at=p.proposals.x+slot*',' farSourceContourEmitted=true;\n let at=p.proposals.x+slot*'));
+ }
  if(family!=='path'){
   const from=code.indexOf(' if(anchorOnly&&pointVisible(finiteRunStart(run))){for(var i=0u;i<run.paper.y;i++){');
   const to=code.indexOf('\nvar<workgroup> twinBits:',from);
@@ -535,12 +585,12 @@ function foldUnwrittenBoxHolds(closed:string,entry:string):string{
 // A future writer/escape/initializer makes this fold inapplicable, not a
 // missing drawing: keep that complete original program unchanged.
 const ZERO_FAR_JUNCTION_READ=" for(var side=0u;side<JUNCTION_HOLDS;side++){let held=junctionHold[side];let centre=2*x+i32(advance);if(held.x<held.y&&(row==held.z||row==held.w)&&centre>=held.x&&centre<=held.y){return;}}\n";
-function foldUnwrittenJunction(closed:string,entry:string):string{
+function foldUnwrittenJunction(closed:string,entry:string,closure:'module'|'functions'='module'):string{
  const code=closed.replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/[^\n]*/g,'');
  if(!code.includes('var<private> junctionHold:array<vec4i,JUNCTION_HOLDS>;')||[...code.matchAll(/\bjunctionHold\b/g)].length!==2||closed.split(ZERO_FAR_JUNCTION_READ).length!==2)return closed;
- return isolateComputeEntry(closed.replace(ZERO_FAR_JUNCTION_READ,'\n'),entry);
+ return isolateComputeEntry(closed.replace(ZERO_FAR_JUNCTION_READ,'\n'),entry,closure);
 }
-export function farPlayback(source:string):string{
+export function farPlayback(source:string,closure:'module'|'functions'='module'):string{
  const closed=isolateComputeEntry(replace(source,BOX_HOLD_READ,'')+'\n'+FAR_STATUS_WGSL+`
 @compute @workgroup_size(64) fn featurefar(@builtin(global_invocation_id) id:vec3u){
  let runID=scheduledRunFamily(id,4u);if(runID==0xffffffffu||runID>=p.extent.z){return;}
@@ -556,6 +606,6 @@ export function farPlayback(source:string):string{
  let span=skySpan(run);let far=farKind(run,away,span);
  if((far==1u||far==3u)&&farSkyline(runID,run,far,span,priority)){atomicStore(&counts[farStatus(runID)],1u);}
 }
-`,'featurefar');
- return foldUnwrittenJunction(closed,'featurefar');
+`,'featurefar',closure);
+ return foldUnwrittenJunction(closed,'featurefar',closure);
 }
