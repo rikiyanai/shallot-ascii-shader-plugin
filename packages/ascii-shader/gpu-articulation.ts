@@ -1,5 +1,5 @@
 import {PLAYBACK_FAMILIES,PAIR_PLAYBACK,PATH_HARD_PLAYBACK,PATH_PROGRAM_PLAYBACK,familyPlayback,pathHardPlayback,pathProgramPlayback,pairPlayback,SOURCE_PART_ROW_LOOKUP_WGSL,SOURCE_PART_ROW_TABLE_HEADER_WORDS,SOURCE_PART_ROW_TABLE_MAGIC,SOURCE_PART_ROW_TABLE_VERSION,sourcePartRowTableLayout} from './gpu-playback-program.ts';
-import {buildFarKindStages,FAR_KIND_ENTRIES,FAR_PLAN_WORDS,standingDispatch} from './gpu-far-program.ts';
+import {buildFarKindStages,FAR_KIND_ENTRIES,FAR_PLAN_WORDS,SOURCE_CONTOUR_NATIVE_RETRY,sourceContourRetryCapacity,standingDispatch} from './gpu-far-program.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
 import type {SourcePartAnchorTable} from './surface-relations.ts';
 import {WORD_STRIDE,PAIRED_FLANK_LEANS,FOLIAGE_EDGES_AT,HARD_SLOPE_PHASES,JUNCTION_TWO,JUNCTION_THREE,SOFT_PART_TABLE_VERSION,SOFT_PART_CONTEXTS,SOFT_PART_TABLE_RECORD_WORDS,SOFT_PART_TABLE_RECORDS,SOFT_PART_TABLE_AT,
@@ -89,6 +89,9 @@ export interface ArticulationResult {
   * The complete incumbent remains readable, while host adapters retire this
   * stale layout and replay the same pose with the reusable reserve. */
  readonly standingOwnerDemand?:number;
+ /** Camera-local native refusal. Exact resident source owner pairs; not an
+  * invalid immutable product and never a global source-generation rejection. */
+ readonly sourceContourRetry?:readonly (readonly [number,number])[];
  readonly sourceOverflow?:{readonly flags:number;readonly relations:number;readonly intervals:number;readonly triangles?:number};
  /** Display owns the sealed GPU tape. Materializing its source annotations
   * and scalar page is an explicit export operation, not a frame dependency. */
@@ -770,7 +773,12 @@ export const STAMP_ORDINAL=0x7fe00000;
  * frame-local allocation index.  Anonymous words keep the existing
  * snapshot-local run suffix. */
 export function nativeSourceWordGroupId(input:{readonly owner:string;readonly kind:number;readonly context:number;readonly sourceEdge:number;readonly runIdentity:number;readonly snapshotLocal:boolean;readonly runIndex:number;readonly contact:string}):string{
- const stableSource=input.sourceEdge!==0xffffffff?`/source-run-${input.runIdentity>>>0}`:input.snapshotLocal?`/run-${input.runIndex>>>0}`:'';
+ // A nonzero source context is also a stable source-run address even when
+ // the producer has no point feature to place in data[14]. Without this
+ // branch, context-bearing words with sourceEdge==NONE discarded
+ // run.identity.w and merged distinct native passages under one group.
+ const sourceAddressed=input.sourceEdge!==0xffffffff||input.context!==0;
+ const stableSource=sourceAddressed?`/source-run-${input.runIdentity>>>0}`:input.snapshotLocal?`/run-${input.runIndex>>>0}`:'';
  return `${input.owner}/gpu-run/${input.kind>>>0}/${input.context>>>0}${stableSource}${input.contact}`;
 }
 /** Append the immutable source edge/unit address to a source-word group. */
@@ -2230,7 +2238,18 @@ fn faceEdgeOrdinal(point:Point)->u32{return 0u;}
 // whole rise at one end of every row: a straight box edge read as a wavy
 // staircase and a cube as a pillow (moving-b minimal, the rock island). Each
 // row starts where the edge enters it, so consecutive rows chain.
-fn shallowEdgeRow(id:u32,ordinal:u32,a:Point,b:Point,wholeA:Point,wholeB:Point,row:i32,priority:u32,size:u32,run:Run,block:vec2u,clipped:bool){
+// Hard shallow rows use a full source address: word.data[14] carries the
+// producer's stable source edge, while this local ordinal carries the hard
+// namespace, row offset and every shallow member. The old edgeKey<<12 |
+// row<<20 layout overlapped ordinary hard ordinals (the frozen record was
+// 0x20004000); no local edge guess is substituted for the transported source
+// edge. Eight low bits retain the complete k<160 production loop.
+fn hardShallowOrdinal(rowOffset:u32)->u32{return 0x80000000u|(rowOffset<<8u);}
+fn shallowMemberOrdinal(ordinal:u32,k:u32,hard:bool)->u32{
+ if(hard){return ordinal|k;}
+ return select(ordinal|0x400u|k,ordinal,k==0u);
+}
+fn shallowEdgeRow(id:u32,ordinal:u32,a:Point,b:Point,wholeA:Point,wholeB:Point,row:i32,priority:u32,size:u32,run:Run,block:vec2u,clipped:bool,hard:bool){
  if(row<0||row>=i32(p.extent.y/17u)){return;}
  let d=boxNativeDelta(wholeA,wholeB);
  let screenDelta=b.position.xy-a.position.xy;
@@ -2274,7 +2293,7 @@ fn shallowEdgeRow(id:u32,ordinal:u32,a:Point,b:Point,wholeA:Point,wholeB:Point,r
   let q=interpolatePoint(a,b,clamp((f32(x)+f32(advance)*.5-a.position.x)/screenAdvance,0.0,1.0));
 
   // the passage origin and unit ordinals still advance from the whole edge.
-  if(!clipped||hardUnitVisibleX(run,block,f32(x),f32(x+advance))){sourceWord(id,select(ordinal|0x400u|k,ordinal,k==0u),q,x,row,word,words[word*WS],u32(advance),priority,a,b);}
+  if(!clipped||hardUnitVisibleX(run,block,f32(x),f32(x+advance))){sourceWord(id,shallowMemberOrdinal(ordinal,k,hard),q,x,row,word,words[word*WS],u32(advance),priority,a,b);}
   x+=advance;
  }
 }
@@ -2707,7 +2726,7 @@ fn authoredPairSegment(id:u32,run:Run,a:Point,b:Point,ordinal:u32,dir:u32,curved
   let program=grammar[8]+(((2u*3u+runSize(run))*64u+dir)*17u)*12u;
   if(abs(d.x)*17.0/abs(d.y)>=30.0&&grammar[program+9u]!=1u){
    let visible=pageRows(span);
-   for(var row=visible.x;row<=visible.y;row++){shallowEdgeRow(id,ordinal|(u32(row-span.x)<<20u),a,b,a,b,row,priority,runSize(run),run,vec2u(0u),false);}
+   for(var row=visible.x;row<=visible.y;row++){shallowEdgeRow(id,ordinal|(u32(row-span.x)<<20u),a,b,a,b,row,priority,runSize(run),run,vec2u(0u),false,false);}
    return;
   }
  }
@@ -3092,7 +3111,7 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
 
    let travel=abs(d.x)*17.0/abs(d.y);
    if(travel>=30.0){
-    shallowEdgeRow(id,ordinal|(u32(row-span.x)<<20u),a,b,wholeA,wholeB,row,priority,runSize(run),run,block,fragmented);
+    shallowEdgeRow(id,hardShallowOrdinal(u32(row-span.x)),a,b,wholeA,wholeB,row,priority,runSize(run),run,block,fragmented,true);
     continue;
    }
    if(!rising){
@@ -8001,7 +8020,13 @@ export class GpuArticulation {
   for(const resident of cohort.residents.values())resident.release();cohort.residents.clear();
   for(const member of [...cohort.jobs]){
    if(this.active.has(member)){member.gpu?.runs.dispose();this.release(member);}
-   if(!member.settled){member.settled=true;member.resolve(result);}
+   if(!member.settled){
+    member.settled=true;
+    // A target cohort is retired atomically, but a contour refusal belongs
+    // only to its camera job. Siblings retry unchanged; they must not inherit
+    // another camera's representation downgrade for the same source owner.
+    member.resolve(result.sourceContourRetry&&member!==job?{groups:[],unresolved:[],sourceOverflow:{flags:4,relations:0,intervals:0}}:result);
+   }
    this.detachCohortJob(member);
   }
   for(const [name,seal]of this.frameSeals)if(seal.cohort===cohort)this.frameSeals.delete(name);
@@ -8341,6 +8366,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   // numeric magnitude of an original source address/hash.
   let needed=1;for(const run of job.runs)if(run.points.length&&!run.round)needed+=2;
   const paperWords=rows*Math.ceil(job.width/32),runCount=job.gpu?.count??job.runs.length;
+  const contourRetryCapacity=sourceContourRetryCapacity(job.gpu?.classes??[],runCount);
   const sourceRunCount=job.gpu?.runs.capacity??runCount;
   const descriptorDemand=job.canonicalDescriptorDemand??0,descriptorSlots=sourcePartDescriptorSlots(descriptorDemand);
   // Standing owner capacity is a reusable host reserve, never a source-run
@@ -8362,7 +8388,9 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
 
   const orderWords=rowCapacity>ROW_CAP?rowSlots:0;
   const proposalCapacity=job.proposalCapacity??this.proposalCapacity;
-  const farPlanWords=runCount*FAR_PLAN_WORDS;
+  // Only its scalar count lives in persistent correspondence scratch. The
+  // exact retry pairs use the immutable job-owned row buffer below.
+  const farPlanWords=runCount*FAR_PLAN_WORDS+1;
   // After the drawn table: two loss/copy words and one far-playback status
   // word per run, then the selection
   // cell grids (gridWrite), cleared every frame.
@@ -8403,6 +8431,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   params[40]=activeQueueBase;params[41]=job.gpu?.runs.capacity??0;params[42]=job.gpu?job.runs.length:0;params[43]=job.gpuTone?.capacity??0;
   params[44]=sourceRowBase;params[45]=job.partAnchorSnapshot?.words??0;params[46]=descriptorSlots;
   params[48]=standingOwnerCapacity;
+  params[49]=rowSlots;params[50]=ROW_WORDS/2;params[51]=contourRetryCapacity;
   const rowLayoutBase=transientBase+layout.rowLayoutBase,orderBase=transientBase+layout.orderBase;
   let ordered=orderBase;for(let span=ROW_CAP;span<rowCapacity;span*=2)ordered=orderBase+(ordered===orderBase?orderWords:0);
   params[31]=orderWords?ordered:0;
@@ -8423,7 +8452,9 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   if(job.gpu&&runData.length)this.device.queue.writeBuffer(runs,job.gpu.runs.capacity*RESIDENT_RUN_WORDS*4,runData);
   if(job.gpuTone)encoder.clearBuffer(runs,(job.gpu!.runs.capacity+job.runs.length)*RESIDENT_RUN_WORDS*4,job.gpuTone.capacity*RESIDENT_RUN_WORDS*4);
   const initialCounts=new Uint32Array(rows+4);
-  const rowWords=this.scratch(job,'rows',rowBytes,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST);
+  const contourRetryBytes=Math.ceil(contourRetryCapacity/(ROW_WORDS/2))*ROW_WORDS*4;
+  if(rowBytes+contourRetryBytes>storageLimit)throw Error('Complete native rows and contour retry owners exceed device binding size');
+  const rowWords=this.scratch(job,'rows',rowBytes+contourRetryBytes,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC);
   const seededRows=new Map<number,number[]>();
   // Authored native text is source input, not OCR or a glyph decision. Seed
   // its immutable pens first so the SAME GPU priority pass protects labels.
@@ -8442,6 +8473,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   // header/map are immutable for this job; the producer writes bitsets,
   // prefixes and payload after the explicit source-reduction boundary.
   encoder.clearBuffer(counts,sourceRowBase*4,Math.max(1,sourceRowWords+1)*4);
+  encoder.clearBuffer(counts,(params[39]!+runCount*FAR_PLAN_WORDS)*4,4);
   if(sourceRowLayout){
    const sourceRowSeed=new Uint32Array(SOURCE_PART_ROW_TABLE_HEADER_WORDS+sourceRowLayout.runCount);
    sourceRowSeed.set([SOURCE_PART_ROW_TABLE_MAGIC,SOURCE_PART_ROW_TABLE_VERSION,sourceRowLayout.groupCount,sourceRowLayout.rowCount,sourceRowLayout.blocks,sourceRowLayout.mapBase,sourceRowLayout.groupBase,sourceRowLayout.bitsetBase,sourceRowLayout.prefixBase,sourceRowLayout.payloadBase,sourceRowLayout.touchedRows,sourceRowLayout.runCount]);
@@ -8509,7 +8541,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   // clear THIS page's range in encoder order, including after width changes.
   encoder.clearBuffer(output,capacity*WORD_WORDS*4,rows*(job.width*2+1)*4);
   const proposalStatusOffset=job.gpu?80+epochs.length*4:16;
-  const rowCountsOffset=proposalStatusOffset+16,anchorRowsOffset=rowCountsOffset+rows*4,standingDemandOffset=anchorRowsOffset+4,headerBytes=standingDemandOffset+4;
+  const rowCountsOffset=proposalStatusOffset+16,anchorRowsOffset=rowCountsOffset+rows*4,standingDemandOffset=anchorRowsOffset+4,contourDemandOffset=standingDemandOffset+4,headerBytes=contourDemandOffset+4;
   // Diagnostic counters are not a publication dependency. Their shader is
   // compiled out in normal play; do not clear/copy/map/materialize them there.
   const probeBytes=job.gpu&&MAIN_PROBES?96*4:0;
@@ -8595,6 +8627,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   // source owners claimed by this attempt. It is copied with the same header
   // fence, after all ordered producer dispatches and before publication.
   encoder.copyBufferToBuffer(counts,standingCursorOffset*4,header,standingDemandOffset,4);
+  encoder.copyBufferToBuffer(counts,(params[39]!+runCount*FAR_PLAN_WORDS)*4,header,contourDemandOffset,4);
   if(probeBytes)encoder.copyBufferToBuffer(counts,(rows+4)*4,header,headerBytes,probeBytes);
   if(job.gpu){encoder.copyBufferToBuffer(job.gpu.runs.status,job.gpu.runs.statusOffset,header,16,16);encoder.copyBufferToBuffer(job.gpu.runs.sourceStatus,0,header,32,16);}
   // One host submission/fence publishes the compact native tape. Source
@@ -8609,6 +8642,8 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
   this.submissionMaps.push(()=>{if(!this.disposed&&!job.retireAfterSubmit&&!mapping){mapping=header.mapAsync(GPUMapMode.READ);mapping.catch(()=>{});}});
   this.submittedTasks.push(()=>{void (async()=>{try{if(this.disposed||job.retireAfterSubmit)return;await awaitNativeHeaderMap(mapping??=header.mapAsync(GPUMapMode.READ),{lifecycle:this.disposed||job.retireAfterSubmit?'retired':'active',frame:`${job.width}x${job.height}`,camera,count:'unavailable',capacity,bufferBytes:header.size});if(this.disposed||job.retireAfterSubmit)return;const memory=header.getMappedRange(),h=new Uint32Array(memory),unresolved=h[1]!,count=h[2]!;let overflow=h[0]!;
    const standingDemand=new Uint32Array(memory,standingDemandOffset,1)[0]!;
+   const contourRetry=(overflow&SOURCE_CONTOUR_NATIVE_RETRY)!==0;
+   overflow&=~SOURCE_CONTOUR_NATIVE_RETRY;
    if(standingDemand>standingOwnerCapacity){
     // The cursor is the GPU's complete unique-owner demand, not a source-run
     // estimate. Grow the reusable reserve, but report THIS immutable attempt
@@ -8654,6 +8689,25 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
     this.retryJob(job);return;
    }
    if(overflow)throw Error(`Native GPU playback capacity overflow ${overflow}`);
+   if(contourRetry){
+    if(!job.gpu)throw Error('Source contour refusal has no retained GPU source cohort');
+    const refused=new Uint32Array(memory,contourDemandOffset,1)[0]!;
+    if(refused<1||refused>contourRetryCapacity)throw Error(`Invalid source contour refusal count ${refused}/${contourRetryCapacity}`);
+    const read=this.device.createBuffer({label:'MAIN camera-local contour retry owners',size:refused*8,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+    let owners:readonly (readonly [number,number])[];
+    try{
+     const copy=this.device.createCommandEncoder({label:'MAIN complete-child contour retry'});
+     // counts is persistent and may already hold a later camera job. Only
+     // the row buffer belongs to this exact immutable attempt after submit.
+     copy.copyBufferToBuffer(rowWords,rowBytes,read,0,refused*8);this.device.queue.submit([copy.finish()]);
+     await awaitNativeHeaderMap(read.mapAsync(GPUMapMode.READ),{lifecycle:this.disposed||job.retireAfterSubmit?'retired':'active',frame:`${job.width}x${job.height}`,camera,count:refused,capacity:runCount,bufferBytes:read.size});
+     if(this.disposed||job.retireAfterSubmit)return;
+     const words=new Uint32Array(read.getMappedRange()),unique=new Map<string,readonly [number,number]>();
+     for(let i=0;i<refused;i++){const pair=[words[i*2]!,words[i*2+1]!] as const;unique.set(`${pair[0]}:${pair[1]}`,pair);}
+     owners=[...unique.values()];read.unmap();
+    }finally{read.destroy();}
+    this.resolveCohortOverflow(job,{groups:[],unresolved:[],sourceContourRetry:owners});return;
+   }
    this.rememberRows(camera,job.width,job.height,new Uint32Array(memory,rowCountsOffset,rows),literalCounts);
    if(sealed){
     // Scalar tape capacity only (flag 1): grow from the reported count and

@@ -27,7 +27,7 @@ import {compileSourceFaceMaterialClasses} from './source-material.ts';
 import type {MeshSourceComplex} from './source-complex.ts';
 import {sourceResidencyEdgeCount} from './source-transfer.ts';
 import {exportResidentFrame,type ResidentFrameState,type ResidentNativeSnapshot,residentFrameState} from './resident-native-frame.ts';
-import {ParentGroupCache,ParentHolds,remapSourceWholeConstruction,type FarFormInstance,type SourceLodSelection} from './source-lod.ts';
+import {ParentGroupCache,ParentHolds,remapSourceWholeConstruction,sourceContourRetryKey,type FarFormInstance,type SourceLodSelection,type SourceContourRetryOwner} from './source-lod.ts';
 import {isCoherentParentRejected} from './coherent-parent-union.ts';
 import type {SourceFarForms} from './gpu-source-far-forms.ts';
 import {discardPartAnchorAttempt} from './part-anchor-replay.ts';
@@ -156,7 +156,7 @@ interface Job {
  partAnchorDemand?:PartAnchorDemandReadback;
  sources:readonly PhysicalResidentBatch[];inView:ReadonlySet<PhysicalResidentBatch>;
  capacity:number;intervalCapacity:number;field?:DrawingFieldView['field'];
- retry?:{relations:number;intervals:number;triangles?:number;anchor?:PartAnchorDemand;standingOwnerDemand?:number};
+ retry?:{relations:number;intervals:number;triangles?:number;anchor?:PartAnchorDemand;standingOwnerDemand?:number;sourceContourRetry?:readonly SourceContourRetryOwner[]};
  /** The full-resolution inspection field and D10 image, while an inspection view is on. */
  inspection?:{field:SurfaceField;target:GPUTexture};
  /** This job's field slot (and inspection slot): read by its own same-pose
@@ -184,9 +184,16 @@ interface Job {
  * The returned selection is immutable, so a retry cannot mutate the selection
  * still held by a displayed or newer job.
  */
-export function restoreRejectedParentChildren(lod:SourceLodSelection|undefined):SourceLodSelection|undefined{
+export function restoreRejectedParentChildren(lod:SourceLodSelection|undefined,refusedOwners?:readonly SourceContourRetryOwner[],residentOwner:(mesh:number,eid:number)=>SourceContourRetryOwner=(mesh,eid)=>[mesh,eid]):SourceLodSelection|undefined{
  if(!lod?.parents?.length)return lod;
- const rejected=lod.parents.filter(parent=>isCoherentParentRejected(parent.construction));
+ const refused=new Set((refusedOwners??[]).map(([mesh,eid])=>sourceContourRetryKey(mesh,eid)));
+ // Explicit tuples are scoped to this retained job/camera. The legacy
+ // no-argument path remains only for old callers/tests; production retries
+ // always pass the GPU's exact resident owner tuples and never consult the
+ // global product rejection state.
+ const rejected=refusedOwners!==undefined
+  ?lod.parents.filter(parent=>parent.members.some(member=>refused.has(sourceContourRetryKey(...residentOwner(member.mesh,member.eid)))))
+  :lod.parents.filter(parent=>isCoherentParentRejected(parent.construction));
  if(!rejected.length)return lod;
  const rejectedKeys=new Set(rejected.map(parent=>parent.key));
  const full=new Map<number,readonly number[]>();
@@ -832,7 +839,9 @@ export class PhysicalFrame {
     // this exact pose is no longer resident. Its extents grew above; the
     // newer pose publishes, or a fresh job starts when none is in flight.
     if(this.posed!==retained.pose){this.started=undefined;this.settle(retained);continue;}
-    const restoredLod=restoreRejectedParentChildren(retained.lod);
+    const parentDomains=new Set(retained.sources.map(source=>source.domain));
+    const residentOwner=(mesh:number,eid:number):SourceContourRetryOwner=>[(parentDomains.has(mesh)?((mesh|0x80000000)>>>0):mesh),eid];
+    const restoredLod=restoreRejectedParentChildren(retained.lod,extent.sourceContourRetry,residentOwner);
     if(restoredLod!==retained.lod){
      retained.lod=restoredLod;
      // FormDepths is field-owned and was already reduced for this retained
@@ -1195,6 +1204,13 @@ export class PhysicalFrame {
   // job may already have grown the shared reserve; that does not upgrade this
   // job's immutable layout. A latest stale job still needs a real rebuild.
   if(result.sourceRowDemand!==undefined){this.relations.ensurePartAnchorRowDemand(result.sourceRowDemand);if(this.lastStartedJob===job)this.started=undefined;}
+  if(result.sourceContourRetry!==undefined){
+   if(!result.sourceContourRetry.length)throw Error('Source contour refusal returned no resident owners');
+   // Keep this exact pose and its prepared source/field buffers. The next host
+   // encoder restores only the refused parent owner groups before relations,
+   // form-depth admission and native playback are replayed.
+   job.retry={relations:job.capacity,intervals:job.intervalCapacity,sourceContourRetry:result.sourceContourRetry};return;
+  }
   if(result.sourceOverflow){const overflow=result.sourceOverflow;if(overflow.flags&~22)throw Error(`GPU physical source failure ${overflow.flags}`);if(result.standingOwnerDemand!==undefined)this.playback?.ensureStandingOwnerCapacity(result.standingOwnerDemand);job.retry={relations:Math.max(job.capacity,overflow.relations),intervals:Math.max(job.intervalCapacity,overflow.intervals),triangles:overflow.triangles,standingOwnerDemand:result.standingOwnerDemand};return;}
   if(result.standingOwnerDemand!==undefined){
    // The missing compact carrier kept the complete incumbent. Publish that

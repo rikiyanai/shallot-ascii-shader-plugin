@@ -15,7 +15,7 @@ import type {SourceFarForms} from './gpu-source-far-forms.ts';
 import {SurfaceRelations,RELATION_WORDS,needsCompleteNativeRelationFallback,type PartAnchorDemandReadback} from './surface-relations.ts';
 import {discardPartAnchorAttempt} from './part-anchor-replay.ts';
 import {MeshSourceCache,isGpuIndexedResident,isCompiledFarForm,type ResidentGpuIndexedSource,type ResidentRelationSource} from './source-cache.ts';
-import {selectSourceLod,fitsParentTier,ParentHolds,ParentGroupCache,mergeSourceLod,remapSourceWholeConstruction,type SourceLodSelection} from './source-lod.ts';
+import {selectSourceLod,fitsParentTier,ParentHolds,ParentGroupCache,mergeSourceLod,remapSourceWholeConstruction,sourceContourRetryKey,type SourceLodSelection} from './source-lod.ts';
 import type {SourceComplexRetention} from './source-program.ts';
 import {decodePosedGraph,posedOwnerId,type PosedGraph} from './posed-graph.ts';
 import {RelationVisibility,type ProjectedRelationReadback} from './relation-visibility.ts';
@@ -57,9 +57,15 @@ interface ComparisonView {readonly camera:string;readonly rect:{x:number;y:numbe
 interface ComparisonSource {readonly world:number;readonly target:number;readonly serial:number;readonly engineFrame:number;readonly entities:readonly (readonly [number,number])[];readonly views:readonly ComparisonView[]}
 export interface MainTextFrame extends PresentedNativeFrame {readonly comparison:ComparisonSource;readonly construction:{readonly sourceLines:number;readonly omitted:readonly string[];readonly metrics:NativeFrame['metrics']}}
 type ResidentMainSnapshot=ResidentNativeSnapshot&{readonly comparison:ComparisonSource};
+export type SourceContourRefusal={readonly poseKey:string;readonly owners:ReadonlySet<string>};
+/** Consume a native refusal only when the next source selection is the same
+ * camera/projection cohort. A late result must not downgrade a moved pose. */
+export function sourceContourRefusalForPose(refusal:SourceContourRefusal|undefined,poseKey:string):ReadonlySet<string>|undefined{
+ return refusal?.poseKey===poseKey?refusal.owners:undefined;
+}
 
 type SourceDefinition=Pick<CompositionGeometry,'positions'|'indices'|'revision'>;
-interface CameraRecord {played?:Promise<ArticulationResult>;toneLiterals?:{resolve:(literals:readonly ArticulationLiteral[],tone?:GpuToneMembers)=>void;reject:(error:unknown)=>void};tone?:ToneReadback;toneSource?:{field:SurfaceField;clip:Float32Array;release?:()=>void};classes?:readonly SourceToneClass[];geometry?:readonly CompositionGeometry[];definitions?:ReadonlyMap<number,SourceDefinition>;pose?:DrawingFieldView['pose'];light?:readonly number[];fog?:readonly number[];inks?:Uint32Array;labels?:readonly NativeLabel[];field?:ConstructionFieldReadback;unresolved?:readonly string[];staging?:GPUBuffer;relationReadback?:ProjectedRelationReadback;partAnchorDemand?:PartAnchorDemandReadback;camera:string;cameraEntity:number;depth:GPUTextureView;rect:{x:number;y:number;width:number;height:number};width:number;height:number;capacity:number;intervalCapacity:number;visibility:number;owners:Map<number,number>}
+interface CameraRecord {played?:Promise<ArticulationResult>;toneLiterals?:{resolve:(literals:readonly ArticulationLiteral[],tone?:GpuToneMembers)=>void;reject:(error:unknown)=>void};tone?:ToneReadback;toneSource?:{field:SurfaceField;clip:Float32Array;release?:()=>void};classes?:readonly SourceToneClass[];geometry?:readonly CompositionGeometry[];definitions?:ReadonlyMap<number,SourceDefinition>;pose?:DrawingFieldView['pose'];light?:readonly number[];fog?:readonly number[];inks?:Uint32Array;labels?:readonly NativeLabel[];field?:ConstructionFieldReadback;unresolved?:readonly string[];staging?:GPUBuffer;relationReadback?:ProjectedRelationReadback;partAnchorDemand?:PartAnchorDemandReadback;camera:string;cameraEntity:number;depth:GPUTextureView;rect:{x:number;y:number;width:number;height:number};width:number;height:number;capacity:number;intervalCapacity:number;visibility:number;owners:Map<number,number>;lod?:SourceLodSelection;sourceContourPoseKey?:string;sourceContourOwners?:ReadonlyMap<string,readonly [number,number]>;sourceContourAmbiguous?:ReadonlySet<string>}
 interface TargetState {publication:NativePublication<MainTextFrame>;presentation:NativePresentation;resident?:ResidentMainSnapshot;still?:{parts:StillParts;world:StillWorld;frame:number;serial:number};appearance?:AppearanceHash;native?:GPUTexture;scaledPage?:GPUTexture;pending:boolean;serial:number;width:number;height:number;frame?:NativeFrame;error?:string}
 interface TargetJob {cpuEncodeMs?:number;state:TargetState;source:GPUTexture;native?:GPUTexture;mask:GPUTexture;records:CameraRecord[];width:number;height:number;serial:number;engineFrame:number;error?:string;comparison:ComparisonSource;retirementRegistered?:boolean;/** The frame has been submitted and the queue fence owns these resources. */retirementSubmitted?:boolean;retired?:boolean}
 export interface MainRendererController {
@@ -88,6 +94,9 @@ interface MainState {
   displayedSnapshots:Map<number,ResidentMainSnapshot>;retiredSnapshots:ResidentMainSnapshot[];
   registration?:Promise<void>;
   primaryFields:WeakMap<View,{field:SurfaceField;frame:number;ready:boolean;materials:readonly MaterialGeometryDraw[];selection:SourceLodSelection|undefined}>;
+  /** One-shot camera-local native contour refusals. A new source selection
+   * consumes this set; it is never attached to an immutable product. */
+  sourceContourRefusals:Map<number,SourceContourRefusal>;
   lodLifetimes:FormLodLifetimes;
   physicsContacts?:PhysicsContactHost;contactSourcesFrame?:number;
   controller:{ascii:boolean;underlay:boolean;overlay:boolean;mode:PresentationMode;paused:boolean;rows:number|undefined;readonly pending:boolean;readonly pendingStage?:string;readonly pendingSince?:number;onState?:()=>void;pause(paused:boolean):void;exportText():Promise<readonly MainTextFrame[]>;requestPresentation():Promise<void>;frames:Map<number,MainTextFrame>;residentFrames:Map<number,ResidentFrameState>;graphs:Map<number,readonly PosedGraph[]>;errors:string[]};world:number;serial:number;disposed:boolean;liveOwners:Set<number>;semanticOwners:Set<number>;pauseLatched:boolean;
@@ -161,6 +170,21 @@ function prepareContactSources(world:World,state:MainState):void{
   state.sources.requestContactCorners(world.storage(MeshInstance).mesh.get(eid));
  }
 }
+/** Identity of the camera projection used by one source selection. A native
+ * refusal is reusable only for this exact camera pose/projection; a late
+ * result from a moved camera must be discarded rather than downgrade the next
+ * pose. Float32 rounding matches the values consumed by the GPU staging path. */
+function sourceContourPoseKey(view:View,clip:ArrayLike<number>):string{
+ const values:string[]=[];
+ const append=(source:ArrayLike<number>|undefined)=>{
+  if(!source){values.push('missing');return;}
+  for(let index=0;index<source.length;index++)values.push(Math.fround(source[index]!).toString());
+ };
+ append(view.viewFromWorld);append(clip);
+ values.push(String(view.width),String(view.height));
+ const viewport=view.viewport;values.push(String(viewport?.x??0),String(viewport?.y??0),String(viewport?.width??view.width),String(viewport?.height??view.height));
+ return values.join(',');
+}
 /** Selection precedes source incidence and material extraction. The engine
  * owns conservative posed bounds; the native field still owns visibility.
  * Unknown/custom sources cannot certify an exterior view. */
@@ -180,6 +204,9 @@ function sourceLod(world:World,view:View,materials:readonly MaterialGeometryDraw
  // Groups and their exact ids are cached per world; the hold is per host LOD scope.
  let cache=parentCaches.get(world);if(!cache){cache=new ParentGroupCache();parentCaches.set(world,cache);}
  const holdScope=state.lodLifetimes.scope(eid,world.ref(eid),0,false);
+ const pendingRefusal=state.sourceContourRefusals.get(eid);
+ const refusalPoseKey=pendingRefusal?sourceContourPoseKey(view,clip):undefined;
+ const refusedOwners=sourceContourRefusalForPose(pendingRefusal,refusalPoseKey??'');
  // This workset names entity placements, so split-straddling singles may
  // join certified parents. Producer-row adapters keep the selector's default.
  // LOD admission is per engine-owned source instance.  The old `known` bit
@@ -225,7 +252,8 @@ function sourceLod(world:World,view:View,materials:readonly MaterialGeometryDraw
  // the complete source size the form-table writer resolves held levels from.
  const bounds=lodMembers.flatMap(instance=>instance.bounds&&instance.bounds.length>=6&&!instance.boundsPending&&certified(instance)?[{mesh:instance.mesh,eid:instance.eid,bounds:instance.bounds}]:[]);
  const selection=selectSourceLod(instances,staging.subarray(offset,offset+16),view.width,view.height,rect.width,rect.height,workset.exterior,staging[offset+30]!==0,parents,parentHolds.get(holdScope),profileSafe,member=>world.ref(member),cache,true,
-  (parent,rows,width)=>state.playback?.smallConstructionAvailable(parent,rows,width)===true,parentHolds.getSmall(holdScope),nativePart);
+  (parent,rows,width)=>state.playback?.smallConstructionAvailable(parent,rows,width)===true,parentHolds.getSmall(holdScope),nativePart,refusedOwners??new Set());
+ if(pendingRefusal)state.sourceContourRefusals.delete(eid);
  parentHolds.set(holdScope,selection.heldParents??new Set(),selection.heldSmall??new Set());
 
  // lifetime, engine frame); a path that returns no selection supplies none.
@@ -614,10 +642,23 @@ function build(world:World):void{
     // in a perspective view). The far aggregate emitter (gpu-source-far-forms)
     // writes each as ONE far run; articulation's farKind/farSkyline draws it.
     const toneSourceClasses=[...classes]; // the carrier below is not a tone class
+    let sourceContourOwners:Map<string,readonly [number,number]>=new Map(),sourceContourAmbiguous:Set<string>=new Set();
     if(state.playback){
       const farDomain=new Map<number,number>();
       for(const {draw,source}of resident){if(!source||draw.mesh===undefined)continue;if(isCompiledFarForm(source))farDomain.set(draw.mesh,source.domain);else{const mixed=mixedFar(draw);if(mixed)farDomain.set(draw.mesh,mixed.form.domain);}}
       const fieldOwner=(mesh:number,eid:number)=>{const domain=farDomain.get(mesh);return domain===undefined?undefined:[domain,eid] as const;};
+      sourceContourOwners=new Map();sourceContourAmbiguous=new Set();
+      const rememberContourOwner=(mesh:number,eid:number):void=>{
+       const resident=fieldOwner(mesh,eid);if(!resident)return;
+       const key=sourceContourRetryKey(resident[0],resident[1]);if(sourceContourAmbiguous.has(key))return;
+       const prior=sourceContourOwners.get(key);
+       if(prior&&(prior[0]!==mesh||prior[1]!==eid)){sourceContourOwners.delete(key);sourceContourAmbiguous.add(key);return;}
+       sourceContourOwners.set(key,[mesh,eid]);
+      };
+      for(const node of sourceLods.get(eid)?.parents??[]){
+       for(const member of node.members)rememberContourOwner(member.mesh,member.eid);
+       for(const item of [...node.construction?.parts??[],...node.construction?.openings??[],...node.construction?.contacts??[],...node.construction?.protectedVoids??[],...node.construction?.paper??[]])for(const [mesh,eid]of item.contributors)rememberContourOwner(mesh,eid);
+      }
       const aggregates=(sourceLods.get(eid)?.parents??[]).map(node=>({key:node.key,box:node.box,construction:remapSourceWholeConstruction(node.construction,fieldOwner),members:node.members.flatMap(member=>{const owner=fieldOwner(member.mesh,member.eid);return owner?[owner]:[];})})).filter(node=>node.members.length);
       const producerDomains=pose.perspective?[...state.graph.fieldDomains??[]]:[];
       if(aggregates.length||producerDomains.length){
@@ -973,6 +1014,26 @@ async function publishRetained(state:MainState,job:TargetJob):Promise<void>{
   }
   return record.played;
  }));
+ let contourRetry=false;
+ for(const [index,result]of results.entries())if(result.sourceContourRetry!==undefined){
+  const record=job.records[index]!,owners=record.sourceContourOwners,ambiguous=record.sourceContourAmbiguous;
+  if(!result.sourceContourRetry.length)throw Error('Source contour refusal returned no resident owners');
+  const prior=state.sourceContourRefusals.get(record.cameraEntity);
+  const scoped=new Set(prior&&prior.poseKey===record.sourceContourPoseKey?prior.owners:[]);
+  for(const [mesh,eid]of result.sourceContourRetry){
+   const key=sourceContourRetryKey(mesh,eid);
+   if(ambiguous?.has(key)||!owners?.has(key))throw Error(`Source contour refusal has no unambiguous host owner mapping ${key}`);
+   const sourceOwner=owners.get(key)!;scoped.add(sourceContourRetryKey(sourceOwner[0],sourceOwner[1]));
+  }
+  state.sourceContourRefusals.set(record.cameraEntity,{poseKey:record.sourceContourPoseKey??'',owners:scoped});contourRetry=true;
+ }
+ if(contourRetry){
+  for(const result of results)result.resident?.release();
+  // The refused cohort never published a partial tape. The next source
+  // selection consumes only this camera's mapped owner set and expands that
+  // parent to complete children; unrelated cameras/products remain untouched.
+  job.state.still=undefined;job.native?.destroy();job.mask.destroy();return;
+ }
  let rowGrowth=false;
  // A sibling target can grow the shared reserve before this result settles.
  // Its old immutable layout still needs a next job even when allocation no
@@ -1051,7 +1112,7 @@ export function mainRenderer(options:{ascii?:boolean;rows?:number;geometryCapaci
       const relationProfile=exampleGpuRelationProfile(world);
       const services=await prepareExampleGpuServices(device,options.geometryCapacity??1048576,compiled,(p,stage)=>{publishStartup(stage);onProgress?.(p/2);},startupAbort.signal,relationProfile);
       let state:MainState;
-      try{state={matrix,displayedSnapshots:new Map(),retiredSnapshots:[],world:++nextWorld,transport:services.transport,graph:services.graph,sources:services.sources,visibility:services.visibility,relationExtent:32768,intervalExtents:[131072,131072],construction:new NativeConstruction(glyphs,options.whitespace??'preformatted'),primaryFields:new WeakMap(),lodLifetimes:new FormLodLifetimes(),fields:new Map(),blit:new TextureBlit(device),mask:services.mask,targets:new Map(),jobs:[],abandonedJobs:new Set(),controller:{ascii:options.ascii??true,overlay:new URL(location.href).searchParams.get('overlay')==='1',mode:'text',pendingSince:startupSince,get rows(){return matrix.rows;},set rows(rows){if(rows!==undefined&&(!Number.isInteger(rows)||rows<1||rows>matrix.maxRows))throw Error(`Rows must be an integer from 1 to ${matrix.maxRows}`);matrix.rows=rows;},get pending(){const published=this.frames.size>0||this.residentFrames.size>0;return !state.disposed&&(!published||!!state.registration||this.paused&&!state.pauseLatched||[...state.targets.values()].some(target=>target.pending));},get pendingStage(){if(state.registration)return 'Compiling visible sources';if([...state.targets.values()].some(target=>target.pending))return 'Publishing text frame';return undefined;},underlay:new URL(location.href).searchParams.get('underdrawing')==='1',paused:false,pause(paused){if(paused===this.paused)return;state.pauseLatched=false;this.paused=paused;if(paused)world.pause();else world.resume();},frames:new Map(),residentFrames:new Map(),async exportText(){const entries=[...state.displayedSnapshots];if(!entries.length)return [...this.frames.values()];return Promise.all(entries.map(async([target,snapshot])=>{const frame={...await exportResidentFrame(snapshot),comparison:snapshot.comparison};if(state.displayedSnapshots.get(target)===snapshot)this.frames.set(target,frame);return frame;}));},requestPresentation(){return presentationLedger(this).demand();},graphs:new Map(),errors:[]},serial:0,disposed:false,liveOwners:new Set(),semanticOwners:new Set(),pauseLatched:false};}
+      try{state={matrix,displayedSnapshots:new Map(),retiredSnapshots:[],world:++nextWorld,transport:services.transport,graph:services.graph,sources:services.sources,visibility:services.visibility,relationExtent:32768,intervalExtents:[131072,131072],construction:new NativeConstruction(glyphs,options.whitespace??'preformatted'),primaryFields:new WeakMap(),sourceContourRefusals:new Map(),lodLifetimes:new FormLodLifetimes(),fields:new Map(),blit:new TextureBlit(device),mask:services.mask,targets:new Map(),jobs:[],abandonedJobs:new Set(),controller:{ascii:options.ascii??true,overlay:new URL(location.href).searchParams.get('overlay')==='1',mode:'text',pendingSince:startupSince,get rows(){return matrix.rows;},set rows(rows){if(rows!==undefined&&(!Number.isInteger(rows)||rows<1||rows>matrix.maxRows))throw Error(`Rows must be an integer from 1 to ${matrix.maxRows}`);matrix.rows=rows;},get pending(){const published=this.frames.size>0||this.residentFrames.size>0;return !state.disposed&&(!published||!!state.registration||this.paused&&!state.pauseLatched||[...state.targets.values()].some(target=>target.pending));},get pendingStage(){if(state.registration)return 'Compiling visible sources';if([...state.targets.values()].some(target=>target.pending))return 'Publishing text frame';return undefined;},underlay:new URL(location.href).searchParams.get('underdrawing')==='1',paused:false,pause(paused){if(paused===this.paused)return;state.pauseLatched=false;this.paused=paused;if(paused)world.pause();else world.resume();},frames:new Map(),residentFrames:new Map(),async exportText(){const entries=[...state.displayedSnapshots];if(!entries.length)return [...this.frames.values()];return Promise.all(entries.map(async([target,snapshot])=>{const frame={...await exportResidentFrame(snapshot),comparison:snapshot.comparison};if(state.displayedSnapshots.get(target)===snapshot)this.frames.set(target,frame);return frame;}));},requestPresentation(){return presentationLedger(this).demand();},graphs:new Map(),errors:[]},serial:0,disposed:false,liveOwners:new Set(),semanticOwners:new Set(),pauseLatched:false};}
       catch(error){services.dispose();throw error;}
       world.resource(stateKey).current=state;
 

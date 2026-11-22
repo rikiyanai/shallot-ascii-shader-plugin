@@ -1,13 +1,26 @@
 import {farPlayback} from './gpu-playback-program.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
-import {PARENT_LEAVE_ROWS} from './source-lod.ts';
+import {PARENT_LEAVE_ROWS,SOURCE_COARSE_CONTOUR_FLAG} from './source-lod.ts';
 import {SMALL_CONSTRUCTION_WGSL} from './gpu-small-construction.ts';
+import type {SourceConstructionClass} from './gpu-construction-runs.ts';
 
 /** Per-run far-kind execution split. The plan is eight u32 words in the
  * existing counts buffer at p.farLoops.w: kind, away, priority, span.xyzw,
  * and packed canonical profile-loop limits. Drawing functions are extracted from
  * the current canonical far playback source before specialization. */
 export const FAR_PLAN_WORDS=8;
+/** Native producer refusal, consumed by the existing complete-child retry. */
+export const SOURCE_CONTOUR_NATIVE_RETRY=64;
+/** Reserve only source-part retry addresses, never a second fine-run arena.
+ * Raw packets may emit once per contributor; coherent packets emit fewer.
+ * Both are bounded by the already prepared run allocation. */
+export function sourceContourRetryCapacity(classes:readonly SourceConstructionClass[],runCount:number):number{
+ let capacity=0;
+ for(const source of classes)if('farForms' in source)for(const aggregate of source.farForms?.aggregates??[]){
+  for(const part of aggregate.construction?.parts??[])capacity+=Math.max(1,part.contributors.length);
+ }
+ return Math.min(runCount,capacity);
+}
 export const FAR_PLAN_BASE='p.farLoops.w';
 export const FAR_PLAN_LAYOUT=['kind','away','priority','span.x','span.y','span.z','span.w','profileLoops'] as const;
 export const FAR_KIND_ENTRIES=['featurefarPrepare','featurefarTerrain','featurefarStanding'] as const;
@@ -306,6 +319,28 @@ function cooperativeStanding(standing:string,canonical:string):string{
  // table for the role/context record; `entryRef` is an opaque source token and
  // is never treated as an index into the native grammar bank.
  const nativeBridge=`
+// A closed principal contour may not fit a resident whole-part entry. It
+// nevertheless already owns a complete ordered source passage. Route
+// that packet through MAIN's canonical hard-boundary/native grammar consumer;
+// never convert it to the neutral skyline or a per-edge search.
+fn farSourceContourNative(runID:u32,run:Run,priority:u32)->bool{
+ var live=false;
+ for(var pair=0u;pair*2u+1u<run.range.y;pair++){
+  let a=points[run.range.x+pair*2u];let b=points[run.range.x+pair*2u+1u];
+  if(pointVisible(a)&&pointVisible(b)&&length(b.position.xy-a.position.xy)>=1.0){live=true;}
+ }
+ if(!live){return false;}
+ farSourceContourEmitted=false;
+ hardBoundaryConstruction(runID,run,priority,false);return farSourceContourEmitted;
+}
+// Only a refused job reads this compact list. Keep the exact source owner,
+// not a global invalid-source bit: visibility/placement is camera-local.
+fn farRecordContourRetry(run:Run){
+ let base=p.farLoops.w+p.extent.z*${FAR_PLAN_WORDS}u;
+ let slot=atomicAdd(&counts[base],1u);
+ if(slot<p.standing.w){let row=p.standing.y+slot/p.standing.z;let field=(slot%p.standing.z)*2u;rowWords[row].data[field]=run.identity.y;rowWords[row].data[field+1u]=run.identity.z;}
+ atomicOr(&counts[rowCount()],${SOURCE_CONTOUR_NATIVE_RETRY}u);
+}
 fn farPartDirection(delta:vec2f)->u32{return u32(round(fract(atan2(delta.y,delta.x)/6.28318530718+1.0)*8.0))&7u;}
 fn farPartContext(run:Run)->u32{
  let contextClass=(run.part.y>>6u)&7u;if(contextClass==0u||run.range.y<2u){return 0u;}
@@ -345,16 +380,16 @@ fn farPartRecord(role:u32,context:u32,sourceRows:i32,sourceWidth:u32,origin:i32)
 // skyline/profile paper fill. Their marker is emitted in the existing role
 // word, so this helper keeps the canonical three-argument consumer ABI while
 // still preventing a global paper mark from erasing an actor through a hole.
-fn farNativePart(runID:u32,run:Run,priority:u32)->bool{
+fn farNativeWholePart(runID:u32,run:Run,priority:u32)->bool{
  let boundaryOnly=(run.paper.w&0xa0000000u)!=0u;
  let feature=run.range.w>>5u;if(feature==0u||run.range.y<2u||run.paper.y==0u){return false;}
- let context=farPartContext(run);if(context==0u){return false;}
- let role=run.paper.w&3u;
  let base=run.range.x;let count=run.range.y/2u;var minY=1e30;var maxY=-1e30;var minX=1e30;var maxX=-1e30;
  for(var pair=0u;pair<count;pair++){let a=points[base+pair*2u].position;let b=points[base+pair*2u+1u].position;minY=min(minY,min(a.y,b.y));maxY=max(maxY,max(a.y,b.y));minX=min(minX,min(a.x,b.x));maxX=max(maxX,max(a.x,b.x));}
  if(!(minY<maxY)||!(minX<maxX)){return false;}
  let firstRow=max(0,i32(floor(minY/17.0)));let lastRow=min(i32(rowCount())-1,i32(floor(maxY/17.0)));let sourceRows=lastRow-firstRow+1;
  if(sourceRows<2||sourceRows>${FAR_PARENT_ROW_PLAN_MAX}){return false;}
+ let context=farPartContext(run);if(context==0u){return false;}
+ let role=run.paper.w&3u;
  let sourceWidth=u32(max(0.0,round(maxX-minX)));
  let record=farPartRecord(role,context,sourceRows,sourceWidth,i32(round(minX)));if(record==NONE){return false;}
  let width=grammar[record+4u]&0xffffu;
@@ -395,6 +430,16 @@ fn farNativePart(runID:u32,run:Run,priority:u32)->bool{
   if(!boundaryOnly){markSoftPartPaper(record,i32(round(minX)),pageRow,nativeRow,growth);}
  }
  return emitted;
+}
+fn farNativePart(runID:u32,run:Run,priority:u32)->bool{
+ boxHolds=0u;
+ if(farNativeWholePart(runID,run,priority)){return true;}
+ let sourceContour=(run.paper.w&${SOURCE_COARSE_CONTOUR_FLAG}u)!=0u&&
+  (run.paper.w&0xf0000000u)==0u;
+ if(!sourceContour){return false;}
+ if(farSourceContourNative(runID,run,priority)){return true;}
+ farRecordContourRetry(run);
+ return false;
 }
 // A compound parent is one coherent source product: ordinary outer passages
 // carry the parent-paper marker, while opening/contact passages carry their
@@ -448,6 +493,7 @@ fn farCompoundParent(runID:u32,run:Run,priority:u32)->bool{
  // ordinary outer parts; relation-free and legacy relation parents retain the
  // existing consumer behavior.
  if((run.paper.w&0x80000000u)!=0u){if(farNativePart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}return;}
+ if((run.paper.w&${SOURCE_COARSE_CONTOUR_FLAG}u)!=0u){if(farNativePart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}return;}
  if(farNativePart(safeRunID,run,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);return;}
  if(farSkylineStanding(safeRunID,run,span,priority)){atomicStore(&counts[farStatus(safeRunID)],1u);}
 }`;
@@ -463,8 +509,40 @@ fn farCompoundParent(runID:u32,run:Run,priority:u32)->bool{
   ['wholeHeightCachePivot','var<private> wholeHeightCachePivot:i32=0;'],
  ].filter(([name])=>!standing.includes('var<private> '+name+':')).map(([,declaration])=>declaration).join('\n');
  const wordConstant=standing.includes('const NATIVE_ROW_NONE:')?'':'\nconst NATIVE_ROW_NONE:u32=0xffffffffu;\n';
- const declarations=`var<workgroup> farCachedCells:array<SkyCell,${cells}>;\nvar<workgroup> farWorkgroupKind:u32;\nvar<private> farCacheBase:i32;\n`+wordState+wordConstant;
- const canonicalFunctions=retainCanonicalFunctions(canonical,standing,['softPartRecord','markSoftPartPaper','wholePartRowGrowth','wholePartAtomX','wholePartMember','spanPartWord','spanPartSourceWord','interpolatePoint',
+ const declarations=`var<workgroup> farCachedCells:array<SkyCell,${cells}>;\nvar<workgroup> farWorkgroupKind:u32;\nvar<private> farCacheBase:i32;\n// hardBoundaryConstruction's source-edge closure is retained in the isolated\n// far stage; keep its invocation-local cache in the same private address space.\nvar<private> softBlockCacheBase:u32=0xffffffffu;\nvar<private> softBlockCacheCount:u32;\nvar<private> softBlockCacheBounds:vec2u;\nvar<private> boxHold:array<vec4i,24>;\nvar<private> boxHolds:u32;\nvar<private> boxDrawn:array<u32,8>;\nvar<private> boxRowLid:array<vec4f,16>;\nvar<private> boxRowLids:u32;\n`+wordState+wordConstant;
+ // This closed stage calls only the non-volume boundary construction. Remove
+ // both impossible volume branches before closure extraction, rather than
+ // making the phone driver compile planar fans and tiny-box stamps anyway.
+ let contourBoundary=functionText(canonical,'hardBoundaryConstruction');
+ for(let removed=0;removed<2;removed++){
+  const masked=codeMask(contourBoundary),start=masked.indexOf('if(volume&&');
+  if(start<0)throw Error('Missing source contour non-volume branch');
+  const open=masked.indexOf('{',start),end=blockEnd(masked,open);
+  contourBoundary=contourBoundary.slice(0,start)+contourBoundary.slice(end);
+ }
+ if(codeMask(contourBoundary).includes('if(volume&&'))throw Error('Unexpected source contour volume branch');
+ contourBoundary=contourBoundary.replace('!volume&&!faceRun','!faceRun')
+  .replace('select(edgeKey<<12u,0u,volume)','edgeKey<<12u')
+  .replace('select(lidKey<<12u,0u,volume)','lidKey<<12u');
+ let contourCanonical=replaceFunction(canonical,'hardBoundaryConstruction',contourBoundary);
+ // Functional submission result, invocation-local: a visible source edge is
+ // not proof that the native boundary actually queued a word. No global count
+ // can answer that question while other source invocations run concurrently.
+ const emit=functionText(contourCanonical,'emitMapped'),record=' let at=p.proposals.x+slot*';
+ contourCanonical=replaceFunction(contourCanonical,'emitMapped',once(emit,record,' farSourceContourEmitted=true;\n'+record));
+ if(codeMask(standing).includes('fn emitMapped(')){
+  let standingEmit=functionText(standing,'emitMapped');
+  // This producer now writes boxHold; the earlier far-only zero-writer fold
+  // is no longer legal. Restore that reader before proposals are queued.
+  if(!codeMask(standingEmit).includes('k<boxHolds;')){
+   const original=codeMask(emit),start=original.indexOf('for(var k=0u;k<boxHolds;k++){');
+   if(start<0)throw Error('Missing canonical source contour hold reader');
+   const open=original.indexOf('{',start),end=blockEnd(original,open);
+   standingEmit=once(standingEmit,' let slot=atomicAdd(&counts[p.proposals.z],1u);',emit.slice(start,end)+'\n let slot=atomicAdd(&counts[p.proposals.z],1u);');
+  }
+  standing=replaceFunction(standing,'emitMapped',once(standingEmit,record,' farSourceContourEmitted=true;\n'+record));
+ }
+ const canonicalFunctions=retainCanonicalFunctions(contourCanonical,standing,['hardBoundaryConstruction','softPartRecord','markSoftPartPaper','wholePartRowGrowth','wholePartAtomX','wholePartMember','spanPartWord','spanPartSourceWord','interpolatePoint',
   'wholePartHeightRowsFit','nativeWholeRowsFit','nativeWholeEmit','nativeWholeRow']);
- return isolateComputeEntry(standing+'\n'+nativeBridge+'\n'+SMALL_CONSTRUCTION_WGSL+'\n'+canonicalFunctions+'\n'+base+'\n'+compute+'\n'+declarations+'\n'+WORKGROUP_SCHEDULER_WGSL,'featurefarStanding');
+ return isolateComputeEntry(standing+'\n'+nativeBridge+'\n'+SMALL_CONSTRUCTION_WGSL+'\n'+canonicalFunctions+'\n'+base+'\n'+compute+'\n'+declarations+'\nvar<private> farSourceContourEmitted:bool;\n'+WORKGROUP_SCHEDULER_WGSL,'featurefarStanding');
 }

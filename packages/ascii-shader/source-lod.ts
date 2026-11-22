@@ -41,6 +41,16 @@ export interface SourceLodInstance {
  /** Immutable source metadata; not itself a parent-eligibility certificate. */
  readonly smallParent?:SourceSmallParent;
 }
+/** Resident source-owner identity returned by a camera-local native refusal.
+ * The first word is the resident domain (including the producer high bit when
+ * the field owner uses it); the second is the retained source owner. */
+export type SourceContourRetryOwner=readonly [number,number];
+/** Stable key for one camera/job refusal scope. This is not a product or
+ * construction identity and must never be cached globally. */
+export function sourceContourRetryKey(mesh:number,eid:number):string{return `${mesh>>>0}:${eid>>>0}`;}
+export function sourceContourRetrySet(owners:readonly SourceContourRetryOwner[]):ReadonlySet<string>{
+ const result=new Set<string>();for(const [mesh,eid] of owners)result.add(sourceContourRetryKey(mesh,eid));return result;
+}
 /** A complete source-owner extent, not a selected edge or an image glyph. */
 
 
@@ -142,6 +152,9 @@ export function sourceWholeContactPathReady(value:SourceWholeOpening|undefined):
 /** Shared source/far marker for the existing open-hard contact consumer. */
 export const SOURCE_CONTACT_BOUNDARY_FLAG=0x04000000;
 export const SOURCE_CONTACT_LINE_CLASS=2;
+/** Run.paper.w marker for a closed source-owned contour that may use the
+ * canonical hard-boundary grammar when the retained whole entry cannot fit. */
+export const SOURCE_COARSE_CONTOUR_FLAG=0x08000000;
 
 /** Source-revision form emitted by the production compiler before an instance
  * identity exists. `sourceContributors` are compiled source-part ordinals,
@@ -470,10 +483,10 @@ export function sourceWholeConstructionReady(value:SourceWholeConstruction|undef
 export function sourceWholeConstructionRenderable(value:SourceWholeConstruction|undefined):value is SourceWholeConstruction{
  if(!sourceWholeConstructionReady(value))return false;
  // A resident product may have passed CPU admission and still be rejected by
- // the actual far producer (coverage, native lowering, or allocation).  Keep
- // the product out of both renderable and executable paths so selectSourceLod
- // descends to the complete incumbent children on the next same-pose replay;
- // never turn a rejected parent into an undefined/legacy skyline.
+ // the actual far producer (coverage, native lowering, or allocation). Keep
+ // that product out of the ordinary selection path so its complete incumbent
+ // children remain available; a camera-local contour retry supplies an
+ // explicit owner scope rather than weakening this malformed-generation guard.
  if(isCoherentParentRejected(value))return false;
  const relation=[...value.openings,...value.contacts,...value.protectedVoids,...(value.paper??[])];
  // A relation is a replacement construction, not a hint to inherit the first
@@ -483,6 +496,23 @@ export function sourceWholeConstructionRenderable(value:SourceWholeConstruction|
  if(relation.length&&value.parts.some(part=>!part.geometry||part.geometry.length<2||typeof part.closed!=='boolean'||!part.worldFromSource))return false;
  return relation.every(item=>!!item.geometry&&item.geometry.length>=2&&typeof item.closed==='boolean'&&
   Number.isSafeInteger(item.entryRef)&&Number.isSafeInteger(item.context)&&!!item.role&&!!item.worldFromSource);
+}
+/**
+ * A source-owned terminal contour for a complete principal product.  This is
+ * deliberately stricter than "has points": the contour must be a closed,
+ * ordered source passage with a real edge at every step.  It is the bounded
+ * fallback for a valid principal part whose projected height is one native
+ * row; it is not a box, a dot, an eye-lid recipe, or permission to pick edges
+ * again during playback.
+ */
+export function sourceWholeCoarseContourReady(part:SourceWholePartRef|undefined):boolean{
+ if(!part||part.closed!==true||!part.geometry||part.geometry.length<3||part.paper?.length)return false;
+ for(let index=0;index<part.geometry.length;index++){
+  const a=part.geometry[index]!,b=part.geometry[(index+1)%part.geometry.length]!;
+  if(a.some(value=>!Number.isFinite(value))||b.some(value=>!Number.isFinite(value)))return false;
+  if(a[0]===b[0]&&a[1]===b[1]&&a[2]===b[2])return false;
+ }
+ return true;
 }
 /** Stable product fingerprint used by the far-form cache.  Source revision is
  * part of the identity, but geometry/pose/relation edits must also retire a
@@ -523,10 +553,10 @@ export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|
   const cx=clip[0]!*wx+clip[4]!*wy+clip[8]!*wz+clip[12]!,cy=clip[1]!*wx+clip[5]!*wy+clip[9]!*wz+clip[13]!,cw=clip[3]!*wx+clip[7]!*wy+clip[11]!*wz+clip[15]!;
   if(!(cw>1e-5))return;return [((cx/cw)*.5+.5)*pageWidth,(.5-(cy/cw)*.5)*pageHeight];
  };
- const parts:{readonly part:SourceWholePartRef|SourceWholeOpening;readonly contact:boolean}[] = [];
- parts.push(...value.parts.map(part=>({part,contact:false})),...value.openings.map(part=>({part,contact:false})),
-  ...value.contacts.map(part=>({part,contact:true})),...value.protectedVoids.map(part=>({part,contact:false})),
-  ...(value.paper??[]).map(part=>({part,contact:false})));
+ const parts:{readonly part:SourceWholePartRef|SourceWholeOpening;readonly contact:boolean;readonly sourcePart:boolean}[] = [];
+ parts.push(...value.parts.map(part=>({part,contact:false,sourcePart:true})),...value.openings.map(part=>({part,contact:false,sourcePart:false})),
+  ...value.contacts.map(part=>({part,contact:true,sourcePart:false})),...value.protectedVoids.map(part=>({part,contact:false,sourcePart:false})),
+  ...(value.paper??[]).map(part=>({part,contact:false,sourcePart:false})));
  const direction=(delta:readonly [number,number]):number=>Math.round((((Math.atan2(delta[1]!,delta[0]!)/(Math.PI*2))+1)%1)*8)&7;
  const rowPlanComplete=(projected:readonly (readonly [number,number])[],closed:boolean,low:number,high:number):boolean=>{
   const covered=new Uint8Array(Math.max(0,high-low+1)),segments=closed?projected.length:projected.length-1;
@@ -537,7 +567,7 @@ export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|
   }
   return covered.every(value=>value!==0);
  };
- return parts.every(({part,contact})=>{
+ return parts.every(({part,contact,sourcePart})=>{
   const geometry=part.geometry,pose=part.worldFromSource;if(!geometry||geometry.length<2||!pose||pose.length!==16)return false;
   const projected=geometry.map(point=>project(point,pose));if(projected.some(point=>!point))return false;
   const projectedPoints=projected as readonly (readonly [number,number])[];
@@ -564,7 +594,13 @@ export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|
    if(index+1>=projectedPoints.length)return false;const b=projectedPoints[index+1]!;
    return Math.hypot(b[0]!-a[0]!,b[1]!-a[1]!)>=1;
   });
-  if(rows<2&&!contactSpan)return false;
+  // A complete principal source part may use the source-owned ordered contour
+  // consumer when the resident whole-part bank cannot represent one row. All
+  // relation/opening records remain on their existing native paths.
+  const coarseContour=nativePart!==undefined&&value.principalComplete===true&&sourcePart&&relation.length===0&&sourceWholeCoarseContourReady(part as SourceWholePartRef)&&
+   minX<maxX&&minY<maxY&&projectedPoints.some((a,index)=>{const b=projectedPoints[(index+1)%projectedPoints.length]!;return Math.hypot(b[0]-a[0],b[1]-a[1])>=1;});
+  if(rows<2&&!contactSpan&&!coarseContour)return false;
+  if(rows<2&&coarseContour)return true;
   if(!rowPlanComplete(projectedPoints,closed,lowRow,highRow))return false;
   const segments=closed?projectedPoints.length:projectedPoints.length-1;if(segments<1)return false;
   const firstDelta:[number,number]=[projectedPoints[0]![0]!-projectedPoints[1]![0]!,projectedPoints[0]![1]!-projectedPoints[1]![1]!];
@@ -573,7 +609,7 @@ export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|
   const nativeContext=((part.context!>>6)&7)<<6|direction(firstDelta)|direction(lastDelta)<<3;
   if(contactSpan)return true;
   if(!part.role||!nativePart)return false;
-  return nativePart(part.role,nativeContext,rows,sourceWidth,origin);
+  return nativePart(part.role,nativeContext,rows,sourceWidth,origin)||coarseContour;
  });
 }
 /** Combine immutable source programs without introducing a scene recipe. A
@@ -649,7 +685,7 @@ export function smallParentPoseSupported(instance:SourceLodInstance,clip:ArrayLi
  const dx=(b[0]!-a[0]!)*Math.max(1,pageWidth),dy=(b[1]!-a[1]!)*Math.max(1,pageHeight);
  return dy<-1e-6&&Math.abs(dx)<=Math.abs(dy)*.25;
 }
-export function selectSourceLod(instances:readonly SourceLodInstance[],clip:ArrayLike<number>,width:number,height:number,pageWidth:number,pageHeight:number,exterior:boolean,perspective:boolean,parents:readonly SourceLodParent[]=[],held:ReadonlySet<number>=new Set(),profileSafe:(mesh:number)=>boolean=()=>false,identity:(eid:number)=>number=eid=>eid,cache:ParentGroupCache=new ParentGroupCache(),joinSingles=false,smallAvailable?:SmallConstructionAvailability,heldSmall:ReadonlySet<string>=new Set(),nativePart?:SourceWholeNativePartAdmission):SourceLodSelection{
+export function selectSourceLod(instances:readonly SourceLodInstance[],clip:ArrayLike<number>,width:number,height:number,pageWidth:number,pageHeight:number,exterior:boolean,perspective:boolean,parents:readonly SourceLodParent[]=[],held:ReadonlySet<number>=new Set(),profileSafe:(mesh:number)=>boolean=()=>false,identity:(eid:number)=>number=eid=>eid,cache:ParentGroupCache=new ParentGroupCache(),joinSingles=false,smallAvailable?:SmallConstructionAvailability,heldSmall:ReadonlySet<string>=new Set(),nativePart?:SourceWholeNativePartAdmission,refusedOwners?:ReadonlySet<string>):SourceLodSelection{
  // A workset may refer to one source through a node and a straddling single.
  // Canonicalize that producer identity ONCE, before choosing any frontier;
  // deduplicating only the emitted parent leaves duplicate singleton packets.
@@ -663,12 +699,15 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
   return false;
  };
  instances=instances.filter(once);parents=parents.map(parent=>({...parent,instances:parent.instances.filter(once)})).filter(parent=>parent.instances.length>0);
+ const isRefused=(instance:SourceLodInstance):boolean=>refusedOwners?.has(sourceContourRetryKey(instance.mesh,instance.eid))===true;
+ const forcedFull=new Set<string>();
+ const forceGroupFull=(group:readonly SourceLodInstance[]):void=>{for(const member of group)forcedFull.add(sourceContourRetryKey(member.mesh,member.eid));};
  const far=new Map<number,FarFormInstance[]>(),defer=new Set<number>(),full=new Map<number,number[]>(),seen=new Set<number>(),aggregates:SourceLodAggregate[]=[],heldParents=new Set<number>();
  const smallOut=new Set<string>();
  const compileSourceParent=(group:readonly SourceLodInstance[]):SourceWholeConstruction|undefined=>{
   // A union may simplify a complete source product, not repair an invalid
   // opening/contact certificate by rebuilding a different compound ledger.
-  if(group.some(instance=>!sourceWholeConstructionRenderable(instance.construction)||
+  if(group.some(instance=>isRefused(instance)||!sourceWholeConstructionRenderable(instance.construction)||
    instance.construction.principalComplete!==true&&!sourceWholeCompoundReady(instance.construction)))return;
   const members:CoherentParentMember[]=group.map(instance=>({mesh:instance.mesh,eid:instance.eid,construction:instance.construction!,sourceRevision:instance.sourceRevision,poseRevision:instance.poseRevision}));
   const result=cache.coherentParents.getOrCompile(members);return result.status==='parent'?result.product.construction:undefined;
@@ -700,6 +739,10 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
 
   // aggregate (nothing inside one cell can be spelled as an opening).
   if(box&&!pending&&box[2]-box[0]<maximumX&&box[3]-box[1]<maximumY){
+   // A camera-local native refusal invalidates this node only for this job.
+   // Expand every member to its complete child producer; do not let the
+   // refused member re-enter another coarse representation below.
+   if(node.instances.some(isRefused)){forceGroupFull(node.instances);rest.push(...node.instances);continue;}
    const construction=compileSourceParent(node.instances);
    const executable=construction&&sourceWholeConstructionExecutable(construction,clip,width,height,pageWidth,pageHeight,nativePart,true);
 
@@ -750,6 +793,7 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
  const merged=new Map<number,number[]>();pieces.forEach((_,i)=>{const r=find(i);const g=merged.get(r)??[];g.push(i);merged.set(r,g);});
  const tryParent=(group:readonly SourceLodInstance[],groupKey:number):boolean=>{
   if(group.length<2)return false;
+  if(group.some(isRefused)){forceGroupFull(group);return false;}
   const groupBox=unionBox(group.map(instance=>projectedBox(instance.bounds!,clip,width,height)));
   if(!groupBox||!parentBox(groupBox,held.has(groupKey)?PARENT_LEAVE_ROWS:PARENT_ENTER_ROWS,width,height,pageWidth,pageHeight)||
    !group.every(instance=>profileSafe(instance.mesh))||!parentAdequate(group,clip,width,height,pageWidth,pageHeight,groupBox))return false;
@@ -785,6 +829,9 @@ export function selectSourceLod(instances:readonly SourceLodInstance[],clip:Arra
   const smallKey=`${mesh}:${identity(instance.eid)}:${instanceSourceRevision(instance)??0}`;
   const nativeHeight=box?(box[3]-box[1])*pageHeight/Math.max(1,height)/17:Infinity;
   const nativeWidth=box?Math.round((box[2]-box[0])*pageWidth/Math.max(1,width)):0;
+  if(forcedFull.has(sourceContourRetryKey(instance.mesh,instance.eid))||isRefused(instance)){
+   const members=full.get(mesh)??[];members.push(instance.eid);full.set(mesh,members);continue;
+  }
   // A compiled whole principal product is already a source-owned drawing.
   // Previously only tiny box/round metadata or a sub-cell singleton could
   // bypass fine expansion; a multi-component principal product was never

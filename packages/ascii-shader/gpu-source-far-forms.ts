@@ -1,5 +1,5 @@
 import type {SurfaceField} from './surface-fields.ts';
-import {PARENT_MAX_COLUMNS,SOURCE_CONTACT_BOUNDARY_FLAG,SOURCE_CONTACT_LINE_CLASS,sourceWholeConstructionRenderable,type FarFormInstance,type SourceWholeConstruction,type SourceWholeOpening,type SourceWholePartRef,type SourceWholePartRole} from './source-lod.ts';
+import {PARENT_MAX_COLUMNS,SOURCE_COARSE_CONTOUR_FLAG,SOURCE_CONTACT_BOUNDARY_FLAG,SOURCE_CONTACT_LINE_CLASS,sourceWholeConstructionRenderable,type FarFormInstance,type SourceWholeConstruction,type SourceWholeOpening,type SourceWholePartRef,type SourceWholePartRole} from './source-lod.ts';
 import {DeviceComputePrograms,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {CONSTRUCTION_POINT_WGSL} from './source-coordinates.ts';
 import {FORM_DEPTH_WGSL,LOD_TIER_HOLD,formDepths} from './form-depths.ts';
@@ -130,6 +130,11 @@ fn sourcePoint(input:Input,pose:mat4x4f,geometry:u32,index:u32,count:u32,feature
  let ndc=clip.xyz/max(clip.w,1e-5);let xy=p.rect.xy+(vec2f(ndc.x,-ndc.y)*.5+.5)*p.rect.zw;
  return Point(vec4f(xy,ndc.z,f32(index)/f32(max(count-1u,1u))),vec4u(u32(valid),bitcast<u32>(1.0/max(clip.w,1e-5)),0xffffffffu,feature));
 }
+// The Run keeps the source part/owner identity. Point.visible.w is the
+// compile-owned edge ordinal consumed by hardBoundaryConstruction's retained
+// source-edge closure: both endpoints of one source edge share it, while
+// adjacent edges remain distinct. It is not a camera fragment or glyph id.
+fn sourceEdgeOrdinal(segment:u32)->u32{return segment+1u;}
 // Relations have their own lineage namespace. A raw contact feature ordinal
 // can equal an ordinary part ordinal; that must never alias the actual memo.
 fn sourcePartLineage(feature:u32,ordinal:u32,relation:bool,contact:bool)->u32{
@@ -142,6 +147,7 @@ fn sourceParts(input:Input,local:u32){
   // Preserve the original 15-bit geometry-count ABI for ordinary parts. The
   // relation flags live in the unused high role bits, never in the count.
   let first=programWord(input,base+6u);let packed=programWord(input,base+7u);let contributors=packed&0xffffu;let count=(packed>>16u)&0x7fffu;let closed=(packed&0x80000000u)!=0u;let relation=(roleWord&0x80000000u)!=0u;let contact=(roleWord&0x40000000u)!=0u;let relationParent=(roleWord&0x20000000u)!=0u;let compoundParent=(roleWord&0x10000000u)!=0u;
+  let contour=(roleWord&${SOURCE_COARSE_CONTOUR_FLAG}u)!=0u&&closed&&(roleWord&0xf0000000u)==0u;
   let poseAt=first+contributors*2u;let pose=mat4x4f(sourceVector(input,poseAt),sourceVector(input,poseAt+4u),sourceVector(input,poseAt+8u),sourceVector(input,poseAt+12u));
   let geometry=poseAt+16u;let segments=count-select(1u,0u,closed);let pointCount=segments*2u;
   for(var contributor=0u;contributor<contributors;contributor++){
@@ -149,7 +155,12 @@ fn sourceParts(input:Input,local:u32){
    let at=reserve(pointCount,1u);if(at.x==0xffffffffu){return;}
    var top=1e30;var bottom=-1e30;
    for(var segment=0u;segment<segments;segment++){
-    let a=sourcePoint(input,pose,geometry,segment,count,feature);var b=sourcePoint(input,pose,geometry,(segment+1u)%count,count,feature);
+    var a=sourcePoint(input,pose,geometry,segment,count,feature);var b=sourcePoint(input,pose,geometry,(segment+1u)%count,count,feature);
+    if(contour){
+     a.visible.w=sourceEdgeOrdinal(segment);b.visible.w=sourceEdgeOrdinal(segment);
+     a.visible.z=segment;b.visible.z=(segment+1u)%count;
+     a.position.w=f32(segment)/f32(segments);b.position.w=f32(segment+1u)/f32(segments);
+    }
     if(closed&&segment+1u==count){b.position.w=1.0;}
     points[at.x+segment*2u]=a;points[at.x+segment*2u+1u]=b;
     top=min(top,min(a.position.y,b.position.y));bottom=max(bottom,max(a.position.y,b.position.y));
@@ -162,7 +173,7 @@ fn sourceParts(input:Input,local:u32){
    // one-row contact and lets hardBoundaryConstruction spell its complete
    // source edge with the existing visibility path.
    let pathFlags=select(${COMPILED_FAR_PROFILE_BIT}u|0x40000002u,${SOURCE_CONTACT_BOUNDARY_FLAG}u|(${SOURCE_CONTACT_LINE_CLASS}u<<8u)|role,contact);
-   runs[at.y]=Run(vec4u(at.x,pointCount,pathFlags,(feature<<5u)|(role<<2u)),vec4u(feature,owner,feature),vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(0u,count,rows,role|select(0u,0x80000000u,relation)|select(0u,0x40000000u,contact)|select(0u,0x20000000u,relationParent)|select(0u,0x10000000u,compoundParent)),vec4u(owner,input.program.z,sourcePartLineage(feature,i,relation,contact)));
+   runs[at.y]=Run(vec4u(at.x,pointCount,pathFlags,(feature<<5u)|(role<<2u)),vec4u(feature,owner,feature),vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(0u,count,rows,role|select(0u,0x80000000u,relation)|select(0u,0x40000000u,contact)|select(0u,0x20000000u,relationParent)|select(0u,0x10000000u,compoundParent)|select(0u,${SOURCE_COARSE_CONTOUR_FLAG}u,contour)),vec4u(owner,input.program.z,sourcePartLineage(feature,i,relation,contact)));
   }
  }
 }
@@ -394,7 +405,9 @@ export function farAggregateRecords(sources:readonly SourceFarForms[],rect:{x:nu
    const programOffset=keyList.length;for(const word of cachedProgram.words)keyList.push(word);
    inputs.set([programOffset,cachedProgram.parts,cachedProgram.revision,cachedProgram.signature],base+12);inputs[base+10]=cachedProgram.correspondence;return;
   }
-  if(row.construction){const sourceParts=row.construction.parts,relations=relationParts(row.construction);if(!relations)return;const parts=[...sourceParts,...relations],programOffset=keyList.length,hasRelations=relations.length>0,compound=!!row.construction.compound;const signature=()=>{let h=2166136261>>>0;const mix=(word:number)=>{h=Math.imul(h^(word>>>0),16777619)>>>0;};mix(row.construction!.revision);mix(parts.length);for(const [index,part] of parts.entries()){mix(part.feature);mix(part.entryRef);mix(part.context);mix(roleCode(part.role));mix((part.relationKind==='contact'?RELATION_CONTACT_BIT|RELATION_ROLE_BIT:part.relationKind?RELATION_ROLE_BIT:hasRelations?RELATION_PARENT_BIT:0)|(compound?COMPOUND_PARENT_BIT:0));mix(part.ports[0]);mix(part.ports[1]);const geometry=part.geometry??[],packed=partCounts(part);mix(packed);for(const contributor of part.contributors){mix(contributor[0]);mix(contributor[1]);}if(part.worldFromSource)for(const value of Array.from(part.worldFromSource))mix(floatBits(value));for(const point of geometry){mix(floatBits(point[0]));mix(floatBits(point[1]));mix(floatBits(point[2]));}}return h||1;};
+  if(row.construction){const sourceParts=row.construction.parts,relations=relationParts(row.construction);if(!relations)return;const parts=[...sourceParts,...relations],programOffset=keyList.length,hasRelations=relations.length>0,compound=!!row.construction.compound;
+   const contourProduct=row.construction.principalComplete===true&&!hasRelations&&!compound;
+   const signature=()=>{let h=2166136261>>>0;const mix=(word:number)=>{h=Math.imul(h^(word>>>0),16777619)>>>0;};mix(row.construction!.revision);mix(Number(row.construction!.principalComplete===true));mix(parts.length);for(const [index,part] of parts.entries()){mix(part.feature);mix(part.entryRef);mix(part.context);mix(roleCode(part.role));mix((part.relationKind==='contact'?RELATION_CONTACT_BIT|RELATION_ROLE_BIT:part.relationKind?RELATION_ROLE_BIT:hasRelations?RELATION_PARENT_BIT:0)|(compound?COMPOUND_PARENT_BIT:0)|(contourProduct&&!part.relationKind&&part.closed===true?SOURCE_COARSE_CONTOUR_FLAG:0));mix(part.ports[0]);mix(part.ports[1]);const geometry=part.geometry??[],packed=partCounts(part);mix(packed);for(const contributor of part.contributors){mix(contributor[0]);mix(contributor[1]);}if(part.worldFromSource)for(const value of Array.from(part.worldFromSource))mix(floatBits(value));for(const point of geometry){mix(floatBits(point[0]));mix(floatBits(point[1]));mix(floatBits(point[2]));}}return h||1;};
    const programSignature=signature();keyList.push(0x50524731,row.construction.revision>>>0,parts.length>>>0,programSignature);
    // Each part's contributor pairs occupy one contiguous source-owned slice.
    // The shader hashes/reads `count` pairs from `first`; a globally deduped
@@ -414,7 +427,8 @@ export function farAggregateRecords(sources:readonly SourceFarForms[],rect:{x:nu
     // contributor's program identity; equal source geometry at a different
     // pose must not collapse into the same relation record.
     for(const point of geometry){payloadWords.push(floatBits(point[0]),floatBits(point[1]),floatBits(point[2]));payloadCursor+=3;}
-    const relationFlags=(part.relationKind==='contact'?RELATION_ROLE_BIT|RELATION_CONTACT_BIT:part.relationKind?RELATION_ROLE_BIT:hasRelations?RELATION_PARENT_BIT:0)|(compound?COMPOUND_PARENT_BIT:0);
+    const relationFlags=(part.relationKind==='contact'?RELATION_ROLE_BIT|RELATION_CONTACT_BIT:part.relationKind?RELATION_ROLE_BIT:hasRelations?RELATION_PARENT_BIT:0)|(compound?COMPOUND_PARENT_BIT:0)|
+      (contourProduct&&!part.relationKind&&part.closed===true?SOURCE_COARSE_CONTOUR_FLAG:0);
     partWords.push(part.feature>>>0,part.entryRef>>>0,part.context>>>0,(roleCode(part.role)|relationFlags)>>>0,part.ports[0]>>>0,part.ports[1]>>>0,contributorBase>>>0,packed>>>0);
    }
    // A real octree parent may contain many source parts. Do not use an

@@ -1,5 +1,6 @@
 import {COHERENT_CORRESPONDENCE_MAGIC,COHERENT_CORRESPONDENCE_VERSION,COHERENT_CORRESPONDENCE_NONE} from './coherent-parent-correspondence.ts';
 import {COHERENT_PARENT_RUN_FLAG,COHERENT_PARENT_SECONDARY_FLAG} from './coherent-parent-native-gpu.ts';
+import {SOURCE_COARSE_CONTOUR_FLAG} from './source-lod.ts';
 
 /** Existing far-status word bits reserved by the private integration seam. */
 export const COHERENT_PARENT_STATUS_REJECT=0x8;
@@ -153,16 +154,19 @@ fn coherentSourceParts(input:Input,local:u32)->bool{
   let primary=vec2u(programWord(input,first)&0xdfffffffu,programWord(input,first+1u));let hasSecondary=contributors==2u;var secondary=vec2u(0u);if(hasSecondary){secondary=vec2u(programWord(input,first+2u)&0xdfffffffu,programWord(input,first+3u));}
   if(!coherentSourceVisibility(input,primary,secondary,hasSecondary)){continue;}
   let poseAt=first+contributors*2u;let pose=mat4x4f(sourceVector(input,poseAt),sourceVector(input,poseAt+4u),sourceVector(input,poseAt+8u),sourceVector(input,poseAt+12u));
+  let contour=(roleWord&${SOURCE_COARSE_CONTOUR_FLAG}u)!=0u&&closed&&(roleWord&0xf0000000u)==0u;
   let geometry=poseAt+16u;let segments=count-select(1u,0u,closed);let pointCount=segments*2u;let pointAt=atomicAdd(&coherentPointCursor,pointCount);let runAt=atomicAdd(&coherentRunCursor,1u);let at=vec2u(atomicLoad(&coherentPointBase)+pointAt,atomicLoad(&coherentRunBase)+runAt);
   var top=1e30;var bottom=-1e30;
   for(var segment=0u;segment<segments;segment++){
-   let a=sourcePoint(input,pose,geometry,segment,count,feature);var b=sourcePoint(input,pose,geometry,(segment+1u)%count,count,feature);if(closed&&segment+1u==count){b.position.w=1.0;}
+   var a=sourcePoint(input,pose,geometry,segment,count,feature);var b=sourcePoint(input,pose,geometry,(segment+1u)%count,count,feature);
+   if(contour){a.visible.w=segment+1u;b.visible.w=segment+1u;a.visible.z=segment;b.visible.z=(segment+1u)%count;a.position.w=f32(segment)/f32(segments);b.position.w=f32(segment+1u)/f32(segments);}
+   if(closed&&segment+1u==count){b.position.w=1.0;}
    points[at.x+segment*2u]=a;points[at.x+segment*2u+1u]=b;top=min(top,min(a.position.y,b.position.y));bottom=max(bottom,max(a.position.y,b.position.y));
   }
   let rows=u32(clamp(floor(top)+16384.0,0.0,65535.0))|(u32(clamp(ceil(bottom)+16384.0,0.0,65535.0))<<16u);
   let pathFlags=select(0x80000000u|0x40000002u,0x04000000u|(2u<<8u)|role,contact)|${COHERENT_PARENT_RUN_FLAG}u|select(0u,${COHERENT_PARENT_SECONDARY_FLAG}u,hasSecondary);
   let lineage=select(coherentFirstAlias(input,i),coherentFirstRelatedFeature(input,i,feature),relation);
-  runs[at.y]=Run(vec4u(at.x,pointCount,pathFlags,(feature<<5u)|(role<<2u)),vec4u(feature,primary,feature),vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(0u,count,rows,role|select(0u,0x80000000u,relation)|select(0u,0x40000000u,contact)|select(0u,0x20000000u,relationParent)|select(0u,0x10000000u,compoundParent)),vec4u(secondary,input.program.z,lineage));
+  runs[at.y]=Run(vec4u(at.x,pointCount,pathFlags,(feature<<5u)|(role<<2u)),vec4u(feature,primary,feature),vec4u(entry,context,programWord(input,base+4u),programWord(input,base+5u)),vec4u(0u,count,rows,role|select(0u,0x80000000u,relation)|select(0u,0x40000000u,contact)|select(0u,0x20000000u,relationParent)|select(0u,0x10000000u,compoundParent)|select(0u,${SOURCE_COARSE_CONTOUR_FLAG}u,contour)),vec4u(secondary,input.program.z,lineage));
  }}
  return sourceMode;
 }`;

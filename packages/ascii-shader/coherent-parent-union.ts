@@ -324,6 +324,11 @@ export function compileCoherentParent(members:readonly CoherentParentMember[]):C
  const partWorks:PartWork[]=[];
  const partSegmentGroups:PartSegment[][]=[];
  let expandedPartCount=0,removedSharedJoins=0;
+ // A complete single-instance principal is already one compiled drawing.
+ // Passing its ordered 3D passages through does not require a planar union
+ // certificate. Exact planes still gate ALL shared-edge removal/merging;
+ // never round a swept/rounded source onto a plane to make it eligible.
+ const retainedPrincipal=members.length===1&&members[0]!.construction.principalComplete===true;
 
  for(const [memberIndex,member] of members.entries()){
   for(const [partIndex,part] of member.construction.parts.entries()){
@@ -336,8 +341,8 @@ export function compileCoherentParent(members:readonly CoherentParentMember[]):C
    poseBindings.push({feature:part.feature,mesh:member.mesh,eid:member.eid,worldFromSource:Array.from(pose),relation:false});
    const end=part.closed?part.geometry.length:part.geometry.length-1;
    const posedGeometry=part.geometry.map(value=>posed(value,pose)),partPlane=planeFromPoints(posedGeometry),planar=partPlane===undefined||posedGeometry.every(point=>planeContains(partPlane,point));
-   if(part.closed&&partPlane&&!planar)return {status:'children',reason:'unsupported-plane'};
-   const usablePlane=planar?partPlane:undefined,patch=closedPatchCertificate(posedGeometry,part.closed,usablePlane);
+   if(part.closed&&partPlane&&!planar&&!retainedPrincipal)return {status:'children',reason:'unsupported-plane'};
+   const usablePlane=planar?partPlane:undefined,patch=planar?closedPatchCertificate(posedGeometry,part.closed,usablePlane):undefined;
    const partSegments:PartSegment[]=[];
    for(let index=0;index<end;index++){
     const first=posedGeometry[index]!,last=posedGeometry[(index+1)%part.geometry.length]!;if(distance(first,last)<EPS)return {status:'children',reason:'missing-geometry'};
