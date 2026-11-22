@@ -129,10 +129,24 @@ export function classifyPathRunFlags(flags:number):PathPlaybackClass{return clas
 const PATH_GEOMETRY_WGSL=`
 struct PathGeometry {bent:bool,hardLine:bool,soft:bool}
 fn pathGeometry(run:Run,first:vec2f,last:vec2f)->PathGeometry{
- let delta=last-first;var bent=false;
- for(var i=0u;i<run.range.y;i++){
-  let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
-  let q=point.position.xy;bent=bent||abs((q.x-first.x)*delta.y-(q.y-first.y)*delta.x)>.25*max(1.0,length(delta));
+ var delta=last-first;var bent=false;
+ let canonicalCandidate=runProgramFeature(run)!=0u&&(run.range.z&0x40000u)==0u&&sourcePartCanonicalPlayable(run);
+ var canonicalDirections=vec2u(NONE);
+ if(canonicalCandidate){canonicalDirections=sourcePartCanonicalDirections(run);}
+ let canonicalContext=canonicalCandidate&&canonicalDirections.x!=NONE&&canonicalDirections.y!=NONE;
+ if(canonicalContext){
+  let sourceFirst=sourcePartCanonicalOrigin(run).position.xy;let sourceLast=sourcePartCanonicalTerminal(run).position.xy;
+  delta=sourceLast-sourceFirst;
+  if(length(delta)<.00001){
+   if(canonicalDirections.y!=NONE){delta=sourcePartDirectionVector(canonicalDirections.y);}
+   else if(canonicalDirections.x!=NONE){delta=-sourcePartDirectionVector(canonicalDirections.x);}
+  }
+  bent=canonicalDirections.x!=((canonicalDirections.y+4u)&7u);
+ }else{
+  for(var i=0u;i<run.range.y;i++){
+   let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
+   let q=point.position.xy;bent=bent||abs((q.x-first.x)*delta.y-(q.y-first.y)*delta.x)>.25*max(1.0,length(delta));
+  }
  }
  let hardLine=(run.range.z&0x40000u)!=0u&&!bent;
  return PathGeometry(bent,hardLine,!hardLine&&(run.range.y&1u)==0u);
@@ -238,6 +252,27 @@ function stripNonProgrammedCanonicalContext(code:string):string{
   if(!body.includes(marker))throw Error('Playback compiler canonical passage context changed');
   return body.replace(marker,' let sourceChord=finiteRunEnd(run).position.xy-finiteRunStart(run).position.xy;');
  });
+ if(code.includes('fn pathGeometry('))code=rewriteFunction(code,'pathGeometry',()=>`\n var delta=last-first;var bent=false;
+ let canonicalCandidate=runProgramFeature(run)!=0u&&(run.range.z&0x40000u)==0u&&sourcePartCanonicalPlayable(run);
+ var canonicalDirections=vec2u(NONE);
+ if(canonicalCandidate){canonicalDirections=sourcePartCanonicalDirections(run);}
+ let canonicalContext=canonicalCandidate&&canonicalDirections.x!=NONE&&canonicalDirections.y!=NONE;
+ if(canonicalContext){
+  let sourceFirst=sourcePartCanonicalOrigin(run).position.xy;let sourceLast=sourcePartCanonicalTerminal(run).position.xy;
+  delta=sourceLast-sourceFirst;
+  if(length(delta)<.00001){
+   if(canonicalDirections.y!=NONE){delta=sourcePartDirectionVector(canonicalDirections.y);}
+   else if(canonicalDirections.x!=NONE){delta=-sourcePartDirectionVector(canonicalDirections.x);}
+  }
+  bent=canonicalDirections.x!=((canonicalDirections.y+4u)&7u);
+ }else{
+  for(var i=0u;i<run.range.y;i++){
+   let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
+   let q=point.position.xy;bent=bent||abs((q.x-first.x)*delta.y-(q.y-first.y)*delta.x)>.25*max(1.0,length(delta));
+  }
+ }
+ let hardLine=(run.range.z&0x40000u)!=0u&&!bent;
+ return PathGeometry(bent,hardLine,!hardLine&&(run.range.y&1u)==0u);\n`);
  code=rewriteFunction(code,'featurecurves',body=>{
   const contextStart=' let canonicalCandidate=runProgramFeature(run)!=0u&&(run.range.z&0x40000u)==0u&&sourcePartCanonicalPlayable(run);';
   const contextEnd=' let anchorOnly=';
@@ -251,6 +286,13 @@ function stripNonProgrammedCanonicalContext(code:string):string{
   if(activeAt>=0){
    if(activeTo<0)throw Error('Playback compiler canonical active delta changed');
    body=body.slice(0,activeAt)+' var activeDelta=delta;\n'+body.slice(activeTo);
+  }
+  const guard=' if(!canonicalContext){\n';
+  if(body.includes(guard)){
+   body=body.replace(guard,'');
+   const guardEnd='\n }\n var activeDelta=delta;';
+   if(!body.includes(guardEnd))throw Error('Playback compiler canonical classification guard changed');
+   body=body.replace(guardEnd,'\n var activeDelta=delta;');
   }
   return body;
  });
@@ -272,19 +314,26 @@ function truncateBody(source:string,marker:string):string{
  return source.slice(0,at)+' return;\n';
 }
 function lowerSharedPathGeometry(body:string):string{
- const original=` var straightVertical=true;var bent=false;var monotone=true;var havePrevious=false;var previousY=first.y;
+ const startMarker=' var straightVertical=true;var bent=false;var monotone=true;var havePrevious=false;var previousY=first.y;';
+ const original=` var straightVertical=true;var bent=geometry.bent;var monotone=true;var havePrevious=false;var previousY=first.y;
+ if(!canonicalContext){
+  for(var i=0u;i<run.range.y;i++){
+   let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
+   let q=point.position.xy;straightVertical=straightVertical&&abs(q.x-first.x)<.5;
+  }
+ }
+ `;
+ const legacy=` var straightVertical=true;var bent=geometry.bent;var monotone=true;var havePrevious=false;var previousY=first.y;
  for(var i=0u;i<run.range.y;i++){
   let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
   let q=point.position.xy;straightVertical=straightVertical&&abs(q.x-first.x)<.5;
-  bent=bent||abs((q.x-first.x)*delta.y-(q.y-first.y)*delta.x)>.25*max(1.0,length(delta));
-`;
- const lowered=` var straightVertical=true;var bent=geometry.bent;var monotone=true;var havePrevious=false;var previousY=first.y;
- for(var i=0u;i<run.range.y;i++){
-  let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
-  let q=point.position.xy;straightVertical=straightVertical&&abs(q.x-first.x)<.5;
-`;
- if(!body.includes(original))throw Error('Playback compiler path geometry body changed');
- body=body.replace(original,lowered);
+ }
+ `;
+ const start=body.indexOf(startMarker),end=body.indexOf(' var activeDelta=delta;',start);
+ if(start<0||end<0)throw Error('Playback compiler path geometry body changed');
+ const guarded=body.indexOf(' if(!canonicalContext){',start);
+ if(guarded>=0&&guarded<end)body=body.slice(0,start)+original+body.slice(end);
+ else body=body.slice(0,start)+legacy+body.slice(end);
  body=body.replace(' let hardLine=(run.range.z&0x40000u)!=0u&&!bent;',' let hardLine=geometry.hardLine;');
  body=body.replace(' let soft=!hardLine&&(run.range.y&1u)==0u;',' let soft=geometry.soft;');
  return body;

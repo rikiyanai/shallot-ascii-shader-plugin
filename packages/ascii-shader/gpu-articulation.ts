@@ -6431,12 +6431,14 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
  if(run.range.y<2u){return;}
  let delta=last.xy-first.xy;if(length(delta)<.00001&&!canonicalContext){return;}
  var straightVertical=true;var bent=false;var monotone=true;var havePrevious=false;var previousY=first.y;
- for(var i=0u;i<run.range.y;i++){
-  let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
-  let q=point.position.xy;straightVertical=straightVertical&&abs(q.x-first.x)<.5;
-  bent=bent||abs((q.x-first.x)*delta.y-(q.y-first.y)*delta.x)>.25*max(1.0,length(delta));
-  if(havePrevious){monotone=monotone&&(q.y-previousY)*sign(delta.y)>=-.00001;}
-  previousY=q.y;havePrevious=true;
+ if(!canonicalContext){
+  for(var i=0u;i<run.range.y;i++){
+   let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
+   let q=point.position.xy;straightVertical=straightVertical&&abs(q.x-first.x)<.5;
+   bent=bent||abs((q.x-first.x)*delta.y-(q.y-first.y)*delta.x)>.25*max(1.0,length(delta));
+   if(havePrevious){monotone=monotone&&(q.y-previousY)*sign(delta.y)>=-.00001;}
+   previousY=q.y;havePrevious=true;
+  }
  }
  var activeDelta=delta;
  if(canonicalContext){
