@@ -5,11 +5,17 @@
   "license": "UNLICENSED",
   "type": "module",
   "packageManager": "bun@1.4.3",
+  "scripts": {
+    "prepare": "node engine-seam/apply.mjs",
+    "check:types": "tsc -p tsconfig.json --noEmit",
+    "build:plugin": "bun build packages/ascii-shader/plugin.ts --target browser --outfile .cache/ascii-shader-plugin.js",
+    "build:minimal": "vite build examples/minimal --config examples/minimal/vite.config.ts"
+  },
   "exports": {
     ".": "./packages/ascii-shader/plugin.ts"
   },
   "dependencies": {
-    "@dylanebert/shallot": "0.11.0-next.0",
+    "@dylanebert/shallot": "0.10.5",
     "typegpu": "0.12.8",
     "wgsl_reflect": "1.6.0"
   },

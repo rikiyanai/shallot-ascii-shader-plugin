@@ -1,3 +1,6 @@
+import { readFile, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
+
 /**
  * Publish the standard renderer's real GPU membership frontier at the
  * MaterialGeometryTransport boundary.  This is deliberately a producer
@@ -14,6 +17,12 @@ function once(text,from,to,label){
 }
 
 export function transformNativeInstanceFrontier(forward){
+ const posedBoundsAnchor='        const posedBounds = item.r.t.owner?.mainPosedBounds';
+ const typedPosedBoundsAnchor='        const posedBounds: "engine-deformed-cull-sphere-v1" | "material-source-cull-sphere-v1" | undefined = item.r.t.owner?.mainPosedBounds';
+ if(forward.includes(posedBoundsAnchor))forward=once(forward,posedBoundsAnchor,typedPosedBoundsAnchor,'posed bound result type');
+ const posedBoundsSpread='            ...(posedBounds ? { posedBounds } : {}),';
+ const typedPosedBoundsSpread='            ...(posedBounds ? { posedBounds: posedBounds as "engine-deformed-cull-sphere-v1" | "material-source-cull-sphere-v1" } : {}),';
+ if(forward.includes(posedBoundsSpread))forward=once(forward,posedBoundsSpread,typedPosedBoundsSpread,'posed bound owner type');
  if(forward.includes(NATIVE_INSTANCE_FRONTIER_MARKER))return forward;
  const declarations=forward.split('\n').filter(line=>line.includes('    sourceGeometry?:')&&line.includes('Float32Array'));
  if(declarations.length!==1)throw Error(`MAIN native instance frontier visitor declaration expected once, found ${declarations.length}`);
@@ -75,4 +84,13 @@ ${declaration}
             ownerAuthority,
             nativeVisibleInstanceFrontier: visibleInstanceFrontier,`,'producer payload');
  return forward;
+}
+/** Reapply the type-only upgrades after later seam transforms have rewritten
+ * the visitor file. This still writes only the installed engine through the
+ * declared application path, never by hand. */
+export async function applyNativeInstanceFrontier(engine){
+ const path=resolve(engine,'src/standard/rendering/forward.ts');
+ const source=await readFile(path,'utf8');
+ const transformed=transformNativeInstanceFrontier(source);
+ if(transformed!==source)await writeFile(path,transformed);
 }

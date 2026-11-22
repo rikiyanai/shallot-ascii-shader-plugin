@@ -51,8 +51,15 @@ function once(text,from,to,label){
 
 /** Pure text transform used by setup and by the CPU fixture test. */
 export function transformGpuIndexedSourceSources({mesh,forward}){
- const meshMarker=`${GPU_INDEXED_SOURCE_PRODUCER_MARKER} mesh`;
- const forwardMarker=`${GPU_INDEXED_SOURCE_PRODUCER_MARKER} forward`;
+ // Older seam copies accidentally left the probe suffix as a bare interface
+ // member (`mesh`/`forward`).  Normalize that form before checking the
+ // marker so rerunning the declared install repairs an existing extraction.
+ const malformedMeshMarker=`${GPU_INDEXED_SOURCE_PRODUCER_MARKER} mesh`;
+ const malformedForwardMarker=`${GPU_INDEXED_SOURCE_PRODUCER_MARKER} forward`;
+ if(mesh.includes(malformedMeshMarker))mesh=mesh.replace(malformedMeshMarker,GPU_INDEXED_SOURCE_PRODUCER_MARKER);
+ if(forward.includes(malformedForwardMarker))forward=forward.replace(malformedForwardMarker,GPU_INDEXED_SOURCE_PRODUCER_MARKER);
+ const meshMarker=GPU_INDEXED_SOURCE_PRODUCER_MARKER;
+ const forwardMarker=GPU_INDEXED_SOURCE_PRODUCER_MARKER;
  if(!mesh.includes(meshMarker)){
   const anchor='    /** the 8 B/vertex position-only stream';
   mesh=once(mesh,anchor,`    ${meshMarker}\n    /** Optional producer-owned indexed topology. The producer's live count\n     * binding is authoritative; this field carries no CPU positions. */\n    gpuIndexedSource?: ${GPU_INDEXED_SOURCE_METADATA_TYPE};\n${anchor}`,'Mesh metadata');
@@ -103,7 +110,7 @@ export function transformGpuIndexedSourceSources({mesh,forward}){
  * The transform uses the producer's actual slot x/z/allFaces and the exact
  * counts offset already assigned to geometry.mesh.indirectIndexCount.
  */
-export function transformVoxelTerrainSource(source,{importSpecifier='../../../../packages/shallot-main/gpu-indexed-source-producer.ts'}={}){
+export function transformVoxelTerrainSource(source,{importSpecifier='../../../packages/ascii-shader/gpu-indexed-source-producer.ts'}={}){
  if(source.includes(GPU_INDEXED_SOURCE_VOXEL_MARKER))return source;
  const importAnchor='import { type MeshHandle, MeshPlugin, MeshQuant } from "@dylanebert/shallot/mesh";';
  source=once(source,importAnchor,`${importAnchor}\nimport { GpuIndexedSourceProducerRuntime, gpuIndexedSourceTopologyKey } from "${importSpecifier}";`,'voxel producer import');
@@ -248,14 +255,14 @@ export function gpuIndexedSourceVoxelVitePlugin({sourcePath,importSpecifier}={})
  // mesher/pool anchors remain exact for focused callers and tests.
  const terrainRoot=expected&&expected.endsWith('/terrain.ts')?dirname(expected):undefined;
  return {
-  name:'shallot-main-gpu-indexed-source-voxel',
+  name:'ascii-shader-gpu-indexed-source-voxel',
   enforce:'pre',
   transform(code,id){
    const clean=id.split('?')[0];
    const resolved=resolve(clean);
    const terrainSibling=terrainRoot&&dirname(resolved)===terrainRoot&&/\/(?:terrain|mesher|pool)\.ts$/.test(resolved);
    if(expected&&resolved!==expected&&!terrainSibling)return null;
-   if(!expected&&!clean.endsWith('/examples/shallot/voxel/src/terrain.ts')&&!clean.endsWith('/examples/shallot/voxel/src/mesher.ts')&&!clean.endsWith('/examples/shallot/voxel/src/pool.ts'))return null;
+   if(!expected&&!clean.endsWith('/examples/voxel/src/terrain.ts')&&!clean.endsWith('/examples/voxel/src/mesher.ts')&&!clean.endsWith('/examples/voxel/src/pool.ts'))return null;
    if(clean.endsWith('/mesher.ts'))return {code:transformVoxelMesherSource(code),map:null};
    if(clean.endsWith('/pool.ts'))return {code:transformVoxelPoolSource(code),map:null};
    return {code:transformVoxelTerrainSource(code,{importSpecifier}),map:null};

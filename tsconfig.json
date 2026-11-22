@@ -8,7 +8,8 @@
     "strict": true,
     "noEmit": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["@webgpu/types"]
+    "skipLibCheck": true,
+    "types": ["@types/node"]
   },
   "include": ["packages/ascii-shader/**/*.ts"],
   "exclude": ["node_modules", "dist", "build", "target"]
