@@ -253,23 +253,9 @@ function stripNonProgrammedCanonicalContext(code:string):string{
   return body.replace(marker,' let sourceChord=finiteRunEnd(run).position.xy-finiteRunStart(run).position.xy;');
  });
  if(code.includes('fn pathGeometry('))code=rewriteFunction(code,'pathGeometry',()=>`\n var delta=last-first;var bent=false;
- let canonicalCandidate=runProgramFeature(run)!=0u&&(run.range.z&0x40000u)==0u&&sourcePartCanonicalPlayable(run);
- var canonicalDirections=vec2u(NONE);
- if(canonicalCandidate){canonicalDirections=sourcePartCanonicalDirections(run);}
- let canonicalContext=canonicalCandidate&&canonicalDirections.x!=NONE&&canonicalDirections.y!=NONE;
- if(canonicalContext){
-  let sourceFirst=sourcePartCanonicalOrigin(run).position.xy;let sourceLast=sourcePartCanonicalTerminal(run).position.xy;
-  delta=sourceLast-sourceFirst;
-  if(length(delta)<.00001){
-   if(canonicalDirections.y!=NONE){delta=sourcePartDirectionVector(canonicalDirections.y);}
-   else if(canonicalDirections.x!=NONE){delta=-sourcePartDirectionVector(canonicalDirections.x);}
-  }
-  bent=canonicalDirections.x!=((canonicalDirections.y+4u)&7u);
- }else{
-  for(var i=0u;i<run.range.y;i++){
-   let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
-   let q=point.position.xy;bent=bent||abs((q.x-first.x)*delta.y-(q.y-first.y)*delta.x)>.25*max(1.0,length(delta));
-  }
+ for(var i=0u;i<run.range.y;i++){
+  let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
+  let q=point.position.xy;bent=bent||abs((q.x-first.x)*delta.y-(q.y-first.y)*delta.x)>.25*max(1.0,length(delta));
  }
  let hardLine=(run.range.z&0x40000u)!=0u&&!bent;
  return PathGeometry(bent,hardLine,!hardLine&&(run.range.y&1u)==0u);\n`);
@@ -322,7 +308,7 @@ function lowerSharedPathGeometry(body:string):string{
    let q=point.position.xy;straightVertical=straightVertical&&abs(q.x-first.x)<.5;
   }
  }
- `;
+`;
  const legacy=` var straightVertical=true;var bent=geometry.bent;var monotone=true;var havePrevious=false;var previousY=first.y;
  for(var i=0u;i<run.range.y;i++){
   let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
