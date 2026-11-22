@@ -48,6 +48,7 @@ export interface SourceViewInstance {readonly eid:number;readonly mesh:number;re
 export interface SourceViewParent {readonly bounds:SpatialBounds;readonly instances:readonly SourceViewInstance[];readonly key:number}
 export interface SourceViewWorkset {readonly instances:readonly SourceViewInstance[];readonly parents?:readonly SourceViewParent[];readonly exterior:boolean}
 class SourceWorkset{
+ private readonly world:World;
  private readonly index=new SpatialIndex<number,Member>();
  private readonly members=new Map<number,Member>();
  private readonly meshRows=new Map<number,Member>();
@@ -64,7 +65,8 @@ class SourceWorkset{
  private readonly slots=new Map<number,Slot>();
  private readonly unsubscribe:(()=>void)[]=[];
  private version=0;private frame=-1;
- constructor(private readonly world:World){
+ constructor(world:World){
+  this.world=world;
   globalTransformTable(world);
   const poses=world.resource(GlobalTransformHistory).current!;
   this.unsubscribe.push(world.resource(Meshes).observe(handle=>{for(const eid of this.meshMembers.get(handle)??[])this.dirty.add(eid);}),world.observeMembership(MeshInstance,(eid,present)=>{
