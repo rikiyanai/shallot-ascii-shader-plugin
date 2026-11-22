@@ -430,7 +430,10 @@ export function sourceWholeCompoundReady(value:SourceWholeConstruction|SourceWho
 /** Validate only the resident source metadata. This never inspects mesh data,
  * camera pixels or the glyph bank. */
 export function sourceWholeConstructionReady(value:SourceWholeConstruction|undefined):value is SourceWholeConstruction{
- if(!value||!Number.isSafeInteger(value.revision)||value.revision<=0||!value.parts.length)return false;
+ // Source revisions are unsigned counters, beginning at zero in both the
+ // static semantic baker and physical producers. Zero is not an absent
+ // product; identity/coverage/native admission are checked independently.
+ if(!value||!Number.isSafeInteger(value.revision)||value.revision<0||value.revision>U32_MAX||!value.parts.length)return false;
  const roles=new Set(value.parts.map(part=>part.role));
  // The legacy whole product still requires all four retained role families.
  // The bounded planar compound is different: its outer boundary may be a
