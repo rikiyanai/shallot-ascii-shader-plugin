@@ -632,9 +632,9 @@ export function composeParentConstruction(members:readonly SourceLodInstance[]):
  const identities=members.map(member=>[member.mesh,member.eid] as const),known=new Set(identities.map(pairKey));
  if(known.size!==identities.length)return undefined;
  const programs=members.map(member=>member.construction!);
- const relationPrograms=programs.filter(program=>program.openings.length||program.contacts.length||program.protectedVoids.length||sourceWholePaperOf(program).length);
+ const relationPrograms=programs.filter(program=>program.openings.length||program.contacts.length||program.protectedVoids.length||program.paper?.length);
  const validContributor=(pairs:readonly (readonly [number,number])[])=>pairs.length>0&&pairs.every(pair=>known.has(pairKey(pair)));
- if(programs.some(program=>program.parts.some(part=>!validContributor(part.contributors)||(part.paper??[]).some(item=>!validContributor(item.contributors)))||[...program.openings,...program.contacts,...program.protectedVoids,...sourceWholePaperOf(program)].some(item=>!validContributor(item.contributors))))return undefined;
+ if(programs.some(program=>program.parts.some(part=>!validContributor(part.contributors)||(part.paper??[]).some(item=>!validContributor(item.contributors)))||[...program.openings,...program.contacts,...program.protectedVoids,...(program.paper??[])].some(item=>!validContributor(item.contributors))))return undefined;
  const parts=programs.flatMap(program=>program.parts);
  const openings=programs.flatMap(program=>program.openings),contacts=programs.flatMap(program=>program.contacts),protectedVoids=programs.flatMap(program=>program.protectedVoids);
  const floatValue=new Float32Array(1),floatWord=new Uint32Array(floatValue.buffer),bits=(value:number)=>{floatValue[0]=value;return floatWord[0]!;};
@@ -645,7 +645,7 @@ export function composeParentConstruction(members:readonly SourceLodInstance[]):
   if(program.compound){mix(1);for(const feature of program.compound.outerFeatures)mix(feature);for(const feature of program.compound.openingFeatures)mix(feature);for(const feature of program.compound.contactFeatures)mix(feature);for(const vertex of program.compound.anchorVertices)mix(vertex);}
   return next;
  },2166136261)>>>0;
- const paper=programs.flatMap(program=>sourceWholePaperOf(program));
+ const paper=programs.flatMap(program=>program.paper??[]);
  const compounds=programs.map(program=>program.compound).filter((value):value is SourceWholeCompound=>!!value);
  const contactOnly=!openings.length&&contacts.length>0&&!protectedVoids.length&&!paper.length&&compounds.every(value=>value.kind==='planar-contact');
  const compound=relationPrograms.length&&compounds.length===programs.length&&(openings.length>0||contactOnly)?{
