@@ -483,6 +483,89 @@ export interface SourcePartPassageReport {
  readonly junctions:readonly SourcePartJunctionRecord[];
 }
 const WHOLE_ROLE:readonly SourceWholePartRole[]=['cap','turn','flank','return'];
+/** One source-revision principal contour for a closed graph component. */
+interface SourcePrincipalPart extends SourceWholePartTemplate {readonly chain:number;readonly score:number;}
+// Keep the source-revision namespace below the far consumer's 0x07ffffff
+// feature bound and below the planar boundary namespace (0x07f00000).
+const PRINCIPAL_FEATURE_BASE=0x07e00000;
+const sourcePrincipalRoleOrder=(labels:number):readonly (0|1|2|3)[]=>{
+ const root=(labels&PART_ROOT)!==0,cap=(labels&PART_CAP)!==0;
+ if(root&&cap)return [];
+ if(root)return [3,2,1,0];
+ if(cap)return [0,2,1,3];
+ return [2,1,0,3];
+};
+const sourcePrincipalArea=(points:readonly (readonly [number,number,number])[]):number=>{
+ if(points.length<3)return 0;
+ const sum=points.reduce((out,point,index)=>{const next=points[(index+1)%points.length]!;return [out[0]+point[1]*next[2]-point[2]*next[1],out[1]+point[2]*next[0]-point[0]*next[2],out[2]+point[0]*next[1]-point[1]*next[0]] as [number,number,number];},[0,0,0] as [number,number,number]);
+ return Math.hypot(...sum)/2;
+};
+/** Every principal contour must be an actual source plane. Degenerate or
+ * non-planar geometry retains the incumbent source parts. */
+const sourcePrincipalPlanar=(points:readonly (readonly [number,number,number])[]):boolean=>{
+ if(points.length<3)return false;
+ const base=points[0]!;let normal:[number,number,number]|undefined;
+ for(let i=1;i+1<points.length&&!normal;i++)for(let j=i+1;j<points.length&&!normal;j++){
+  const a=[points[i]![0]-base[0],points[i]![1]-base[1],points[i]![2]-base[2]],b=[points[j]![0]-base[0],points[j]![1]-base[1],points[j]![2]-base[2]],n=[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]] as [number,number,number],length=Math.hypot(...n);
+  if(length>1e-8)normal=[n[0]/length,n[1]/length,n[2]/length];
+ }
+ if(!normal)return false;
+ let scale=1;for(const point of points)scale=Math.max(scale,Math.hypot(point[0]-base[0],point[1]-base[1],point[2]-base[2]));
+ return points.every(point=>Math.abs((point[0]-base[0])*normal![0]+(point[1]-base[1])*normal![1]+(point[2]-base[2])*normal![2])<=scale*1e-4);
+};
+const sourcePrincipalPorts=(section:PartSection,base:readonly (readonly [number,number,number])[],points:readonly (readonly [number,number,number])[],graph:MeshPartGraph,positions:Float32Array):readonly [number,number]|undefined=>{
+ const same=(a:readonly number[],b:readonly number[])=>a.length===b.length&&a.every((value,index)=>value===b[index]),first=base.findIndex(point=>same(point,points[0]!)),last=base.findIndex(point=>same(point,points.at(-1)!));
+ if(first<0||last<0)return;
+ const port=(sample:PartSample)=>(sampleVertex(sample,graph.axis,positions)>>>0),ports:[number,number]=[port(section.samples[first]!),port(section.samples[last]!)];
+ return graph.vertexRepresentatives[ports[0]]===graph.vertexRepresentatives[ports[1]]?undefined:ports;
+};
+const sourcePrincipalFeature=(sectionId:number,chain:number):number=>(PRINCIPAL_FEATURE_BASE|((sectionId<=0x000fffff?sectionId:chain)&0x000fffff))>>>0;
+
+/** Build the bounded multi-component PRINCIPAL/CONNECTED source product. It
+ * selects one source contour per graph chain, adds only fixed source-role
+ * fallbacks when an admitted record has no native context, and refuses the
+ * whole product unless every component and all four native role families are
+ * represented. */
+export function compileSourcePrincipalParts(source:SourceProgramInput,analysis:SourceAnalysis,complex:MeshSourceComplex,graph:MeshPartGraph,report:SourcePartPassageReport):readonly SourcePrincipalPart[]|undefined{
+ const chains=graph.chains;if(!chains||chains.length<2||(analysis.type!=='path-led'&&analysis.type!=='planar'))return;
+ const components=new Set(graph.sections.map(section=>section.component));
+ if(components.size!==chains.length||complex.boundaries.length||complex.issues.length||graph.bands.some(band=>(band.labels??0)&PART_FORK))return;
+ const relation=compileSourceRelationships(complex);
+ if(relation.contacts||relation.defects||(analysis.planeRegions??[]).some(region=>(region.openings?.length??0)>0))return;
+ const chainOf=new Map<number,number>();
+ for(const chain of chains){if(!chain.sections.length)return;const component=graph.sections.find(section=>section.id===chain.sections[0]!)?.component;if(component===undefined||chain.sections.some(id=>{const section=graph.sections.find(value=>value.id===id);return !section||section.component!==component||!section.closed||section.inside!==undefined;}))return;for(const id of chain.sections){if(chainOf.has(id))return;chainOf.set(id,chain.id);}}
+ // The certificate must cover the actual graph, not just every chain handed
+ // to the reducer. An orphaned section or overlapping chain is incomplete
+ // even when the component count and four-role mask happen to agree.
+ if(chainOf.size!==graph.sections.length||graph.sections.some(section=>!chainOf.has(section.id)))return;
+ const admittedByChain=new Map<number,(SourcePartAdmission&{readonly record:SourcePartProgramRecord})[]>();
+ for(const part of report.parts){if(part.record.kind!==1||!part.closed)continue;const chain=chainOf.get(part.record.sourceId);if(chain===undefined)continue;const list=admittedByChain.get(chain);if(list)list.push(part);else admittedByChain.set(chain,[part]);}
+ const options:SourcePrincipalPart[][]=[];
+ for(const chain of chains){
+  const chainContributors=chain.sections.slice();
+  const candidates:SourcePrincipalPart[]=[];
+  for(const part of admittedByChain.get(chain.id)??[]){if(!sourcePrincipalPlanar(part.points))continue;const score=sourcePrincipalArea(part.points);if(!(score>0))continue;candidates.push({feature:part.record.feature,entryRef:part.entryRef,context:part.context.token,role:WHOLE_ROLE[part.record.role]!,ports:part.ports,sourceContributors:chainContributors,geometry:part.points,closed:true,chain:chain.id,score:score+1e6});}
+  const sections=chain.sections.map(id=>graph.sections.find(section=>section.id===id)!).filter(Boolean).sort((a,b)=>sourcePrincipalArea(b.samples.map(sample=>partPoint({positions:source.positions},sample)))-sourcePrincipalArea(a.samples.map(sample=>partPoint({positions:source.positions},sample)))||a.id-b.id).slice(0,4);
+  for(const section of sections){const points=section.samples.map(sample=>partPoint({positions:source.positions},sample));if(!sourcePrincipalPlanar(points))continue;
+   let admitted:SourcePrincipalPart|undefined;
+   for(const role of sourcePrincipalRoleOrder(chain.labels)){
+    for(const candidate of sourcePartContextCandidates(graph.axis,role,true,{points,center:section.center},'page')){
+     const native=sourcePartResidentEntry(role,candidate.context),ports=sourcePrincipalPorts(section,points,candidate.points,graph,source.positions);
+     if(!native||!ports)continue;
+     admitted={feature:sourcePrincipalFeature(section.id,chain.id),entryRef:native.entryRef,context:candidate.context.token,role:WHOLE_ROLE[role]!,ports,sourceContributors:chainContributors,geometry:candidate.points,closed:true,chain:chain.id,score:sourcePrincipalArea(candidate.points)};
+     break;
+    }
+    if(admitted)break;
+   }
+   if(admitted)candidates.push(admitted);
+  }
+  const dedup=new Map<string,SourcePrincipalPart>();for(const candidate of candidates){const key=`${candidate.feature}:${candidate.role}:${candidate.context}`;const old=dedup.get(key);if(!old||candidate.score>old.score)dedup.set(key,candidate);}const ordered=[...dedup.values()].sort((a,b)=>b.score-a.score||a.feature-b.feature||a.role.localeCompare(b.role));if(!ordered.length)return;options.push(ordered);
+ }
+ type State={readonly score:number;readonly parts:readonly SourcePrincipalPart[]};let states=new Map<number,State>([[0,{score:0,parts:[]}]]);
+ for(const choices of options){const next=new Map<number,State>();for(const [mask,state]of states)for(const choice of choices){const role=WHOLE_ROLE.indexOf(choice.role),newMask=mask|(1<<role),candidate={score:state.score+choice.score,parts:[...state.parts,choice]};const old=next.get(newMask);if(!old||candidate.score>old.score)next.set(newMask,candidate);}states=next;}
+ const selected=states.get(15)?.parts;if(!selected||selected.length!==chains.length||new Set(selected.map(part=>part.chain)).size!==chains.length||new Set(selected.map(part=>part.feature)).size!==selected.length)return;
+ return selected;
+}
 export function compileSourcePartPassages(source:Pick<SourceProgramInput,'positions'|'indices'>,analysis:SourceAnalysis,complex:MeshSourceComplex,incidence:SourceBandIncidence|undefined=sourceBandIncidenceOwner):SourcePartPassageReport|undefined{
  const graph=analysis.structure;if(!graph)return;
  const packet=analysis.runProgram?sourcePartProgramPacket(analysis.runProgram.topology):compileSourcePartPrograms({structure:graph,complex,sourcePositions:source.positions});
@@ -561,7 +644,13 @@ export function compileWholeConstructionTemplate(source:SourceProgramInput,analy
   ...report.parts.map(part=>({...part,sourceId:part.record.sourceId,feature:part.record.feature,role:part.record.role})),
   ...planar.flatMap(part=>{const feature=sourcePlanarFeature(part.component,part.passage);return feature===undefined?[]:[{...part,sourceId:part.component,feature,role:part.role}]}),
  ];
- const admittedRoleSet=new Set(admittedParts.map(part=>WHOLE_ROLE[part.role]!));
+ // Closed multi-component building sources get one PRINCIPAL contour per
+ // source chain. Unsupported components retain the incumbent section list;
+ // only the complete source-owned replacement may cross the whole-template
+ // gate. Flat panels and relation-bearing sources keep their existing path.
+ const principal=compileSourcePrincipalParts(source,analysis,complex,graph,report);
+ const selectedParts=principal??admittedParts;
+ const admittedRoleSet=new Set(selectedParts.map(part=>typeof part.role==='number'?WHOLE_ROLE[part.role]!:part.role));
  const completeLegacyRoles=WHOLE_ROLE.every(role=>admittedRoleSet.has(role));
  // Emit exactly the admitted geometry: its anchor/winding (or passage ends)
  // produced the tangent context and the two ports, so the runtime
@@ -570,9 +659,9 @@ export function compileWholeConstructionTemplate(source:SourceProgramInput,analy
  // run, so it is the ADMITTED candidate's token. The packet's record token is
  // its FIRST legal closed candidate, which for a flank may be the other side
 
- const parts:SourceWholePartTemplate[]=admittedParts.map(part=>({feature:part.feature,entryRef:part.entryRef,
-  context:part.context.token,role:WHOLE_ROLE[part.role]!,
-  ports:part.ports,sourceContributors:[part.sourceId],geometry:part.points,closed:part.closed}));
+ const parts:SourceWholePartTemplate[]=selectedParts.map(part=>({feature:part.feature,entryRef:part.entryRef,
+  context:typeof part.context==='number'?part.context:part.context.token,role:typeof part.role==='number'?WHOLE_ROLE[part.role]!:part.role,
+  ports:part.ports,sourceContributors:'sourceContributors' in part?part.sourceContributors:[part.sourceId],geometry:'points' in part?part.points:part.geometry,closed:part.closed}));
  // Relations may borrow the turn *family* only when the compiler actually
  // admitted a turn part.  There is no fallback to an arbitrary first part:
  // missing native relation construction keeps the children as the incumbent.
@@ -628,7 +717,11 @@ export function compileWholeConstructionTemplate(source:SourceProgramInput,analy
   anchorVertices:[...new Set(anchorVertices)],
  }:undefined;
  if(!completeLegacyRoles&&!compound)return;
- return {revision:source.revision,parts,openings,contacts,protectedVoids:openings.slice(),paper:openings.slice(),...(compound?{compound}:{})};
+ // Only the source-revision principal producer proves complete component
+ // coverage. Four admitted role families (or a planar compound) are not
+ // enough to let the selector replace the incumbent children, so legacy and
+ // relation-only products deliberately remain unmarked.
+ return {revision:source.revision,...(principal?{principalComplete:true as const}:{}),parts,openings,contacts,protectedVoids:openings.slice(),paper:openings.slice(),...(compound?{compound}:{})};
 }
 export function* sourceProgramWork(source:SourceProgramInput):Generator<void,CompiledSourceProgram>{
  if(source.complexMode==='summary'&&source.incidence!=='gpu-csr')throw Error('Summary source requires compiled GPU incidence');

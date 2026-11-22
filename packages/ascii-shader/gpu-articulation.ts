@@ -25,7 +25,7 @@ const GPU_NATIVE_ROW_HEIGHT_PLAYBACK=GPU_NATIVE_ROW_PLAYBACK
  .replaceAll('let original=grammar[rowAddr+20u];\n  let lo=whole.x+nativeWholePaperX(record,nativeRow,sourceRow,whole.w,original,span.x,grammar[at+2u]);', 'let original=grammar[rowAddr+20u];\n  let lo=whole.x+nativeWholePaperX(record,nativeRow,sourceRow,whole.w,original,span.x,grammar[rowAddr+22u]);');
 import type {SourceSmallParent} from './source-small-parent.ts';
 import type {SourceWholePartRole} from './source-lod.ts';
-import {compileComputePipelines,prepareComputePipelines,type ComputePipelinePlan,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
+import {compileComputePipelines,prepareComputePipelines,DeviceComputePrograms,type ComputePipelinePlan,type ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {CONSTRUCTION_POINT_WGSL,POINT_SOURCE_CHART_WGSL,SPAN_SOURCE_TAG,NATIVE_SPAN_SOURCE} from './source-coordinates.ts';
 import {TONE_PASSAGES} from './compiled-tone-passages.ts';
 import {nativeWholeInk,type NativeGlyph,type NativeNeighborhood,type NativeOccurrence} from './native-page.ts';
@@ -5633,6 +5633,9 @@ fn softD5Record(table:u32,entry:u32)->u32{
 fn softRetainedRecordPresent(record:u32)->bool{
  return record!=NONE&&record+3u<arrayLength(&grammar)&&grammar[record]!=0u&&grammar[record+1u]!=0u&&grammar[record+2u]!=0u&&grammar[record+3u]==0u;
 }
+const SOFT_RETAINED_PASSAGE_GENERIC=0u;
+const SOFT_RETAINED_PASSAGE_PAIR=1u;
+const SOFT_RETAINED_PASSAGE_FOLIAGE=2u;
 // Admit the retained source spelling once per programmed run.  The source
 // instruction owns the column/phase; D5 may replace that one complete native
 // word with the compiled safe alternative, but a destination row or visibility
@@ -5668,6 +5671,24 @@ fn softRetainedSourcePrepare(table:u32,run:Run,size:u32,instruction:u32)->bool{
   softRetainedUnit=whole;
  }
  return true;
+}
+// Capture the retained source passage beside its spelling, once per run. The
+// source producer already carries the limb-chain and foliage class on Run;
+// this helper turns those stable source facts into the exact paired record or
+// foliage side used by every row. Visibility fragments never enter this choice.
+fn softRetainedPassagePrepare(run:Run){
+ softRetainedPassage=SOFT_RETAINED_PASSAGE_GENERIC;softRetainedPairRecord=NONE;softRetainedFoliageSide=4u;
+ let sourceChord=finiteRunEnd(run).position.xy-finiteRunStart(run).position.xy;
+ if(limbPairable(run)&&lineTier==0u){
+  let rowLean=sourceChord.x*17.0/max(abs(sourceChord.y),.0001)*sign(sourceChord.y);
+  var leanClass=2u;
+  if(rowLean<=-12.0){leanClass=0u;}else if(rowLean<=-2.5){leanClass=1u;}else if(rowLean>=12.0){leanClass=4u;}else if(rowLean>=2.5){leanClass=3u;}
+  let pairRecord=grammar[11]+leanClass*4u;
+  if(softRetainedRecordPresent(pairRecord)){softRetainedPassage=SOFT_RETAINED_PASSAGE_PAIR;softRetainedPairRecord=pairRecord;}
+ }else if((run.range.z&0x20000000u)!=0u&&((run.range.z>>8u)&255u)<=1u&&abs(sourceChord.x)>=.15*abs(sourceChord.y)){
+  softRetainedPassage=SOFT_RETAINED_PASSAGE_FOLIAGE;
+  softRetainedFoliageSide=select(4u,0u,sourceChord.x*sourceChord.y<0.0);
+ }
 }
 fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPair:u32,startT:f32,endPair:u32,endT:f32,seen:bool,markPair:u32,markT:f32,priority:u32,canonicalReady:bool,nativeInstruction:u32){
  if(row<0||row>=i32(rowCount())){return;}
@@ -5813,9 +5834,10 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
   // red line; beyond it a trunk is its plain outline, then the far strip).
   // lineTier is the FORM's selection tier, set once per run in featurecurves:
   // every limb of one tree is paired, or none is.
-  if(limbPairable(run)&&lineTier==0u){
+  if((retainedSource&&softRetainedPassage==SOFT_RETAINED_PASSAGE_PAIR)||(!retainedSource&&limbPairable(run)&&lineTier==0u)){
    let top=f32(row*17)+2.5;let bottom=f32(row*17)+14.5;
-   let topAt=vec2f(enter.x+(top-enter.y)*chord.x/chord.y,top);let bottomAt=vec2f(enter.x+(bottom-enter.y)*chord.x/chord.y,bottom);
+   let sourceChord=sourceB.position.xy-sourceA.position.xy;
+   let topAt=vec2f(sourceA.position.x+(top-sourceA.position.y)*sourceChord.x/sourceChord.y,top);let bottomAt=vec2f(sourceA.position.x+(bottom-sourceA.position.y)*sourceChord.x/sourceChord.y,bottom);
 
    // (limbPairSource); a source without the compiled table keeps limbPair.
    var pair=vec2f(0.0);
@@ -5825,7 +5847,7 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
     let lean=chord.x*sign(chord.y);
     var leanClass=2u;
     if(lean<=f32(${PAIRED_FLANK_LEANS[0]})){leanClass=0u;}else if(lean<=f32(${PAIRED_FLANK_LEANS[1]})){leanClass=1u;}else if(lean>=f32(${PAIRED_FLANK_LEANS[3]})){leanClass=4u;}else if(lean>=f32(${PAIRED_FLANK_LEANS[2]})){leanClass=3u;}
-    let record=grammar[11]+leanClass*4u;let word=grammar[record];let advance=grammar[record+1u];let centre=bitcast<i32>(grammar[record+2u]);
+    let record=select(grammar[11]+leanClass*4u,softRetainedPairRecord,retainedSource);let word=grammar[record];let advance=grammar[record+1u];let centre=bitcast<i32>(grammar[record+2u]);
     emit(runID,softRowOrdinal(runAnchor,row,1u),q.w,i32(round(middle))-centre,row,word,1u,advance,priority,0u,q.z);
     emit(runID,softRowOrdinal(runAnchor,row,2u),q.w,i32(round(pair.y))-centre,row,word,1u,advance,priority,0u,q.z);
     softWords+=2u;return;
@@ -5835,10 +5857,10 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
   // not to a screen-row count or a renormalized visible chain. Occlusion,
   // extending a run and a camera-only row crossing do not restart it.
   // Uprights and sources without this chart keep the generic run above.
-  if((run.range.z&0x20000000u)!=0u&&((run.range.z>>8u)&255u)<=1u&&abs(chord.x)>=.15*abs(chord.y)){
+  if((retainedSource&&softRetainedPassage==SOFT_RETAINED_PASSAGE_FOLIAGE)||(!retainedSource&&(run.range.z&0x20000000u)!=0u&&((run.range.z>>8u)&255u)<=1u&&abs(chord.x)>=.15*abs(chord.y))){
    let chart=softSourcePointChart(sourceA,sourceB,row);
    if(chart.y!=0.0){
-    let rec=grammar[11]+${FOLIAGE_EDGES_AT}u+(select(4u,0u,chord.x*chord.y<0.0)+foliageChartBand(chart.x))*4u;
+    let rec=grammar[11]+${FOLIAGE_EDGES_AT}u+(select(select(4u,0u,chord.x*chord.y<0.0),softRetainedFoliageSide,retainedSource)+foliageChartBand(chart.x))*4u;
     let conifer=grammar[rec];let centre=bitcast<i32>(grammar[rec+2u]);
    if(conifer!=0u){if(sourceRowSeen){sourceWord(runID,softRowOrdinal(runAnchor,row,3u),q,i32(round(middle))-centre,row,conifer,words[conifer*WS],words[conifer*WS+1u],priority,sourceA,sourceB);softWords++;}return;}
    }
@@ -5978,6 +6000,31 @@ var<private> softRetainedUnit:u32=NONE;
 var<private> softRetainedColumn:u32=NONE;
 var<private> softRetainedPhase:u32;
 var<private> softRetainedDirection:u32;
+var<private> softRetainedPassage:u32=SOFT_RETAINED_PASSAGE_GENERIC;
+var<private> softRetainedPairRecord:u32=NONE;
+var<private> softRetainedFoliageSide:u32=4u;
+const SOFT_RETAINED_MEMO_PHASE_MASK=31u;
+const SOFT_RETAINED_MEMO_PASSAGE_SHIFT=5u;
+const SOFT_RETAINED_MEMO_PAIR_SHIFT=7u;
+const SOFT_RETAINED_MEMO_FOLIAGE_SHIFT=10u;
+const SOFT_RETAINED_MEMO_VALID=1u<<11u;
+fn softRetainedMemoState(phase:u32)->u32{
+ var pairClass=0u;
+ if(softRetainedPassage==SOFT_RETAINED_PASSAGE_PAIR&&softRetainedPairRecord>=grammar[11]){pairClass=min((softRetainedPairRecord-grammar[11])/4u,4u);}
+ let foliage=select(0u,1u,softRetainedFoliageSide==0u);
+ return (phase&SOFT_RETAINED_MEMO_PHASE_MASK)|(softRetainedPassage<<SOFT_RETAINED_MEMO_PASSAGE_SHIFT)|(pairClass<<SOFT_RETAINED_MEMO_PAIR_SHIFT)|(foliage<<SOFT_RETAINED_MEMO_FOLIAGE_SHIFT)|SOFT_RETAINED_MEMO_VALID;
+}
+fn softRetainedMemoPassage(state:u32)->u32{
+ let passage=(state>>SOFT_RETAINED_MEMO_PASSAGE_SHIFT)&3u;
+ return select(SOFT_RETAINED_PASSAGE_GENERIC,passage,(state&SOFT_RETAINED_MEMO_VALID)!=0u&&passage<=SOFT_RETAINED_PASSAGE_FOLIAGE);
+}
+fn softRetainedMemoPairRecord(state:u32)->u32{
+ let passage=softRetainedMemoPassage(state);let pairClass=(state>>SOFT_RETAINED_MEMO_PAIR_SHIFT)&7u;
+ return select(NONE,grammar[11]+pairClass*4u,passage==SOFT_RETAINED_PASSAGE_PAIR&&pairClass<=4u);
+}
+fn softRetainedMemoFoliageSide(state:u32)->u32{
+ return select(4u,0u,(state&SOFT_RETAINED_MEMO_VALID)!=0u&&(state&(1u<<SOFT_RETAINED_MEMO_FOLIAGE_SHIFT))!=0u);
+}
 // Spelling belongs to the source lattice pen, even when its first word
 // overlaps a row boundary. q above stays clipped to the live row for mapped
 // visibility; using that clipped point here would re-elect the word as the
@@ -6148,10 +6195,10 @@ fn softRunPhaseOrigin(run:Run)->Point{
  if(sourcePartCanonicalPlayable(run)){return sourcePartCanonicalOrigin(run);}
  return finiteRunStart(run);
 }
-fn softRunPlayback(runID:u32,run:Run,table:u32,size:u32,priority:u32,nativeAnchorPhase:f32,nativeTurn:vec2f,nativeInstruction:u32){
+fn softRunPlayback(runID:u32,run:Run,table:u32,size:u32,priority:u32,nativeAnchorPhase:f32,nativeTurn:vec2f,nativeInstruction:u32,memo:u32,retainedMemo:bool){
  var canonicalReady=sourcePartCanonicalPlayable(run);
  if(canonicalReady&&!sourcePartPreparedCanonicalRowsReady(runID,run)){canonicalReady=false;}
- softRetainedRecord=NONE;softRetainedUnit=NONE;softRetainedColumn=NONE;softRetainedPhase=0u;softRetainedDirection=0u;
+ softRetainedRecord=NONE;softRetainedUnit=NONE;softRetainedColumn=NONE;softRetainedPhase=0u;softRetainedDirection=0u;softRetainedPassage=SOFT_RETAINED_PASSAGE_GENERIC;softRetainedPairRecord=NONE;softRetainedFoliageSide=4u;
  curvedRun=runBent(run);lastUprightRow=-1000000;
  noUprightRun=terrainRun(run)||((run.range.z>>8u)&255u)>=3u;
  if(canonicalReady){
@@ -6167,7 +6214,13 @@ fn softRunPlayback(runID:u32,run:Run,table:u32,size:u32,priority:u32,nativeAncho
   if(sourcePartPrepared(run)!=NONE){canonicalReady=false;}
  }
  if(canonicalReady&&runProgramFeature(run)!=0u&&sourcePartPrepared(run)==NONE){
-  if(!softRetainedSourcePrepare(table,run,size,nativeInstruction)){canonicalReady=false;}
+  if(retainedMemo){
+   let memoState=atomicLoad(&counts[memo+3u]);let memoValid=(memoState&SOFT_RETAINED_MEMO_VALID)!=0u;
+   softRetainedPassage=softRetainedMemoPassage(memoState);softRetainedPairRecord=softRetainedMemoPairRecord(memoState);softRetainedFoliageSide=softRetainedMemoFoliageSide(memoState);
+   if(!softRetainedSourcePrepare(table,run,size,nativeInstruction)){canonicalReady=false;}
+   else if(!memoValid){softRetainedPassagePrepare(run);let phase=atomicLoad(&counts[memo+3u])&SOFT_RETAINED_MEMO_PHASE_MASK;atomicStore(&counts[memo+3u],softRetainedMemoState(phase));}
+  }else if(!softRetainedSourcePrepare(table,run,size,nativeInstruction)){canonicalReady=false;}
+  else{softRetainedPassagePrepare(run);let phase=atomicLoad(&counts[memo+3u])&SOFT_RETAINED_MEMO_PHASE_MASK;atomicStore(&counts[memo+3u],softRetainedMemoState(phase));}
  }
  softRunAnchor=softRunPhaseOrigin(run);
  let base=run.range.x;let pairs=run.range.y/2u;
@@ -6403,7 +6456,7 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
   let nativeAngle=angle-bitcast<f32>(atomicLoad(&counts[memo+7u]));
   var nativeTurn=vec2f(1.0,0.0);
   if(nativeAngle!=0.0){nativeTurn=vec2f(cos(nativeAngle),sin(nativeAngle));}
-  softRunPlayback(runID,run,select(select(grammar[0],grammar[4],articulated),terrainTable,terrainRun(run)),min(runSize(run),tierBand(tier)),priority,bitcast<f32>(atomicLoad(&counts[memo+6u])),nativeTurn,instruction);
+  softRunPlayback(runID,run,select(select(grammar[0],grammar[4],articulated),terrainTable,terrainRun(run)),min(runSize(run),tierBand(tier)),priority,bitcast<f32>(atomicLoad(&counts[memo+6u])),nativeTurn,instruction,memo,retained);
   // Loss accounting: a selected run with a visible span that handed no word
   // to placement, and did not yield a row to its pair, drew nothing.
   if(softWords==0u&&!softYield){
@@ -7663,6 +7716,15 @@ function articulationPipelinePlan(device:GPUDevice){
  plans.set('partAnchorPack',()=>({layout:'auto',compute:{module:device.createShaderModule({label:'MAIN camera part-anchor snapshot pack',code:PART_ANCHOR_PACK_SHADER}),entryPoint:'pack'}}));
  return {layout,plans};
 }
+// Articulation layouts and pipelines are immutable device-lifetime resources.
+// Keep the prepared bank at the same per-device owner as the source-run and
+// sealer banks: a second MAIN adapter on the same device must not recompile
+// every family before it can publish its first frame. Per-instance grammar,
+// source-run buffers and native tape state remain owned by each articulation.
+const articulationPrograms=new DeviceComputePrograms(device=>{
+ const {layout,plans}=articulationPipelinePlan(device);
+ return {resources:layout,plans};
+});
 interface PreparedArticulation {
  readonly packed:PackedRoleGrammar;readonly sourceRuns?:GpuConstructionRuns;readonly seal?:GpuNativeSealer;
  readonly layout?:GPUBindGroupLayout;readonly pipelines?:ReadonlyMap<string,GPUComputePipeline>;
@@ -7928,9 +7990,9 @@ export class GpuArticulation {
   const packed=await loadRuntimeRoleGrammar(font,whitespace,maxWidth);
   const sourceRuns=await GpuConstructionRuns.create(device,packed.anchorContexts,(p,stage)=>progress?.(p/3,stage));
   try{
-   const {layout,plans}=articulationPipelinePlan(device),pipelines=await prepareComputePipelines(device,plans,(p,stage)=>progress?.((1+p)/3,stage));
+   const prepared=await articulationPrograms.prepare(device,(p,stage)=>progress?.((1+p)/3,stage));
    const seal=await GpuNativeSealer.create(device,(p,stage)=>progress?.((2+p)/3,stage));
-   return new GpuArticulation(device,font,whitespace,maxWidth,{packed,sourceRuns,layout,pipelines,seal});
+   return new GpuArticulation(device,font,whitespace,maxWidth,{packed,sourceRuns,layout:prepared.resources,pipelines:prepared.pipelines,seal});
   }catch(error){sourceRuns.dispose();throw error;}
  }
  constructor(private readonly device:GPUDevice,font:readonly NativeGlyph[],whitespace:NativeWhitespacePolicy='preformatted',private readonly maxWidth=8192,prepared?:PreparedArticulation){

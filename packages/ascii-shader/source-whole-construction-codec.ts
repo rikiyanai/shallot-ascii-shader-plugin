@@ -9,9 +9,10 @@ import type {
 /** Compact, bounded source-owned parent packet. Relation boundaries carry
  * source geometry and pose; opaque relation IDs remain non-renderable. */
 export const SOURCE_WHOLE_CONSTRUCTION_MAGIC=0x57435450;
-export const SOURCE_WHOLE_CONSTRUCTION_VERSION=3;
+export const SOURCE_WHOLE_CONSTRUCTION_VERSION=4;
 const LEGACY_SOURCE_WHOLE_CONSTRUCTION_VERSION=1;
 const PREVIOUS_SOURCE_WHOLE_CONSTRUCTION_VERSION=2;
+const COMPOUND_SOURCE_WHOLE_CONSTRUCTION_VERSION=3;
 const NONE=0xffffffff;
 const MAX_LIST=1<<20;
 const MAX_GEOMETRY_POINTS=1<<22;
@@ -141,13 +142,14 @@ export function encodeSourceWholeConstructionTemplate(source:SourceWholeConstruc
   writer.word(assertCount(source.compound.contactFeatures.length,'compound.contactFeatures'));writer.words(source.compound.contactFeatures.map(value=>assertU32(value,'compound.contactFeature')));
   writer.word(assertCount(source.compound.anchorVertices.length,'compound.anchorVertices'));writer.words(source.compound.anchorVertices.map(value=>assertU32(value,'compound.anchorVertex')));
  }
+ writer.word(Number(source.principalComplete===true));
  return writer.finish();
 }
 
 export function decodeSourceWholeConstructionTemplate(values:Uint32Array):SourceWholeConstructionTemplate{
  const reader=new WordReader(values);
  if(reader.word('magic')!==SOURCE_WHOLE_CONSTRUCTION_MAGIC)throw Error('Unsupported whole construction packet');
- const version=reader.word('version');if(version!==SOURCE_WHOLE_CONSTRUCTION_VERSION&&version!==PREVIOUS_SOURCE_WHOLE_CONSTRUCTION_VERSION&&version!==LEGACY_SOURCE_WHOLE_CONSTRUCTION_VERSION)throw Error('Unsupported whole construction packet');
+ const version=reader.word('version');if(version!==SOURCE_WHOLE_CONSTRUCTION_VERSION&&version!==COMPOUND_SOURCE_WHOLE_CONSTRUCTION_VERSION&&version!==PREVIOUS_SOURCE_WHOLE_CONSTRUCTION_VERSION&&version!==LEGACY_SOURCE_WHOLE_CONSTRUCTION_VERSION)throw Error('Unsupported whole construction packet');
  const revision=reader.word('revision'),partsCount=reader.count('parts');
  const parts:SourceWholePartTemplate[]=[];
  for(let index=0;index<partsCount;index++){
@@ -167,7 +169,7 @@ export function decodeSourceWholeConstructionTemplate(values:Uint32Array):Source
  const openings=decodeOpeningList(reader,'openings',version),contacts=decodeOpeningList(reader,'contacts',version),protectedVoids=decodeOpeningList(reader,'protectedVoids',version),paper=decodeOpeningList(reader,'paper',version);
  if(!openings||!contacts||!protectedVoids)throw Error('Invalid whole construction required list');
  let compound:SourceWholeCompound|undefined;
- if(version===SOURCE_WHOLE_CONSTRUCTION_VERSION){
+ if(version>=COMPOUND_SOURCE_WHOLE_CONSTRUCTION_VERSION){
   const present=reader.word('compound.present');if(present>1)throw Error('Invalid whole construction compound marker');
   if(present){
    const kind=WORD_TO_COMPOUND[reader.word('compound.kind')!];if(!kind)throw Error('Invalid whole construction compound kind');
@@ -175,6 +177,8 @@ export function decodeSourceWholeConstructionTemplate(values:Uint32Array):Source
    compound={kind,outerFeatures:readList('compound.outerFeatures'),openingFeatures:readList('compound.openingFeatures'),contactFeatures:readList('compound.contactFeatures'),anchorVertices:readList('compound.anchorVertices')};
   }
  }
+ const principal=version>=4?reader.word('principal.complete'):0;
+ if(principal>1)throw Error('Invalid whole construction principal coverage marker');
  if(!reader.done())throw Error('Trailing whole construction words');
- return {revision,parts,openings,contacts,protectedVoids,...(paper!==undefined?{paper}: {}),...(compound?{compound}: {})};
+ return {revision,...(principal?{principalComplete:true as const}:{}),parts,openings,contacts,protectedVoids,...(paper!==undefined?{paper}: {}),...(compound?{compound}: {})};
 }

@@ -296,6 +296,7 @@ function sourcePose(part:SourceWholePartRef,member:CoherentParentMember):ArrayLi
 export function compileCoherentParent(members:readonly CoherentParentMember[]):CoherentParentResult{
  if(!members.length)return {status:'children',reason:'missing-geometry'};
  const known=new Set(members.map(member=>`${member.mesh}:${member.eid}`));
+ if(known.size!==members.length)return {status:'children',reason:'invalid-contributor'};
  if(members.some(member=>!member.construction.parts.length))return {status:'children',reason:'missing-geometry'};
  const poseBindings:CoherentPoseBinding[]=[];
  const sourceFeatures:number[]=[];
@@ -415,7 +416,7 @@ export function compileCoherentParent(members:readonly CoherentParentMember[]):C
  }:undefined;
  if(hasRelations&&!compound)return {status:'children',reason:'invalid-relation'};
  const revision=featureHash(sourceFeatures,members.reduce((hash,member)=>mix(hash,member.construction.revision),2166136261));
- const construction:SourceWholeConstruction={revision,parts,openings,contacts,protectedVoids,...(allPaper.length?{paper:allPaper}:{}),...(compound?{compound}:{})};
+ const construction:SourceWholeConstruction={revision,...(members.every(member=>member.construction.principalComplete===true)?{principalComplete:true as const}:{}),parts,openings,contacts,protectedVoids,...(allPaper.length?{paper:allPaper}:{}),...(compound?{compound}:{})};
  const endpoints=new Map<string,number>(),parent=Array.from({length:passages.length},(_,index)=>index);
  const root=(index:number):number=>{while(parent[index]!==index){parent[index]=parent[parent[index]!]!;index=parent[index]!;}return index;};
  const join=(a:number,b:number)=>{const x=root(a),y=root(b);if(x!==y)parent[Math.max(x,y)]=Math.min(x,y);};

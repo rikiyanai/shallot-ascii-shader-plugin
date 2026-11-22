@@ -21,7 +21,38 @@ import {SpatialIndex,type SpatialBounds} from './spatial-index.ts';
 import {bindSourceWholeConstruction,fitsParentTier,selectSourceLod,type SourceLodInstance,type SourceLodParent,type SourceLodSelection,ParentGroupCache,type SourceWholeConstructionTemplate,type SmallConstructionAvailability,type SourceWholeNativePartAdmission} from './source-lod.ts';
 import type {SourceSmallParent} from './source-small-parent.ts';
 
-export type PhysicalSourceGeometry=CompositionGeometry&{readonly contactKeys?:Uint32Array;readonly semantic?:Uint8Array};
+/** A producer-owned local-space envelope for a posed source.  `bounds` is
+ * already the union required by the producer's current/adjacent animation
+ * pair (or its immutable deformation envelope); it is not the rest mesh
+ * bounds and is never inferred by MAIN.  `poseRevision` changes whenever the
+ * pair changes, so a resident source can reuse the product without scanning
+ * vertices on each camera frame. */
+export type PhysicalPosedBoundAuthority='current-pose'|'adjacent-pose-envelope'|'immutable-envelope';
+export interface PhysicalPosedBounds {
+ readonly authority:PhysicalPosedBoundAuthority;
+ readonly sourceRevision:number;
+ readonly poseRevision:number;
+ readonly bounds:readonly [number,number,number,number,number,number];
+}
+export type PhysicalSourceGeometry=CompositionGeometry&{readonly contactKeys?:Uint32Array;readonly semantic?:Uint8Array;readonly posedBounds?:PhysicalPosedBounds};
+/** Pack one producer's complete local envelope into the source chart layout
+ * used by the physical posing shader: low xyz at 0..2 and high xyz at 4..6.
+ * A source-model row is certified by its resident source bounds. A deformed
+ * row is certified only by an exact source-revision/pose-revision envelope;
+ * unknown authority copies the conservative fallback for chart input but
+ * returns false so every culler keeps that instance unbounded. */
+export function writePhysicalInstanceBound(out:Float32Array,geometry:PhysicalSourceGeometry,fallback:Float32Array):boolean{
+ if(out.length<8)throw Error('Physical instance bound destination is too small');
+ out.set(fallback.subarray(0,8));
+ if(geometry.poseAuthority==='source-model')return fallback.length>=8&&fallback.slice(0,8).every(Number.isFinite)&&fallback[0]!<=fallback[4]!&&fallback[1]!<=fallback[5]!&&fallback[2]!<=fallback[6]!;
+ if(geometry.poseAuthority!==undefined)return false;
+ const posed=geometry.posedBounds;
+ if(!posed||posed.authority!=='current-pose'&&posed.authority!=='adjacent-pose-envelope'&&posed.authority!=='immutable-envelope'||
+  !Number.isSafeInteger(posed.sourceRevision)||posed.sourceRevision!==geometry.revision||!Number.isSafeInteger(posed.poseRevision)||posed.poseRevision<0||
+  posed.bounds.length!==6||!posed.bounds.every((value)=>Number.isFinite(value))||posed.bounds[0]!>posed.bounds[3]!||posed.bounds[1]!>posed.bounds[4]!||posed.bounds[2]!>posed.bounds[5]!)return false;
+ out[0]=posed.bounds[0]!;out[1]=posed.bounds[1]!;out[2]=posed.bounds[2]!;out[4]=posed.bounds[3]!;out[5]=posed.bounds[4]!;out[6]=posed.bounds[5]!;
+ return true;
+}
 /** Exact dynamic-worker input shared by runtime registration and build-time
  * semantic identity. Keep source id, P0 adjacency, contact keys, material and
  * producer lineage in one factory; baked assets use this same model authority
@@ -47,7 +78,7 @@ export type PhysicalSource=PhysicalSourceData&(
  {readonly complex:MeshSourceComplex;readonly summary?:never;readonly analysis:SourceAnalysis;readonly profileSafe:boolean}|
  {readonly summary:SourceResidencySummary;readonly complex?:never;readonly analysis:PlaybackSourceAnalysis;readonly profileSafe:boolean});
 interface Registration {readonly id:number;readonly bounds:Float32Array;priority?:number;readonly geometry:PhysicalSourceGeometry;resolvedGeometry?:PhysicalSourceGeometry;resolving?:Promise<void>;compilation?:SourceCompilation;numeric?:NumericSourceCompilation;readonly promise:Promise<void>;readonly resolve:()=>void;readonly reject:(error:Error)=>void;error?:Error}
-export interface PhysicalSourceInstance {readonly geometry:CompositionGeometry;readonly domain:number;readonly owner:number}
+export interface PhysicalSourceInstance {readonly geometry:PhysicalSourceGeometry;readonly domain:number;readonly owner:number}
 export interface PhysicalResidentBatch {readonly batch:PosedSourceBatch;readonly source:RegisteredSourceComplex<SourceComplexRetention>;readonly domain:number}
 export interface PhysicalProducerOwner {readonly mesh:number;readonly eid:number}
 /** Parse the retained per-instance producer identity, not the shared source's
@@ -60,7 +91,7 @@ export function parsePhysicalProducerOwner(owner:string):PhysicalProducerOwner|u
 interface RetainedBatch {
  readonly mesh:PhysicalSource;readonly batch:PosedSourceBatch;readonly range:SourceInstanceRange;
  readonly storageRanges:{vertices:SourceStorageRange;attributes:SourceStorageRange;metadata:SourceStorageRange};
- readonly members:string[];readonly matrices:Float32Array;revision:number;
+ readonly members:string[];readonly matrices:Float32Array;readonly localBounds:Float32Array;readonly boundKnown:Uint8Array;readonly boundRevisions:Float64Array;revision:number;
  /** Inputs are leased until submitted(), never overwritten while an encoder
   * or native job can still read them. Outputs keep their source-owned identity. */
  readonly slots:SourceFrameSlot[];published?:PhysicalResidentBatch;
@@ -78,9 +109,11 @@ type SpatialInstance={readonly batch:RetainedBatch;readonly instance:number};
 const IDENTITY=new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
 /** Retained batches of one domain are addressed `domain*BATCHES+index`. */
 const BATCHES=0x100000;
+const ROOT_WORDS=28,ROOT_BYTES=ROOT_WORDS*4;
+const physicalBoundRevision=(geometry:PhysicalSourceGeometry,known:boolean):number=>known?(geometry.poseAuthority==='source-model'?geometry.revision:geometry.posedBounds!.poseRevision):-1;
 const SHADER=/* wgsl */`
 struct Params {extent:vec4u,low:vec4f,high:vec4f}
-struct Root {world:mat4x4f,identity:vec4u}
+struct Root {world:mat4x4f,identity:vec4u,low:vec4f,high:vec4f}
 @group(0) @binding(0) var<uniform> params:Params;
 @group(0) @binding(1) var<storage,read> source:array<vec4f>;
 @group(0) @binding(2) var<storage,read> normals:array<vec4f>;
@@ -105,7 +138,7 @@ fn oct(value:vec3f)->vec2f{
  var chart=vec2u(0u);if(params.low.w!=0.0){chart=vec2u(bitcast<u32>(sourceHeightChart(source[i].xyz,params.low.xyz,params.high.xyz)),${SOURCE_CHART_TAG}u);}
  attributes[out]=vec4u(pack2x16snorm(oct(worldNormal)),chart,root.identity.x);
  if(i==0u){var low=vec3f(3.402823e38);var high=vec3f(-3.402823e38);
-  for(var corner=0u;corner<8u;corner++){let q=(root.world*vec4f(select(params.low.xyz,params.high.xyz,vec3u(corner&1u,corner&2u,corner&4u)!=vec3u(0)),1)).xyz;low=min(low,q);high=max(high,q);}
+  if(root.identity.z==0u){low=vec3f(-1e18);high=vec3f(1e18);}else{for(var corner=0u;corner<8u;corner++){let q=(root.world*vec4f(select(root.low.xyz,root.high.xyz,vec3u(corner&1u,corner&2u,corner&4u)!=vec3u(0)),1)).xyz;low=min(low,q);high=max(high,q);}}
   bounds[(params.extent.w+root.identity.y)*2u]=vec4f(low,0);bounds[(params.extent.w+root.identity.y)*2u+1u]=vec4f(high,0);
  }
 }`;
@@ -249,6 +282,7 @@ export class PhysicalSourceTransport {
   if(this.disposed)throw Error('Physical source transport is disposed');
   const requested=new Set<Registration>(),required=new Set<Registration>(),predicted=new Set<Registration>(),live=new Set<PhysicalSource>();
   const eye=clip&&clipEye(clip),wide=clip&&widenedClip(clip,PREDICT_WIDEN);
+  const local=new Float32Array(8);
   for(const g of geometry){
    if(!g.indices.length)continue;
    const source=this.cache.get(g.positions)?.get(g.indices);
@@ -258,7 +292,7 @@ export class PhysicalSourceTransport {
    let job=byIndex.get(g.indices);
    if(job&&job.geometry.revision!==g.revision){this.cancelRegistration(job);byIndex.delete(g.indices);job=undefined;}
    if(!job){
-    const definition:PhysicalSourceGeometry={owner:g.owner,positions:g.positions,indices:g.indices,revision:g.revision,normals:g.normals,contactKeys:g.contactKeys,semantic:g.semantic,lineage:g.lineage,surface:g.surface,materialSource:g.materialSource,construction:g.construction};
+    const definition:PhysicalSourceGeometry={owner:g.owner,positions:g.positions,indices:g.indices,revision:g.revision,normals:g.normals,contactKeys:g.contactKeys,semantic:g.semantic,posedBounds:g.posedBounds,lineage:g.lineage,surface:g.surface,materialSource:g.materialSource,construction:g.construction};
     // Bounds are registered once per source revision, not recomputed per
     // camera or instance. The worker's completed bounds replace this scratch.
     const bounds=new Float32Array([Infinity,Infinity,Infinity,0,-Infinity,-Infinity,-Infinity,0]);
@@ -270,8 +304,12 @@ export class PhysicalSourceTransport {
    }
    requested.add(job);
    // OR across ALL instances of one source, regardless of enumeration order.
-   if(!clip||!job.bounds.every(Number.isFinite)||instanceMayShow(job.bounds,g.worldFromSource??IDENTITY,0,clip))required.add(job);
-   else if(wide&&(instanceMayShow(job.bounds,g.worldFromSource??IDENTITY,0,wide)||(eye&&boundsDistance(job.bounds,g.worldFromSource??IDENTITY,eye)<=PREDICT_RADIUS)))predicted.add(job);
+   const known=writePhysicalInstanceBound(local,g,job.bounds);
+   // Without an exact posed certificate this source remains required for the
+   // complete incumbent. Never let a rest/source mesh box make a deformed row
+   // disappear merely because the current camera cannot see that rest box.
+   if(!clip||!known||instanceMayShow(local,g.worldFromSource??IDENTITY,0,clip))required.add(job);
+   else if(known&&wide&&(instanceMayShow(local,g.worldFromSource??IDENTITY,0,wide)||(eye&&boundsDistance(local,g.worldFromSource??IDENTITY,eye)<=PREDICT_RADIUS)))predicted.add(job);
   }
   for(const job of this.work)if(!requested.has(job)){this.cancelRegistration(job);const byIndex=this.registrations.get(job.geometry.positions);if(byIndex?.get(job.geometry.indices)===job)byIndex.delete(job.geometry.indices);}
   for(const job of requested){
@@ -396,7 +434,7 @@ export class PhysicalSourceTransport {
   // The worker's physical projection computes normals and retains the source
   // lineage; merge the admitted input fields so a semantic asset cannot vanish
   // merely because this source took the complete fallback route.
-  const geometry:PhysicalSourceGeometry={...physical.geometry,contactKeys:g.contactKeys,semantic:g.semantic};
+  const geometry:PhysicalSourceGeometry={...physical.geometry,contactKeys:g.contactKeys,semantic:g.semantic,posedBounds:g.posedBounds};
   const vertices=allocateStorageRanges({positions:{storage:this.sourcePositions,data:physical.positions},normals:{storage:this.sourceNormals,data:geometry.normals!}});
   let incidence:SourceStorageRange|undefined,indices:SourceStorageRange|undefined,indicesBinding:GPUBufferBinding,incidenceBinding:GPUBufferBinding;
   try{
@@ -435,10 +473,10 @@ export class PhysicalSourceTransport {
   if(!slot){
    const partial:GPUBuffer[]=[];
    try{
-    const roots=this.device.createBuffer({label:'MAIN retained source roots',size:size*80,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});partial.push(roots);
+    const roots=this.device.createBuffer({label:'MAIN retained source roots',size:size*ROOT_BYTES,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});partial.push(roots);
     const params=this.device.createBuffer({label:'MAIN retained source pose parameters',size:48,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});partial.push(params);
     const group=this.device.createBindGroup({layout:this.pipeline.getBindGroupLayout(0),entries:[ {buffer:params},source.positionsBinding,source.normalsBinding,retained.batch.storage!.vertices,retained.batch.storage!.attributes,{buffer:this.arena.bounds},{buffer:roots}].map((resource,binding)=>({binding,resource}))});
-    const memory=new ArrayBuffer(size*80),parameterImage=new ArrayBuffer(48);
+    const memory=new ArrayBuffer(size*ROOT_BYTES),parameterImage=new ArrayBuffer(48);
     new Float32Array(parameterImage).set(source.bounds,4);
     // Only the foliage-side consumer needs this chart today. Registration
     // supplies the class; non-foliage relations keep the old math path.
@@ -460,7 +498,7 @@ export class PhysicalSourceTransport {
   // Preflight all new ranges before opening a pass: arena growth copies the
   // unchanged bounds and every pose of this encode must bind the NEW buffer.
   const additional:number[]=[];
-  for(const [domain,list]of groups){const g=list[0]!.geometry,source=this.acquire(g),count=source.geometry.positions.length/3,stride=count*16,maximum=Math.min(this.device.limits.maxStorageBufferBindingSize,this.device.limits.maxBufferSize),chunk=Math.max(1,Math.floor(maximum/Math.max(stride,80)));
+  for(const [domain,list]of groups){const g=list[0]!.geometry,source=this.acquire(g),count=source.geometry.positions.length/3,stride=count*16,maximum=Math.min(this.device.limits.maxStorageBufferBindingSize,this.device.limits.maxBufferSize),chunk=Math.max(1,Math.floor(maximum/Math.max(stride,ROOT_BYTES)));
    for(let offset=0,batch=0;offset<list.length;offset+=chunk,batch++){const size=Math.min(chunk,list.length-offset),old=this.batches.get(domain*BATCHES+batch);if(!old||old.mesh!==source||old.batch.storage!.vertices.size!==stride*size)additional.push(size);}
   }
   this.arena.reserve(encoder,additional);this.arena.begin();let cullChanged=false;
@@ -475,10 +513,11 @@ export class PhysicalSourceTransport {
    const first=list[0]!,g=first.geometry,source=this.acquire(g);
    for(const item of list)if(item.geometry.positions!==g.positions||item.geometry.indices!==g.indices||item.geometry.revision!==g.revision)throw Error('Physical domain changed its immutable mesh within one frame');
    const count=source.geometry.positions.length/3,stride=count*16,maximum=Math.min(this.device.limits.maxStorageBufferBindingSize,this.device.limits.maxBufferSize);
-   if(!count||Math.max(stride,80)>maximum)throw Error('Physical posed source requires device-sized geometry chunks');
-   // A root is 80 bytes even for a three-vertex source. Every binding, not
-   // just the posed vertex stream, must fit the same device-sized slice.
-   const chunk=Math.max(1,Math.floor(maximum/Math.max(stride,80)));
+   if(!count||Math.max(stride,ROOT_BYTES)>maximum)throw Error('Physical posed source requires device-sized geometry chunks');
+   // A root is 112 bytes even for a three-vertex source: world transform,
+   // owner/index, and the producer's complete local posed envelope. Every
+   // binding, not just the posed vertex stream, must fit the same slice.
+   const chunk=Math.max(1,Math.floor(maximum/Math.max(stride,ROOT_BYTES)));
    for(let offset=0,batch=0;offset<list.length;offset+=chunk,batch++){
     if(batch>=BATCHES)throw Error('Physical domain exceeds its retained batch addressing');
     const size=Math.min(chunk,list.length-offset),key=domain*BATCHES+batch,bytes=stride*size;live.add(key);let retained=this.batches.get(key);
@@ -487,22 +526,24 @@ export class PhysicalSourceTransport {
      const storageRanges=allocateStorageRanges({vertices:{storage:this.posedVertices,data:bytes},attributes:{storage:this.posedAttributes,data:bytes},metadata:{storage:this.catalog,data:new Uint32Array([g.indices.length,size,0,0,0,0,0,0])}});
      const storage={identity:{},vertices:this.posedVertices.binding(storageRanges.vertices),attributes:this.posedAttributes.binding(storageRanges.attributes),metadata:this.catalog.binding(storageRanges.metadata)};
      const range=this.arena.allocate(size),bounds=this.arena.bounds,visibleInstances=this.arena.visibility;
-     retained={mesh:source,storageRanges,range,batch:{vertices:storage.vertices.buffer,attributes:storage.attributes.buffer,metadata:storage.metadata.buffer,storage,source:{vertexCapacity:count,indexBase:0,cullMode:1,instanceCapacity:size,bounds,visibleInstances,visibleInstanceOffset:range.base,physicalUniformProducerRows:true}},members:[],matrices:new Float32Array(size*16),revision:0,slots:[],settling:new Set()};this.batches.set(key,retained);
+     retained={mesh:source,storageRanges,range,batch:{vertices:storage.vertices.buffer,attributes:storage.attributes.buffer,metadata:storage.metadata.buffer,storage,source:{vertexCapacity:count,indexBase:0,cullMode:1,instanceCapacity:size,bounds,visibleInstances,visibleInstanceOffset:range.base,physicalUniformProducerRows:true}},members:[],matrices:new Float32Array(size*16),localBounds:new Float32Array(size*8),boundKnown:new Uint8Array(size),boundRevisions:new Float64Array(size).fill(-1),revision:0,slots:[],settling:new Set()};this.batches.set(key,retained);
     }
     changed.length=0;
+   const local=new Float32Array(8);
     for(let index=0;index<size;index++){
-     const member=list[offset+index]!,matrix=member.geometry.worldFromSource??IDENTITY;let dirty=retained.members[index]!==member.geometry.owner;
+     const member=list[offset+index]!,matrix=member.geometry.worldFromSource??IDENTITY,known=writePhysicalInstanceBound(local,member.geometry,source.bounds),boundRevision=physicalBoundRevision(member.geometry,known);let dirty=retained.members[index]!==member.geometry.owner||retained.boundKnown[index]!==Number(known)||retained.boundRevisions[index]!==boundRevision;
      for(let k=0;k<16&&!dirty;k++)dirty=retained.matrices[index*16+k]!==matrix[k];
-     if(dirty){changed.push(index);retained.settling.add(index);retained.members[index]=member.geometry.owner;retained.matrices.set(matrix,index*16);this.spatial.set(retained.range.base+index,instanceBounds(source.bounds,retained.matrices,index),{batch:retained,instance:index});}
+     for(let k=0;k<8&&!dirty;k++)dirty=retained.localBounds[index*8+k]!==local[k];
+     if(dirty){changed.push(index);retained.settling.add(index);retained.members[index]=member.geometry.owner;retained.boundKnown[index]=Number(known);retained.boundRevisions[index]=boundRevision;retained.localBounds.set(local,index*8);retained.matrices.set(matrix,index*16);this.spatial.set(retained.range.base+index,known?instanceBounds(local,retained.matrices,index):undefined,{batch:retained,instance:index});}
      else retained.settling.delete(index);
     }
     let slot:SourceFrameSlot|undefined;
     if(changed.length){
      retained.revision++;
      slot=this.frameSlot(retained,source,size);const f=slot.floats,u=slot.words;
-     for(let record=0;record<changed.length;record++){const index=changed[record]!,at=record*20;for(let k=0;k<16;k++)f[at+k]=retained.matrices[index*16+k]!;u[at+16]=list[offset+index]!.owner;u[at+17]=index;u[at+18]=0;u[at+19]=0;}
+     for(let record=0;record<changed.length;record++){const index=changed[record]!,at=record*28,local=index*8;for(let k=0;k<16;k++)f[at+k]=retained.matrices[index*16+k]!;u[at+16]=list[offset+index]!.owner;u[at+17]=index;u[at+18]=retained.boundKnown[index]!;u[at+19]=0;for(let k=0;k<3;k++){f[at+20+k]=retained.localBounds[local+k]!;f[at+24+k]=retained.localBounds[local+4+k]!;}f[at+23]=0;f[at+27]=0;}
      const groups=Math.ceil(count*changed.length/64),columns=Math.min(groups,this.device.limits.maxComputeWorkgroupsPerDimension);
-     slot.parameters.set([count,changed.length,columns,retained.range.base]);this.device.queue.writeBuffer(slot.roots,0,slot.memory,0,changed.length*80);this.device.queue.writeBuffer(slot.params,0,slot.parameterImage);
+     slot.parameters.set([count,changed.length,columns,retained.range.base]);this.device.queue.writeBuffer(slot.roots,0,slot.memory,0,changed.length*ROOT_BYTES);this.device.queue.writeBuffer(slot.params,0,slot.parameterImage);
      const roots_=pass();roots_.setPipeline(this.pipeline);roots_.setBindGroup(0,slot.group);roots_.dispatchWorkgroups(columns,Math.ceil(groups/columns));
     }
     // Preserve the host's coarse in-view decision and exact held-view test.
@@ -555,7 +596,8 @@ export class PhysicalSourceTransport {
    const identity=parsePhysicalProducerOwner(entry.batch.members[entry.instance]??'');if(!identity)return;
    const {mesh,eid}=identity;profiles.set(mesh,entry.batch.mesh.profileSafe);
    const worldFromSource=entry.batch.matrices.subarray(entry.instance*16,entry.instance*16+16);
-   return {eid,mesh,bounds:instanceBounds(entry.batch.mesh.bounds,entry.batch.matrices,entry.instance),settling:entry.batch.settling.has(entry.instance)||!entry.batch.mesh.profileSafe,sourceRevision:entry.batch.mesh.revision,poseRevision:entry.batch.revision,worldFromSource,construction:bindSourceWholeConstruction(entry.batch.mesh.wholeConstruction,mesh,eid,worldFromSource),smallParent:entry.batch.mesh.smallParent};
+   const known=entry.batch.boundKnown[entry.instance]===1,local=entry.batch.localBounds.subarray(entry.instance*8,entry.instance*8+8);
+   return {eid,mesh,bounds:known?instanceBounds(local,entry.batch.matrices,entry.instance):undefined,settling:entry.batch.settling.has(entry.instance)||!known||!entry.batch.mesh.profileSafe,sourceRevision:entry.batch.mesh.revision,poseRevision:entry.batch.revision,worldFromSource,construction:bindSourceWholeConstruction(entry.batch.mesh.wholeConstruction,mesh,eid,worldFromSource),smallParent:entry.batch.mesh.smallParent};
   };
   const adequate=(bounds:SpatialBounds)=>exterior&&perspective&&fitsParentTier(bounds,clip,width,height,pageWidth,pageHeight);
   const planes=new Float32Array(24);clipPlanes(clip as Float32Array,planes);

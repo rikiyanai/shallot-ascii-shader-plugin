@@ -5,7 +5,7 @@ import {GlobalTransform,TransformRuntime} from '../../core/transform';
 import {GlobalTransformHistory,globalTransformTable} from '../../core/rendering/global-transform';
 import {RenderContext} from '../../core/rendering/render';
 import {CULL_FRUSTUM,CULL_VOLUME_FLOATS} from '../../core/rendering/frustum';
-import type {World} from '../../engine';
+import type {Resource,World} from '../../engine';
 import {meshInstanceTable} from './preprocess';
 import * as d from 'typegpu/data';
 import {EntityMeshInstanceInput,MeshMaterial} from './material-data';
@@ -47,6 +47,28 @@ export interface SourceViewInstance {readonly eid:number;readonly mesh:number;re
 
 export interface SourceViewParent {readonly bounds:SpatialBounds;readonly instances:readonly SourceViewInstance[];readonly key:number}
 export interface SourceViewWorkset {readonly instances:readonly SourceViewInstance[];readonly parents?:readonly SourceViewParent[];readonly exterior:boolean}
+/** A producer-owned environment fact. The engine cannot infer whether a
+ * camera is in a room from separate source bounds: a ring of walls can enclose
+ * an eye while every wall's own box remains open above it. The world producer
+ * therefore supplies the space result from its actual occupancy/navigation
+ * authority. Unknown is required while that authority is incomplete. */
+export type SourceEnvironmentClass='exterior'|'interior'|'unknown';
+export interface SourceEnvironmentAuthority{
+ readonly revision:number;
+ classify(eye:readonly [number,number,number],sourceVersion:number):SourceEnvironmentClass;
+}
+interface SourceEnvironmentState{authority?:SourceEnvironmentAuthority}
+/** Shared world resource used by scene/world producers to publish the current
+ * environment certificate. It is empty by default; absence never turns an
+ * interior or unknown view into an exterior view. */
+export const SourceEnvironment:Resource<SourceEnvironmentState>={
+ key:Symbol.for('shallot-main.source-environment-authority'),
+ create:()=>({}),
+};
+export function registerSourceEnvironmentAuthority(world:World,authority:SourceEnvironmentAuthority):()=>void{
+ const state=world.resource(SourceEnvironment),previous=state.authority;state.authority=authority;
+ return ()=>{if(state.authority===authority)state.authority=previous;};
+}
 class SourceWorkset{
  private readonly world:World;
  private readonly index=new SpatialIndex<number,Member>();
@@ -211,10 +233,26 @@ class SourceWorkset{
    boundsPending:this.settling.has(member.eid)&&this.world.gpu.frame<member.initialBoundsFrame};
  }
  private exterior(eye:ArrayLike<number>):boolean{
-  // A window/open doorway does not make an interior camera exterior. Only
-  // being OUTSIDE a conservative bound of the complete known scene certifies
-  // this first tier owner. Ground-level/unknown cases keep the full producer.
-  if(this.dirty.size||this.uncertain.size||!this.members.size||![eye[0],eye[1],eye[2]].every(Number.isFinite))return false;
+  // A producer-owned space result is stronger than the fallback scene AABB,
+  // but only its explicit EXTERIOR value admits the cheap frontier. Interior
+  // and unknown are both deliberately false; a provider error or malformed
+  // revision is also false. The provider owns its compiled enclosure,
+  // occupancy or navigation lookup, so camera movement does not make MAIN
+  // rediscover source geometry here.
+  if(![eye[0],eye[1],eye[2]].every(Number.isFinite))return false;
+  const authority=this.world.resource(SourceEnvironment).authority;
+  if(authority){
+   if(!Number.isSafeInteger(authority.revision)||authority.revision<0)return false;
+   let classification:SourceEnvironmentClass;
+   try{classification=authority.classify([eye[0]!,eye[1]!,eye[2]!],this.version);}catch{return false;}
+   return classification==='exterior';
+  }
+  // No producer authority is available. Retain the old conservative proof for
+  // generic examples; it can only admit a camera outside the complete known
+  // source envelope and therefore cannot weaken interior protection.
+  // Pending resident bounds cannot veto an independent complete-world space
+  // authority above; those instances retain their full producer individually.
+  if(this.dirty.size||this.uncertain.size||!this.members.size)return false;
   if(this.enclosure?.version!==this.version){
    const bounds:[number,number,number,number,number,number]=[Infinity,Infinity,Infinity,-Infinity,-Infinity,-Infinity];
    for(const member of this.members.values()){const b=(member.formBounds??member.bounds)!;for(let k=0;k<3;k++){bounds[k]=Math.min(bounds[k]!,b[k]!);bounds[k+3]=Math.max(bounds[k+3]!,b[k+3]!);}}

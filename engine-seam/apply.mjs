@@ -505,7 +505,12 @@ const worksetSource=await readFile(resolve(project,'engine-seam/engine/source-wo
 const posedBoundSource=await readFile(resolve(project,'engine-seam/engine/posed-bound-producer.ts'),'utf8');
 const {transformGltfPosedBoundProducer}=await import('./posed-bound-material.mjs');
 skinning=transformGltfPosedBoundProducer(skinning);
-if(!barrel.includes('export { sourceViewWorkset } from "./source-workset";'))barrel+='\nexport { sourceViewWorkset } from "./source-workset";\n';
+const sourceEnvironmentExport='export { sourceViewWorkset, SourceEnvironment, registerSourceEnvironmentAuthority, type SourceEnvironmentAuthority, type SourceEnvironmentClass } from "./source-workset";';
+if(!barrel.includes(sourceEnvironmentExport)){
+  const oldSourceWorksetExport='export { sourceViewWorkset } from "./source-workset";';
+  if(barrel.includes(oldSourceWorksetExport))barrel=barrel.replace(oldSourceWorksetExport,sourceEnvironmentExport);
+  else barrel+='\n'+sourceEnvironmentExport+'\n';
+}
 const meshChangeMarker='/* TRUEFF_MAIN_MESH_CHANGE_STREAM_0103 */';
 if(!mesh.includes(meshChangeMarker)){
   const declaration='interface MeshRegistry extends Iterable<Mesh> {';

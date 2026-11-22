@@ -2,7 +2,7 @@ import {compileMeshSource,type MeshSourceComplex} from './source-complex.ts';
 import {compileSourceFaceMaterialClasses} from './source-material.ts';
 import {compileSourceAnalysis} from './composition.ts';
 import {meshPartWork} from './mesh-part-graph.ts';
-import {compileSourceRunProgram,compileConstructionLevels,compileMeshProfileSafe,compileLimbVertices,sourcePartProgramPacket,PACKED_RUN_CONTEXT} from './compiled-construction-topology.ts';
+import {compileSourceRunProgram,compileConstructionLevels,compilePlanarLevels,compileMeshProfileSafe,compileLimbVertices,sourcePartProgramPacket,PACKED_RUN_CONTEXT} from './compiled-construction-topology.ts';
 import {compileWholeConstructionTemplate,type SourceProgramInput} from './source-program.ts';
 import {encodeSourceSemanticResidual,type SourcePublishedAuthority,type SourceSemanticResidual} from './source-semantic-residual.ts';
 import {compileSourceRelationships,compileSourceSmallParent} from './source-small-parent.ts';
@@ -85,7 +85,11 @@ export function* sourceSemanticResidualWork(source:SourceProgramInput):Generator
  // The baked path shares the worker's source producer. Reuse this build's
  // existing analysis/complex; never run sourceProgramWork or reconstruct a
  // source graph in the numeric resident or a displayed camera frame.
- const wholeConstruction=compileWholeConstructionTemplate(source,analysis,complex);
+ // The baked/numeric route consumes the same immutable planar level product
+ // as the worker. Without this argument flat source boundaries silently lost
+ // their source-level principal/connected construction before residency.
+ const planarLevels=analysis.type==='terrain'||analysis.type==='rounded'||analysis.type==='paper'?undefined:compilePlanarLevels(complex,positions);
+ const wholeConstruction=compileWholeConstructionTemplate(source,analysis,complex,planarLevels);
  const publishedAuthority=source.adjacency?compilePublishedAuthority(complex):undefined;
  // Keep the small-parent decision on the same immutable graph/relationship
  // inputs as sourceProgramWork. It is a compact source fact, not a displayed

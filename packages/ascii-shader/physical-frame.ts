@@ -11,7 +11,7 @@ import type {FormLodScope} from './form-lod-state.ts';
 import {FormLodLifetimes} from './form-lod-lifetimes.ts';
 import type {NativeLabel} from './semantic-text.ts';
 import type {PresentationMode} from './text/text-frame.ts';
-import {PhysicalSourceTransport,type PhysicalSourceInstance,type PhysicalResidentBatch} from './physical-source.ts';
+import {PhysicalSourceTransport,type PhysicalSourceInstance,type PhysicalResidentBatch,type PhysicalPosedBounds} from './physical-source.ts';
 import {preparePhysicalGpuServices,type PhysicalGpuServices} from './gpu-startup.ts';
 import type {ComputePipelineProgress} from './gpu-pipeline-preparation.ts';
 import {SurfaceRelations,posedBatchIdentity,type SurfaceGraphView,type SourcePartAnchorTable,type PartAnchorDemand,type PartAnchorDemandReadback} from './surface-relations.ts';
@@ -46,24 +46,58 @@ export interface PhysicalGeometry extends CompositionGeometry {
  /** Source-revision bounds supplied at asset registration; camera admission
   * transforms eight corners, never scans vertices on its frame path. */
  readonly sourceBounds?:readonly [number,number,number,number,number,number];
+ /** Producer-owned complete local envelope for a deformed or animated source.
+  * An adjacent-pose value is the union of the pair, not a rest-pose box. */
+ readonly posedBounds?:PhysicalPosedBounds;
  /** Visibility flags only: source triangles and lineage remain complete. */
  readonly cameraCleared?:Uint8Array;
  readonly albedo?:readonly [number,number,number];
 }
-
-
-
-
+interface SourceBoundCache {
+ readonly authority:'source-model'|PhysicalPosedBounds['authority'];
+ readonly sourceRevision:number;readonly poseRevision:number;
+ readonly local:readonly [number,number,number,number,number,number];
+ readonly matrix:readonly number[];readonly world:readonly [number,number,number,number,number,number];
+}
+const sourceBoundCache=new WeakMap<object,SourceBoundCache>();
+const validBounds=(value:unknown):value is readonly [number,number,number,number,number,number]=>{
+ if(!Array.isArray(value)||value.length!==6||!value.every((entry):entry is number=>typeof entry==='number'&&Number.isFinite(entry)))return false;
+ return value[0]!<=value[3]!&&value[1]!<=value[4]!&&value[2]!<=value[5]!;
+};
+const sameNumbers=(a:ArrayLike<number>,b:readonly number[]):boolean=>a.length>=b.length&&b.every((value,index)=>a[index]===value);
+/** perf-impl-204: the complete posed world bound of one producer-row owner.
+ * Rigid source/model rows use their immutable source box. A deformed/animated
+ * row must instead carry a producer-certified current or adjacent-pose
+ * envelope whose source revision and pose revision match this instance. An
+ * absent or malformed certificate returns no bound, preserving the complete
+ * incumbent rather than culling from a rest box. The transformed result is
+ * cached by source/pose revision and the actual instance matrix. */
 export function formSourceBoundOf(geometry:PhysicalGeometry,owner:readonly [number,number]):FormSourceBound[]{
- const b=geometry.sourceBounds,m=geometry.worldFromSource;
- if(!b||!m||m.length<16||geometry.poseAuthority!=='source-model')return [];
+ const m=geometry.worldFromSource,authority=geometry.poseAuthority;
+ if(!m||m.length<16||!m.every(Number.isFinite)||(authority!==undefined&&authority!=='source-model'))return [];
+ let local:readonly [number,number,number,number,number,number]|undefined,poseRevision=geometry.revision,sourceRevision=geometry.revision;
+ let normalizedAuthority:'source-model'|PhysicalPosedBounds['authority']='source-model';
+ if(authority==='source-model'){
+  if(!validBounds(geometry.sourceBounds))return [];
+  local=geometry.sourceBounds;
+ }else{
+  const posed=geometry.posedBounds;
+  if(!posed||posed.authority!=='current-pose'&&posed.authority!=='adjacent-pose-envelope'&&posed.authority!=='immutable-envelope'||
+    !Number.isSafeInteger(posed.sourceRevision)||posed.sourceRevision!==geometry.revision||!Number.isSafeInteger(posed.poseRevision)||posed.poseRevision<0||!validBounds(posed.bounds))return [];
+  local=posed.bounds;sourceRevision=posed.sourceRevision;poseRevision=posed.poseRevision;normalizedAuthority=posed.authority;
+ }
+ const previous=sourceBoundCache.get(geometry);
+ if(previous&&previous.authority===normalizedAuthority&&previous.sourceRevision===sourceRevision&&previous.poseRevision===poseRevision&&
+   previous.local.every((value,index)=>value===local![index])&&sameNumbers(m,previous.matrix))return [{owner,low:[previous.world[0],previous.world[1],previous.world[2]],high:[previous.world[3],previous.world[4],previous.world[5]]}];
  const low=[Infinity,Infinity,Infinity],high=[-Infinity,-Infinity,-Infinity];
  for(let corner=0;corner<8;corner++){
-  const x=corner&1?b[3]:b[0],y=corner&2?b[4]:b[1],z=corner&4?b[5]:b[2];
+  const x=corner&1?local![3]:local![0],y=corner&2?local![4]:local![1],z=corner&4?local![5]:local![2];
   for(let axis=0;axis<3;axis++){const v=m[axis]!*x+m[4+axis]!*y+m[8+axis]!*z+m[12+axis]!;low[axis]=Math.min(low[axis]!,v);high[axis]=Math.max(high[axis]!,v);}
  }
  if(![...low,...high].every(Number.isFinite))return [];
- return [{owner,low:[low[0]!,low[1]!,low[2]!],high:[high[0]!,high[1]!,high[2]!]}];
+ const world=[low[0]!,low[1]!,low[2]!,high[0]!,high[1]!,high[2]!] as const;
+ sourceBoundCache.set(geometry,{authority:normalizedAuthority,sourceRevision,poseRevision,local:[...local!] as [number,number,number,number,number,number],matrix:Array.from(m.slice(0,16)),world});
+ return [{owner,low:[world[0],world[1],world[2]],high:[world[3],world[4],world[5]]}];
 }
 export interface PhysicalFrameInput {
  readonly encoder:GPUCommandEncoder;readonly target?:GPUTextureView;
@@ -832,7 +866,10 @@ export class PhysicalFrame {
    // Only a NEW text job snapshots source/model authority. Presenting the
    // retained page while that job is pending must not recopy every source.
    // Other material adapters cannot assume this physical vertex contract.
-   const geometries:PhysicalGeometry[]=input.geometry.filter(source=>this.transport.isReady(source)).map(source=>({...source,poseAuthority:'source-model'}));
+   // Producer authority is explicit. Do not relabel an unknown/deformed source
+   // as source-model here: that would let a rest AABB certify early LOD and
+   // make the very guard this seam relies on meaningless.
+   const geometries:PhysicalGeometry[]=input.geometry.filter(source=>this.transport.isReady(source));
    const live=new Set(geometries.map(source=>source.owner));
    for(const [owner,buffers]of this.sources)if(!live.has(owner)){this.release(buffers);this.sources.delete(owner);}
    const light=this.holdLight(input.light);   const serial=++this.serial,targets=this.targets(input.width,input.height),attachments:SurfaceAttachment[]=[],source:SurfaceField={width:targets.field[0]!.width,height:targets.field[0]!.height,textures:targets.field,worldFromClip:input.worldFromClip,sources:new Map(),attachments};

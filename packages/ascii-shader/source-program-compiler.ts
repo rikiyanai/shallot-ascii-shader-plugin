@@ -1,7 +1,7 @@
 import {assertSourcePacketVersion} from './source-packet.ts';
 import type {CompiledSourceProgram,FullCompiledSourceProgram,SummaryCompiledSourceProgram,SourceProgramInput} from './source-program.ts';
 import {decodeSourceComplex,type SourceComplexColumns} from './source-transfer.ts';
-import type {SourceWholeConstructionTemplate,SourceWholePartRole} from './source-lod.ts';
+import {sourceWholeCompoundReady,type SourceWholeConstructionTemplate, type SourceWholePartRole} from './source-lod.ts';
 import {validateSourceSmallParent} from './source-semantic-residual.ts';
 export {validateSourceSmallParent} from './source-semantic-residual.ts';
 
@@ -23,10 +23,22 @@ export function validateWholeConstruction(value:SourceWholeConstructionTemplate|
  if(value.revision!==revision||!value.parts.length)throw Error('Invalid source whole construction revision');
  const roles=new Set(value.parts.map(part=>part.role));
  const required:readonly SourceWholePartRole[]=['cap','turn','flank','return'];
- if(!required.every(role=>roles.has(role)))throw Error('Incomplete source whole construction roles');
+ const completeRoles=required.every(role=>roles.has(role));
  const check=(items:readonly {feature:number;ports:readonly number[];sourceContributors:readonly number[];geometry?:readonly (readonly number[])[];closed?:boolean;entryRef?:number;context?:number}[])=>{for(const item of items){if(!Number.isSafeInteger(item.feature)||item.feature<=0||item.ports.length<2||item.sourceContributors.length===0||item.ports.some(port=>!Number.isSafeInteger(port)||port<0)||item.sourceContributors.some(id=>!Number.isSafeInteger(id)||id<0))throw Error('Invalid source whole construction passage');if(item.geometry!==undefined&&(item.geometry.length<2||item.geometry.some(point=>point.length!==3||point.some(value=>!Number.isFinite(value)))))throw Error('Invalid source whole construction passage geometry');if(item.closed!==undefined&&typeof item.closed!=='boolean')throw Error('Invalid source whole construction passage closure');if(item.entryRef!==undefined&&(!Number.isSafeInteger(item.entryRef)||item.entryRef<1)||item.context!==undefined&&(!Number.isSafeInteger(item.context)||item.context===0))throw Error('Invalid source whole construction passage context');}};
  for(const part of value.parts){if(!Number.isSafeInteger(part.feature)||part.feature<=0||!Number.isSafeInteger(part.entryRef)||part.entryRef<1||!Number.isSafeInteger(part.context)||part.context===0||part.ports.length!==2||part.ports.some(port=>!Number.isSafeInteger(port)||port<0)||part.sourceContributors.length===0||part.sourceContributors.some(id=>!Number.isSafeInteger(id)||id<0)||!part.geometry?.length||part.geometry.some(point=>point.length!==3||point.some(value=>!Number.isFinite(value))))throw Error('Invalid source whole construction part');if(part.paper)check(part.paper);}
  check(value.openings);check(value.contacts);check(value.protectedVoids);if(value.paper)check(value.paper);
+ // A partial role set is legal only for the one bounded planar compound whose
+ // source graph carries the complete outer/opening/contact identity ledger.
+ // Do not let four-role presence or a marker turn relation metadata into a
+ // parent replacement: every compound passage must still be drawable by its
+ // own native entry and source geometry.
+ const nativePassage=(item:{feature:number;ports:readonly number[];sourceContributors:readonly number[];geometry?:readonly (readonly number[])[];closed?:boolean;entryRef?:number;context?:number;role?:SourceWholePartRole}):boolean=>
+  !!item.geometry&&item.geometry.length>=2&&typeof item.closed==='boolean'&&Number.isSafeInteger(item.entryRef)&&item.entryRef!>=1&&Number.isSafeInteger(item.context)&&item.context!==0&&item.role!==undefined;
+ const compoundComplete=!!value.compound&&sourceWholeCompoundReady(value)&&
+  value.parts.every(part=>nativePassage(part))&&
+  [...value.openings,...value.contacts,...value.protectedVoids,...(value.paper??[])].every(item=>nativePassage(item));
+ if(value.compound&&!compoundComplete)throw Error('Invalid source whole construction compound');
+ if(!completeRoles&&!compoundComplete)throw Error('Incomplete source whole construction roles');
 }
 type TransferredSourceProgram=(Omit<FullCompiledSourceProgram,'complex'>&{readonly complex:SourceComplexColumns})|SummaryCompiledSourceProgram;
 /** Owns immutable revision snapshots and compilation lifetimes for both

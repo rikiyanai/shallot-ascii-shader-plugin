@@ -857,7 +857,15 @@ fn surfaceFrame(c:vec3u)->Frame{
 fn runState(m:vec3i,g:u32)->u32{
  let e=vec3i(partExtent());let step=faceStep(g);var q=m;
  for(var n=0;n<256;n++){
-  q+=step;if(any(q<vec3i(0))||any(q>=e)){return CLUSTER_UNKNOWN;}
+  q+=step;if(any(q<vec3i(0))||any(q>=e)){
+   // The voxel producer's occupancy certificate covers the complete bounded
+   // heightfield. Leaving that grid through Y is therefore guaranteed air;
+   // treating it as UNKNOWN forced every upper/lower air run to keep its fine
+   // children. X/Z exits remain UNKNOWN because a neighbouring chunk owns
+   // that continuation and this chunk must preserve its seam.
+   if((params.owners[3].y&32u)!=0u&&step.y!=0){return CLUSTER_AIR;}
+   return CLUSTER_UNKNOWN;
+  }
   let mask=faceMask(q);if(mask!=0u){return select(CLUSTER_SOLID,CLUSTER_AIR,(mask&(1u<<(g^1u)))!=0u);}
  }
  return CLUSTER_UNKNOWN;
@@ -956,7 +964,7 @@ fn clusterCertified(c:vec3i,b:u32)->bool{
  return atomicLoad(&contactWork[s])==0u||clusterFramePlaced(s);
 }
 // On the chunk's x/z border: the chunk meets its neighbour there.
-fn clusterBorder(c:vec3i,b:u32)->bool{let e=vec3i(partExtent());let n=i32(b);return c.x<=0||c.z<=0||(c.x+1)*n>=e.x||(c.z+1)*n>=e.z;}
+fn clusterBorder(c:vec3i,b:u32)->bool{if(!chartSurface()){return false;}let e=vec3i(partExtent());let n=i32(b);return c.x<=0||c.z<=0||(c.x+1)*n>=e.x||(c.z+1)*n>=e.z;}
 
 // A node whose box holds an unknown, cave or x/z-border cell must recurse
 // (complete fine children), exactly the CPU reference selectVoxelFrontier.
@@ -2960,7 +2968,14 @@ function ordinaryDirectSurfaceRelationsShader(source:string):string{
  specialized=replaceWgslFunctionSnippet(specialized,'contactSortAt',` let residual=residualReady();var edgeId=id;
  if(residual){if(id>=residualEdgeCount()){return;}edgeId=residualEdgeAt(id);}
  else if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}`,` var edgeId=id;if(id>=sourceEdgeCount()||!edgeInDraw(id)){return;}`);
- return boundaryClassificationShader(specialized);
+ // Ordinary direct packets have the same complete fine-domain contract as
+ // the physical no-chart path: posed contact/canonical ownership remains,
+ // while residual/chart domains are unavailable until a late source proves
+ // that capability. Use the existing physical classification variant here
+ // so ordinary preparation does not retain the unreachable residual/chart
+ // closure. Late unsupported sources still use the separately prepared
+ // completeNativeRelationPipelinePlans fallback below.
+ return boundaryClassificationShader(specialized,true);
 }
 export const SURFACE_RELATIONS_GENERIC_DIRECT_ORDINARY_SHADER=ordinaryDirectSurfaceRelationsShader(SURFACE_RELATIONS_SHADER);
 /** Producer-capable direct playback retains the physical-safe closure for
