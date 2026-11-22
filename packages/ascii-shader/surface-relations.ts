@@ -246,8 +246,12 @@ ${FAR_AGGREGATE_MEMBER_WGSL}
 // in the same compute pass and must not alias their counters.
 @group(0) @binding(19) var<storage,read_write> partAnchorAlloc:array<atomic<u32>>;
 
+// perf-impl-181/206: the voxel mesher's own cell occupancy for this generation
 // (restCellChart.occupancy, 'voxel-column-occupancy-v1'): W=ceil(Y/32) words
 // per column, cell (x,y,z) is word (z*X+x)*W+(y>>5), bit (y&31), set = SOLID.
+// With an exact X/Z halo, X/Z become X+2*halo.x and Z+2*halo.z, and local
+// (0,*,0) is at (halo.x,halo.z). frontier.w keeps admission in bit0 and packs
+// X/Z radii in bits1..15/16..30, independent of levelDispatch's classifier tail.
 // Bound (and owners[3].y bit 32 set) only when the producer published it.
 @group(0) @binding(18) var<storage,read> cellOccupancy:array<u32>;
 // Native standard-renderer ownership is a same-submit read-only pair: the
@@ -306,7 +310,7 @@ fn selected(instance:u32)->bool{
 // address with that count.
 fn selectedCount()->u32{
  if(params.owners[3].x==0u){return native[1];}
- if(params.frontier.w==0u){return params.owners[2].z;}
+ if((params.frontier.w&1u)==0u){return params.owners[2].z;}
  let total=selectedOwners[select(params.frontier.x,0u,nativeFrontier())];let ordinalStart=params.frontier.y;
  if(ordinalStart>=total){return 0u;}return min(params.owners[2].z,total-ordinalStart);
 }
@@ -331,7 +335,7 @@ fn levelDispatchCapacity()->u32{return params.levelDispatch.z;}
 // certificate (including a mixed/custom source) keeps the complete incumbent
 // path; choosing a bank from edge zero would silently borrow one owner's level
 // for every other owner in the draw.
-fn levelOwnerCertificate()->u32{return params.levelDispatch.w;}
+fn levelOwnerCertificate()->u32{return params.levelDispatch.w&3u;}
 fn levelDispatchRelationWord(k:u32)->u32{
  let record=relations[levelDispatchBase()+k/8u];let lane=k%8u;
  if(lane<4u){if(lane==0u){return record.key.x;}if(lane==1u){return record.key.y;}if(lane==2u){return record.key.z;}return record.key.w;}
@@ -428,7 +432,7 @@ fn frontierOwner(instance:u32)->vec2u{
 // in the existing word immediately before the list, so all later consumers
 // (contacts, anchors, lines and interior tensors) read the same result.
 @compute @workgroup_size(1) fn admitFrontier(){
- if(params.owners[3].x==0u||params.frontier.w==0u||native[0u]<3u||native[2u]<params.indexBase){return;}
+ if(params.owners[3].x==0u||(params.frontier.w&1u)==0u||native[0u]<3u||native[2u]<params.indexBase){return;}
  let countAt=select(params.frontier.x,0u,nativeFrontier());let listAt=params.owners[2].w;var write=0u;
  if(nativeFrontier()){
   let first=nativeIndirectWord(4u);let slice=native[4u];let total=nativeIndirectWord(1u);
@@ -546,7 +550,10 @@ fn voxelClusterEmit(a:vec3f,b:vec3f,t:Triangle,kind:u32,address:u32,faces:vec2u,
 // size, retained, unsupported], then (chart) cells x 19 face words, corners x
 // 4 lattice words, then the scratch home. A home: 4 header words [cluster
 // capacity, stored token, stored block, spare], then clusters x 4 words
-// [~least cell, ~least incidence, flags (bit 0 emitted), spare].
+// [~least cell, ~least incidence, flags (bit 0 emitted), spare], followed by
+// two words per cluster for the producer-owned 2-bit states of its eight
+// X/Z neighbours. The neighbour cache is part of the same source-generation
+// home: retained homes keep it, and a rebuilt home clears it with the records.
 fn chartOn()->bool{return (params.owners[3].y&4u)!=0u;}
 fn chunkBlockWord()->u32{return clusterBase()+contactSlots();}
 fn retainedWord()->u32{return chunkBlockWord()+2u;}
@@ -560,13 +567,13 @@ fn scratchHome()->u32{return cornerBase()+chartCornerCount()*4u;}
 fn persistentHome()->bool{return params.owners[0].w!=0u;}
 
 // level homes from params.owners[0].w: blocks 2, 4, 8, 16, each 4 header words
-// + 4 words per cluster of its OWN level (the host's chartLevelClusters /
+// + 6 words per cluster of its OWN level (the host's chartLevelClusters /
 // chartHomeWords). Each home keeps its own [capacity, token, block] header, so
 // a level transition lands on that level's retained home and its resident
 // records instead of rebuilding a single shared home. The base home's header
 // word 3 holds the HELD level (the previous vote), read during the vote.
 fn levelClusters(b:u32)->u32{let n=(partExtent()+vec3u(b-1u))/b;return n.x*n.y*n.z;}
-fn levelHomeOffset(b:u32)->u32{var off=0u;var level=2u;loop{if(level>=b||level>16u){break;}off+=4u+levelClusters(level)*4u;level*=2u;}return off;}
+fn levelHomeOffset(b:u32)->u32{var off=0u;var level=2u;loop{if(level>=b||level>16u){break;}off+=4u+levelClusters(level)*6u;level*=2u;}return off;}
 // Generation-owned per-part frontier membership follows the source packet's
 // complete canonical table. Each word is a certified level-node index (high
 // bit set) or zero for mixed/border/seam/unsupported content. The host appends
@@ -690,7 +697,7 @@ fn segmentLevel(va:u32,vb:u32)->u32{
 // the cell codes) so the boundary stage reads lattice points WITHOUT binding
 // partCodes (it stays within 8 storage buffers).
 fn chartVertices()->u32{return select(0u,sourceFaceCount()*2u,chartOn());}
-fn latticeBase()->u32{return scratchHome()+4u+chartClusters()*4u;}
+fn latticeBase()->u32{return scratchHome()+4u+chartClusters()*6u;}
 
 // the rest of the scratch): [count, overflow, then chartClusters() cluster
 // indices]. chartSelect appends a cluster exactly once, when its own atomicOr
@@ -859,11 +866,16 @@ fn runState(m:vec3i,g:u32)->u32{
  for(var n=0;n<256;n++){
   q+=step;if(any(q<vec3i(0))||any(q>=e)){
    // The voxel producer's occupancy certificate covers the complete bounded
-   // heightfield. Leaving that grid through Y is therefore guaranteed air;
-   // treating it as UNKNOWN forced every upper/lower air run to keep its fine
-   // children. X/Z exits remain UNKNOWN because a neighbouring chunk owns
-   // that continuation and this chunk must preserve its seam.
-   if((params.owners[3].y&32u)!=0u&&step.y!=0){return CLUSTER_AIR;}
+   // heightfield. Leaving that grid through Y is guaranteed air. X/Z exits
+   // are exact only when the producer supplied its global-coordinate halo;
+   // otherwise the seam remains UNKNOWN and keeps the incumbent fine path.
+   if((params.owners[3].y&32u)!=0u){
+    if(step.y!=0){return CLUSTER_AIR;}
+    let h=occupancyHalo();
+    if((step.x!=0&&h.x>0&&q.x>=(-h.x)&&q.x<e.x+h.x)||(step.z!=0&&h.y>0&&q.z>=(-h.y)&&q.z<e.z+h.y)){
+     return select(CLUSTER_AIR,CLUSTER_SOLID,occupancyCellSolidAt(q));
+    }
+   }
    return CLUSTER_UNKNOWN;
   }
   let mask=faceMask(q);if(mask!=0u){return select(CLUSTER_SOLID,CLUSTER_AIR,(mask&(1u<<(g^1u)))!=0u);}
@@ -930,8 +942,67 @@ fn clusterSlot(c:vec3i,b:u32)->u32{
  let index=u32((c.z*n.y+c.y)*n.x+c.x);if(index>=levelCapacity(b)){return NONE_CLUSTER;}
  return levelHomeBase(b)+4u+index*4u;
 }
+fn occupancyHalo()->vec2i{let h=params.frontier.w;return vec2i(i32((h>>1u)&0x7fffu),i32((h>>16u)&0x7fffu));}
+fn occupancyCellSolidAt(c:vec3i)->bool{
+ if(!occupancyOn()){return false;}
+ let e=partExtent();let h=occupancyHalo();let x=c.x+h.x;let z=c.z+h.y;
+ if(c.y<0||c.y>=i32(e.y)||x<0||z<0||x>=i32(e.x)+h.x*2||z>=i32(e.z)+h.y*2){return false;}
+ let w=(e.y+31u)/32u;let stride=e.x+u32(h.x*2);
+ return ((cellOccupancy[(u32(z)*stride+u32(x))*w+u32(c.y)/32u]>>(u32(c.y)%32u))&1u)!=0u;
+}
+fn occupancyNeighbourState(c:vec3i,b:u32)->u32{
+ if(!occupancyOn()){return CLUSTER_UNKNOWN;}
+ // This is a producer-owned macrocell reduction, not six rays from its least
+ // corner. Reduce the occupancy bitset for every X/Z column and the Y word
+ // range, so an off-axis solid or opening makes the whole neighbor UNKNOWN.
+ let h=occupancyHalo();let e=partExtent();let lo=c*i32(b);let hi=lo+vec3i(i32(b));
+ if(lo.x<(-h.x)||lo.z<(-h.y)||hi.x>i32(e.x)+h.x||hi.z>i32(e.z)+h.y){return CLUSTER_UNKNOWN;}
+ // Y is a finite heightfield: outside its published extent is certified air.
+ // Clamp only the bitset read; a partial overlap keeps that exterior air in the
+ // reduction so a solid at the boundary cannot be promoted to SOLID.
+ let y0=select(lo.y,0,lo.y<0);let y1=select(hi.y,i32(e.y),hi.y>i32(e.y));if(y0>=y1){return CLUSTER_AIR;}
+ let w=(e.y+31u)/32u;let stride=e.x+u32(h.x*2);let firstWord=u32(y0)/32u;let lastWord=(u32(y1)-1u)/32u;
+ var sawSolid=false;var sawAir=lo.y<0||hi.y>i32(e.y);
+ for(var z=lo.z;z<hi.z;z++){
+  for(var x=lo.x;x<hi.x;x++){
+   let base=(u32(z+h.y)*stride+u32(x+h.x))*w;
+   for(var word=firstWord;word<=lastWord;word++){
+    var range=0xffffffffu;if(word==firstWord){range&=(0xffffffffu<<(u32(y0)%32u));}if(word==lastWord&&u32(y1)%32u!=0u){range&=(1u<<(u32(y1)%32u))-1u;}
+    let bits=cellOccupancy[base+word]&range;if(bits!=0u){sawSolid=true;}if(bits!=range){sawAir=true;}
+   }
+  }
+ }
+ if(sawSolid&&sawAir){return CLUSTER_UNKNOWN;}if(sawSolid){return CLUSTER_SOLID;}if(sawAir){return CLUSTER_AIR;}return CLUSTER_UNKNOWN;
+}
+// A resident home caches the eight producer-certified X/Z neighbour states
+// for each in-grid cluster. Two words hold four 2-bit states each; zero is
+// reserved for an unwritten entry and therefore reads as UNKNOWN. The high bit
+// of the second word is a ready marker, outside the eight low 2-bit slots.
+fn neighbourCacheBase(s:u32,b:u32)->u32{return levelHomeBase(b)+4u+levelCapacity(b)*4u+((s-(levelHomeBase(b)+4u))/4u)*2u;}
+fn neighbourCacheState(c:vec3i,b:u32)->u32{
+ if(!chartSurface()){return CLUSTER_UNKNOWN;}
+ let n=vec3i((partExtent()+vec3u(b-1u))/b);if(c.y<0||c.y>=n.y){return CLUSTER_AIR;}
+ var ax=c.x;var az=c.z;var sx=0;var sz=0;
+ if(c.x<0){if(c.x!=-1){return CLUSTER_UNKNOWN;}ax=0;sx=-1;}else if(c.x>=n.x){if(c.x!=n.x){return CLUSTER_UNKNOWN;}ax=n.x-1;sx=1;}
+ if(c.z<0){if(c.z!=-1){return CLUSTER_UNKNOWN;}az=0;sz=-1;}else if(c.z>=n.z){if(c.z!=n.z){return CLUSTER_UNKNOWN;}az=n.z-1;sz=1;}
+ if(sx==0&&sz==0){return CLUSTER_UNKNOWN;}
+ let s=clusterSlot(vec3i(ax,c.y,az),b);if(s==NONE_CLUSTER){return CLUSTER_UNKNOWN;}
+ let slot=select(select(u32(sx+1),select(3u,4u,sx==1),sz==0),5u+u32(sx+1),sz==1);
+ let cache=neighbourCacheBase(s,b);let ready=atomicLoad(&contactWork[cache+1u]);if((ready&0x80000000u)==0u){return CLUSTER_UNKNOWN;}
+ let word=atomicLoad(&contactWork[cache+slot/4u]);let state=(word>>((slot%4u)*2u))&3u;
+ return select(CLUSTER_UNKNOWN,state,state!=0u);
+}
+fn writeNeighbourCache(c:vec3i,b:u32){
+ if(!chartSurface()||!occupancyOn()){return;}
+ let s=clusterSlot(c,b);if(s==NONE_CLUSTER){return;}
+ let cache=neighbourCacheBase(s,b);if((atomicLoad(&contactWork[cache+1u])&0x80000000u)!=0u){return;}
+ var lo=0u;var hi=0u;
+ let states=array<u32,8>(occupancyNeighbourState(c+vec3i(-1,0,-1),b),occupancyNeighbourState(c+vec3i(0,0,-1),b),occupancyNeighbourState(c+vec3i(1,0,-1),b),occupancyNeighbourState(c+vec3i(-1,0,0),b),occupancyNeighbourState(c+vec3i(1,0,0),b),occupancyNeighbourState(c+vec3i(-1,0,1),b),occupancyNeighbourState(c+vec3i(0,0,1),b),occupancyNeighbourState(c+vec3i(1,0,1),b));
+ for(var i=0u;i<4u;i++){lo|=states[i]<<(i*2u);hi|=states[i+4u]<<((i)*2u);}
+ atomicStore(&contactWork[cache],lo);atomicStore(&contactWork[cache+1u],hi|0x80000000u);
+}
 fn clusterState(c:vec3i,b:u32)->u32{
- let s=clusterSlot(c,b);if(s==NONE_CLUSTER){return select(CLUSTER_AIR,CLUSTER_UNKNOWN,chartSurface());}
+ let s=clusterSlot(c,b);if(s==NONE_CLUSTER){return select(CLUSTER_AIR,neighbourCacheState(c,b),chartSurface());}
  if(atomicLoad(&contactWork[s])!=0u){return CLUSTER_SOLID;}if(!chartSurface()){return CLUSTER_AIR;}
  let w=atomicLoad(&contactWork[s+3u])&3u;return select(CLUSTER_UNKNOWN,w,w==CLUSTER_AIR||w==CLUSTER_SOLID);
 }
@@ -963,8 +1034,19 @@ fn clusterCertified(c:vec3i,b:u32)->bool{
  let s=clusterSlot(c,b);if(s==NONE_CLUSTER||!clusterNearKnown(s)){return false;}
  return atomicLoad(&contactWork[s])==0u||clusterFramePlaced(s);
 }
-// On the chunk's x/z border: the chunk meets its neighbour there.
-fn clusterBorder(c:vec3i,b:u32)->bool{if(!chartSurface()){return false;}let e=vec3i(partExtent());let n=i32(b);return c.x<=0||c.z<=0||(c.x+1)*n>=e.x||(c.z+1)*n>=e.z;}
+// A surface chart border is coarse-safe only when the producer's exact halo
+// classifies the neighbouring continuation. Missing, mixed or out-of-halo
+// metadata remains a forced fine seam. Closed-cell parts do not use this path.
+fn clusterBorder(c:vec3i,b:u32)->bool{
+ if(!chartSurface()){return false;}
+ let e=vec3i(partExtent());let n=i32(b);let dims=(e+vec3i(n-1))/n;
+ if(c.x<0||c.x>=dims.x||c.z<0||c.z>=dims.z){return clusterState(c,b)==CLUSTER_UNKNOWN;}
+ if(c.x==0&&clusterState(c-vec3i(1,0,0),b)==CLUSTER_UNKNOWN){return true;}
+ if(c.z==0&&clusterState(c-vec3i(0,0,1),b)==CLUSTER_UNKNOWN){return true;}
+ if(c.x+1>=dims.x&&clusterState(c+vec3i(1,0,0),b)==CLUSTER_UNKNOWN){return true;}
+ if(c.z+1>=dims.z&&clusterState(c+vec3i(0,0,1),b)==CLUSTER_UNKNOWN){return true;}
+ return false;
+}
 
 // A node whose box holds an unknown, cave or x/z-border cell must recurse
 // (complete fine children), exactly the CPU reference selectVoxelFrontier.
@@ -987,13 +1069,13 @@ fn clusterForced(c:vec3i,b:u32)->bool{let s=clusterSlot(c,b);return s!=NONE_CLUS
 // and clusterForceBox keeps complete fine children instead.
 fn occupancyOn()->bool{return (params.owners[3].y&32u)!=0u;}
 fn cellSolid(c:vec3i)->bool{
- let e=partExtent();let w=(e.y+31u)/32u;let y=u32(c.y);
- return ((cellOccupancy[(u32(c.z)*e.x+u32(c.x))*w+y/32u]>>(y%32u))&1u)!=0u;
+ return occupancyCellSolidAt(c);
 }
 // The cell's column above it holds no solid cell up to the top of the grid
 // (open to the exterior; exact for any occupancy, every cell for a heightfield).
 fn cellOpenAbove(c:vec3i)->bool{
- let e=partExtent();let w=(e.y+31u)/32u;let base=(u32(c.z)*e.x+u32(c.x))*w;let y=u32(c.y)+1u;
+ let e=partExtent();if(!occupancyOn()){return false;}
+ let h=occupancyHalo();let w=(e.y+31u)/32u;let stride=e.x+u32(h.x*2);let base=(u32(c.z+h.y)*stride+u32(c.x+h.x))*w;let y=u32(c.y)+1u;
  if(y>=e.y){return true;}
  for(var k=y/32u;k<w;k++){var bits=cellOccupancy[base+k];if(k==y/32u){bits&=~((1u<<(y%32u))-1u);}if(bits!=0u){return false;}}
  return true;
@@ -1674,6 +1756,19 @@ fn chartCornerAt(v:u32){
  atomicStore(&contactWork[at],1u);
  if(v<chartVertices()){let l=vec3u(lattice.xyz);atomicStore(&contactWork[latticeBase()+v],(l.x|(l.y<<9u)|(l.z<<18u))+1u);}
 }
+// Producer-owned halo publication. This is deliberately a separate ordered
+// stage: every cache entry is complete before chart certification, selection,
+// emission or contact readers can consult it. A retained generation skips its
+// already-ready entries; a scratch home is rebuilt once per draw.
+fn chartNeighbourCacheAt(id:u32,threads:u32){
+ if(!posedContacts()||native[0]==0u||!chartOn()||!chartSurface()||!occupancyOn()){return;}
+ for(var b=2u;b<=16u;b*=2u){
+  if(!levelHomed(b)||levelRetained(b)){continue;}
+  let n=(partExtent()+vec3u(b-1u))/b;let total=min(n.x*n.y*n.z,levelCapacity(b));
+  for(var j=id;j<total;j+=max(threads,1u)){writeNeighbourCache(vec3i(i32(j%n.x),i32((j/n.x)%n.y),i32(j/(n.x*n.y))),b);}
+ }
+}
+@compute @workgroup_size(64) fn chartNeighbourCache(@builtin(global_invocation_id) gid:vec3u){chartNeighbourCacheAt(gid.x+gid.y*params.owners[3].w*64u,max(1u,chartClusters()));}
 
 // chartCorners (claims, face centroids and surface states complete) and
 // before contactVertices / contactEdges / boundaries read the flags. Surface
@@ -1726,9 +1821,9 @@ fn voxelHomeAt(id:u32){
  // so every level is built when content changes and is resident before a
  // transition selects it.
  var lb=0u;var local=id;
- for(var b=2u;b<=16u;b*=2u){let size=4u+levelClusters(b)*4u;if(local<size){lb=b;break;}local-=size;}
+ for(var b=2u;b<=16u;b*=2u){let size=4u+levelClusters(b)*6u;if(local<size){lb=b;break;}local-=size;}
  if(lb==0u){return;}
- let h=levelHomeBase(lb);if(local>=4u+levelCapacity(lb)*4u){return;}
+ let h=levelHomeBase(lb);if(local>=4u+levelCapacity(lb)*6u){return;}
  let token=params.selection.w;
  let kept=token>1u&&atomicLoad(&contactWork[h+1u])==token&&atomicLoad(&contactWork[h+2u])==levelCode(lb);
  if(local==0u){
@@ -1737,7 +1832,9 @@ fn voxelHomeAt(id:u32){
   return;
  }
  if(local<4u){return;}
- if(kept){if((local-4u)%4u==2u){atomicAnd(&contactWork[h+local],~15u);}return;}
+ // Only the four-word cluster records carry per-frame flags. The following
+ // neighbour-cache words are source-generation data and must remain intact.
+ if(kept){if(local<4u+levelCapacity(lb)*4u&&(local-4u)%4u==2u){atomicAnd(&contactWork[h+local],~15u);}return;}
  atomicStore(&contactWork[h+local],0u);
 }
 @compute @workgroup_size(64) fn contactVertices(@builtin(global_invocation_id) gid:vec3u){contactVertexAt(gid.x+gid.y*params.owners[3].w*64u);}
@@ -1986,7 +2083,7 @@ fn prepareIn(){
  // not launch the old host reservation and then clear holes.
  let voxelWork=select(0u,min(sourceFaceCount()*2u,native[0]/6u*4u),contactActive);
  let edgeWork=select(0u,min(sourceEdgeCount(),native[0]/6u*5u),contactActive);
- let homeWork=select(0u,4u+levelClusters(2u)*4u+4u+levelClusters(4u)*4u+4u+levelClusters(8u)*4u+4u+levelClusters(16u)*4u,contactActive&&persistentHome()&&chartOn());
+ let homeWork=select(0u,4u+levelClusters(2u)*6u+4u+levelClusters(4u)*6u+4u+levelClusters(8u)*6u+4u+levelClusters(16u)*6u,contactActive&&persistentHome()&&chartOn());
  let chartWork=select(0u,max(chartClusters(),prepareAnchorParts()),contactActive);
  dispatch[21]=min((voxelWork+63u)/64u,limit);dispatch[22]=max(1u,((voxelWork+63u)/64u+limit-1u)/limit);dispatch[23]=1u;
  dispatch[24]=min((homeWork+63u)/64u,limit);dispatch[25]=max(1u,((homeWork+63u)/64u+limit-1u)/limit);dispatch[26]=1u;
@@ -3109,6 +3206,7 @@ ${chartEntry('batchContactClear','contactClearAt(id);')}
 ${chartEntry('batchVoxelVote','voxelVoteAt(id);')}
 ${chartEntry('batchVoxelBin','voxelBinAt(id);')}
 ${chartEntry('batchChartCorners','chartCornerAt(id);')}
+${chartEntry('batchChartNeighbourCache','chartNeighbourCacheAt(id,max(1u,chartClusters()));')}
 ${chartEntry('batchChartCertify','chartCertifyAt(id);')}
 ${chartEntry('batchChartSelectStage','chartSelectAt(id);')}
 ${chartEntry('batchChartEmit','chartEmitAt(id,max(1u,chartClusters()));if(id==0u&&posedContacts()&&chartOn()){atomicStore(&contactWork[chartEarlyEmittedWord()],1u);}')}
@@ -3147,10 +3245,10 @@ export const SURFACE_RELATIONS_BATCH_SHADER=makeBatchShader(boundaryClassificati
  * their producer-owned chart. No chart or cave/frontier helper is reachable
  * from the line or anchor stages. */
 export const SURFACE_RELATIONS_PHYSICAL_BATCH_SHADER=makeBatchShader(boundaryClassificationShader(SURFACE_RELATIONS_PHYSICAL_SHADER,true),true);
-type BatchStage='partAnchorClear'|'partAnchors'|'prepareFrontier'|'contactClear'|'voxelVote'|'voxelBin'|'chartCorners'|'chartCertify'|'chartSelectStage'|'chartEmit'|'chartPublish'|'contactVertices'|'contactEdges'|'contactSort'|'boundaryClassify'|'boundaryLines'|'contourLines'|'prepareInterior'|'faceDifferentials'|'radialCurvature'|'suggestiveContours'|'principalCurvature'|'ridgeDerivative'|'ridgeLines'|'viewFaceLines';
+type BatchStage='partAnchorClear'|'partAnchors'|'prepareFrontier'|'contactClear'|'voxelVote'|'voxelBin'|'chartCorners'|'chartNeighbourCache'|'chartCertify'|'chartSelectStage'|'chartEmit'|'chartPublish'|'contactVertices'|'contactEdges'|'contactSort'|'boundaryClassify'|'boundaryLines'|'contourLines'|'prepareInterior'|'faceDifferentials'|'radialCurvature'|'suggestiveContours'|'principalCurvature'|'ridgeDerivative'|'ridgeLines'|'viewFaceLines';
 /** Global stage order. Per source it is the per-source order (contacts, lines,
  * prepareInterior, tensor, view lines); sources write disjoint ranges. */
-const BATCH_ORDER:readonly BatchStage[]=['partAnchorClear','prepareFrontier','contactClear','voxelVote','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','contactSort','boundaryClassify','boundaryLines','contourLines','partAnchors','prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'];
+const BATCH_ORDER:readonly BatchStage[]=['partAnchorClear','prepareFrontier','contactClear','voxelVote','voxelBin','chartCorners','chartNeighbourCache','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','contactSort','boundaryClassify','boundaryLines','contourLines','partAnchors','prepareInterior','faceDifferentials','radialCurvature','suggestiveContours','principalCurvature','ridgeDerivative','ridgeLines','viewFaceLines'];
 const batchEntryName=(stage:BatchStage)=>'batch'+stage[0]!.toUpperCase()+stage.slice(1);
 // Direct and batched anchor dispatches execute the same projection body. It
 // links each complete record atomically; there is no second insertion owner.
@@ -3164,8 +3262,8 @@ export const SURFACE_PART_ANCHOR_BINDINGS={
 // compilation moved partCodes/anchor input from certification to vertex marking.
 export const SURFACE_CONTACT_BINDINGS={
  contactClear:[0,1,4,8,12],voxelVote:[0,1,2,4,8,12,13],voxelHome:[0,1,4,8,12],
- voxelBin:[0,1,2,4,8,12,13],chartCorners:[0,1,2,4,8,12,13],
- chartCertify:[0,1,4,8,12,18],contactVertices:[0,1,2,4,8,12,13,16],
+ voxelBin:[0,1,2,4,8,12,13],chartCorners:[0,1,2,4,8,12,13,18],
+ chartNeighbourCache:[0,1,4,8,12,18],chartCertify:[0,1,4,8,12,18],contactVertices:[0,1,2,4,8,12,13,16],
  contactEdges:[0,1,2,4,8,12,13,14],contactSort:[0,1,2,4,8,12],chartSelectStage:[0,1,4,8,12],chartEmit:[0,1,2,3,4,5,6,8,10,11,12,15],chartPublish:[0,1,4,7,8,12],
 } as const;
 const BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...SURFACE_PART_ANCHOR_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],...SURFACE_CONTACT_BINDINGS,boundaryClassify:[0,1,2,4,5,6,8,12],boundaryLines:[0,1,2,3,4,5,6,8,10,11,12,15],contourLines:[0,1,2,3,4,5,6,8,10,11,12,15],prepareInterior:[0,1,2,3,4,6,7,8,9,10,11],faceDifferentials:[0,1,2,3,4,6,8,9],radialCurvature:[0,1,2,3,4,8,9],suggestiveContours:[0,1,2,3,4,5,6,8,9,15],principalCurvature:[0,1,2,3,4,8,9],ridgeDerivative:[0,1,2,4,8,9],ridgeLines:[0,1,2,3,4,5,6,8,9,15],viewFaceLines:[0,1,2,3,4,5,6,8,9,15]};
@@ -3173,7 +3271,7 @@ const BATCH_INDIRECT_OFFSETS:Partial<Record<BatchStage,number>>={boundaryClassif
 /** The physical shader's boundary no longer reaches partCodes or the chart;
  * binding 13 is therefore omitted from its host bind group. Generic and
  * GPU-indexed stages keep the producer-capable map above. */
-const PHYSICAL_BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...BATCH_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],contactClear:[0],voxelVote:[0],voxelBin:[0],chartCorners:[0],chartCertify:[0],chartSelectStage:[0],chartEmit:[0],chartPublish:[0],contactVertices:[0],contactEdges:[0],contactSort:[0],boundaryClassify:[0,1,2,4,5,6,8,12],boundaryLines:BATCH_BINDINGS.boundaryLines.filter(binding=>binding!==12&&binding!==13),contourLines:BATCH_BINDINGS.contourLines.filter(binding=>binding!==12)};
+const PHYSICAL_BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...BATCH_BINDINGS,prepareFrontier:[0,1,2,3,4,5,6,7,8,10,11],contactClear:[0],voxelVote:[0],voxelBin:[0],chartCorners:[0],chartNeighbourCache:[0],chartCertify:[0],chartSelectStage:[0],chartEmit:[0],chartPublish:[0],contactVertices:[0],contactEdges:[0],contactSort:[0],boundaryClassify:[0,1,2,4,5,6,8,12],boundaryLines:BATCH_BINDINGS.boundaryLines.filter(binding=>binding!==12&&binding!==13),contourLines:BATCH_BINDINGS.contourLines.filter(binding=>binding!==12)};
 const COMPLETE_BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...BATCH_BINDINGS,boundaryLines:BATCH_BINDINGS.boundaryLines,contourLines:BATCH_BINDINGS.contourLines};
 const COMPLETE_PHYSICAL_BATCH_BINDINGS:Record<BatchStage,readonly number[]>={...PHYSICAL_BATCH_BINDINGS};
 const completeBatchStage=(stage:BatchStage):string=>stage==='boundaryLines'?'batchCompleteBoundaryLines':stage==='contourLines'?'batchCompleteContourLines':batchEntryName(stage);
@@ -3327,6 +3425,15 @@ export function chartOccupancy(indexed:{readonly generation:number;readonly rest
   const chart=currentRestCellChart(indexed),occupancy=chart?.occupancy;
   return occupancy?.kind==='voxel-column-occupancy-v1'&&chart!.extent.every((n,i)=>n===extent[i])?occupancy:undefined;
 }
+/** All chart consumers carry two15-bit halo radii above frontier.w's admission
+ * bit. levelDispatch.w remains exclusively the classifier/owner certificate,
+ * including on compatibility and batched sources with an actual tail. */
+export function voxelOccupancyHaloWord(occupancy:GpuIndexedCellOccupancy|undefined,frontierAdmission=0):number{
+ const halo=occupancy?.halo??[0,0];
+ if(halo.length!==2||halo.some((n)=>!Number.isSafeInteger(n)||n<0||n>32767))throw Error('Voxel occupancy halo must contain two integers in 0..32767');
+ if(frontierAdmission!==0&&frontierAdmission!==1)throw Error('Voxel occupancy requires an exact frontier admission bit');
+ return frontierAdmission+halo[0]*2+halo[1]*65536;
+}
 export function cellChart(extent:readonly [number,number,number]):{cells:number;corners:number;clusters:number}|undefined{
   const [x,y,z]=extent;if(![x,y,z].every(n=>Number.isInteger(n)&&n>=1&&n<=256))return undefined;
   const cells=x*y*z;if(cells>CHART_CELLS)return undefined;
@@ -3383,8 +3490,9 @@ interface ColumnHome {readonly offset:number;readonly slots:number;readonly leve
 export function chartLevelClusters(extent:readonly [number,number,number]):readonly number[]{
   return [2,4,8,16].map(b=>extent.reduce((n,e)=>n*Math.ceil(e/b),1));
 }
-/** Words of one source's four contiguous level homes (each: 4 header words + 4 words per cluster). */
-export function chartHomeWords(levels:readonly number[]):number{return levels.reduce((n,clusters)=>n+4+clusters*4,0);}
+/** Words of one source's four contiguous level homes (each: 4 header words +
+ * 4 words per cluster record + 2 words per cached eight-neighbour record). */
+export function chartHomeWords(levels:readonly number[]):number{return levels.reduce((n,clusters)=>n+4+clusters*6,0);}
 
 
 export function chartRequirementWords(extent:readonly [number,number,number]):number{return chartLevelClusters(extent).reduce((n,clusters)=>n+clusters,0);}
@@ -3420,7 +3528,7 @@ export function tensorRevision(batch:{readonly source:{readonly posedRevision?:n
   if(!batch.gpuPose)return batch.source.posedRevision;
   const token=posedContentToken(batch);return token>1?token:undefined;
 }
-const SURFACE_RELATION_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','voxelVote','voxelHome','voxelBin','chartCorners','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','contactSort','boundaryClassify','boundaries','contours','surfaceLines'] as const;
+const SURFACE_RELATION_ENTRIES=['admitFrontier','prepare','partAnchorClear','partAnchors','contactClear','voxelVote','voxelHome','voxelBin','chartCorners','chartNeighbourCache','chartCertify','chartSelectStage','chartEmit','chartPublish','contactVertices','contactEdges','contactSort','boundaryClassify','boundaries','contours','surfaceLines'] as const;
 // The ordinary example caller uses direct, host-free append calls. The fused
 // surfaceLines entry is only reachable from the extent-bearing host path below
 // and is therefore not part of that caller's preparation closure. Keep it in
@@ -3438,7 +3546,7 @@ const SURFACE_RELATION_BATCH_ENTRIES=BATCH_ORDER.map(batchEntryName);
 // into the cold shader compile even though the host dispatches the producer
 // stages as one capability family.
 const GENERIC_DIRECT_VOXEL_ENTRIES=new Set<string>([
- 'voxelVote','voxelHome','voxelBin','chartCorners','chartCertify',
+ 'voxelVote','voxelHome','voxelBin','chartCorners','chartNeighbourCache','chartCertify',
  'chartSelectStage','chartEmit','chartPublish','contactVertices',
  'contactEdges','contactSort','boundariesVoxel','contoursVoxel',
 ]);
@@ -4216,6 +4324,10 @@ export class SurfaceRelations {
     const chart=producerChartSource&&posedContacts?(parts?cellChart(parts.extent):surfaceChart?cellChart(surfaceChart.extent):undefined):undefined;
     const chartCodes:SourceStorageBinding|undefined=parts?.cellCodes??(chart?surfaceChart?.vertexCellCodes:undefined);
     const occupancy=chart?chartOccupancy(indexed,(parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]):undefined;
+    // This happens after every frontier writer, before direct/batch routing.
+    // Keep halo stride correct even when a compatibility consumer also owns
+    // a classifier or level-prefix reservation in levelDispatch.w.
+    if(occupancy){const u=new Uint32Array(floats.buffer);u[51]=voxelOccupancyHaloWord(occupancy,u[51]!&1);}
     new Uint32Array(floats.buffer)[31]=chartToken(batch,source,!!chart);
     if(posedContacts){
       contactSlots=2**Math.ceil(Math.log2(Math.max(2,contactEdges*2,sourceResidencyFaceCount(source)*4)));
@@ -4225,7 +4337,7 @@ export class SurfaceRelations {
       // incumbent population exceeds them, the shader marks overflow and
       // rewrites the indirect ranges to the complete old domains.
       const fineMembershipWords=chart?voxelFineMembershipWords(sourceResidencyEdgeCount(source),sourceResidencyVertexCount(source),sourceResidencyFaceCount(source)):0;
-      baselineContactWords=(parts?contactSlots*7+contactEdges*2:contactSlots*3+contactEdges)+contactSlots+4+fineMembershipWords+(chart?chart.cells*19+chart.corners*4+4+chart.clusters*4+sourceResidencyFaceCount(source)*2+2+chart.clusters+4+1+chartRequirementWords((parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]):4);
+      baselineContactWords=(parts?contactSlots*7+contactEdges*2:contactSlots*3+contactEdges)+contactSlots+4+fineMembershipWords+(chart?chart.cells*19+chart.corners*4+4+chart.clusters*6+sourceResidencyFaceCount(source)*2+2+chart.clusters+4+1+chartRequirementWords((parts?parts.extent:surfaceChart!.extent) as readonly [number,number,number]):4);
       // Optional residual suffix: four header words, compact edge ids, the
       // sparse vertex bitset/list, then the sparse face bitset/list. Face ids
       // remain source ordinals; the bitset prevents duplicate appends from
@@ -4320,7 +4432,7 @@ export class SurfaceRelations {
     }
     if(home?.fresh){
       // Every level home gets a fresh header [capacity, no token, no block, held level 0].
-      let at=home.offset;for(const clusters of home.levels){this.device.queue.writeBuffer(this.contactWork,at*4,new Uint32Array([clusters,0,0,0]));at+=4+clusters*4;}
+      let at=home.offset;for(const clusters of home.levels){this.device.queue.writeBuffer(this.contactWork,at*4,new Uint32Array([clusters,0,0,0]));at+=4+clusters*6;}
       home.fresh=false;
     }
     new Uint32Array(floats.buffer)[35]=home?.offset??0;
@@ -4370,7 +4482,7 @@ export class SurfaceRelations {
     if((posedContacts&&!host)||frontierAdmitted){
       indirect('prepare');
       if(posedContacts&&producerChartSource){
-        indirect('contactClear',24);indirect('voxelVote',84);indirect('voxelHome',96);indirect('voxelBin',108);indirect('chartCorners',120);indirect('chartCertify',132);indirect('chartSelectStage',48);indirect('chartEmit',132);direct('chartPublish',1,held.groups,used.chartPublish!,buffers);indirect('contactVertices',36);indirect('contactEdges',48);indirect('contactSort',48);
+        indirect('contactClear',24);indirect('voxelVote',84);indirect('voxelHome',96);indirect('voxelBin',108);indirect('chartCorners',120);direct('chartNeighbourCache',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartNeighbourCache!,buffers);indirect('chartCertify',132);indirect('chartSelectStage',48);indirect('chartEmit',132);direct('chartPublish',1,held.groups,used.chartPublish!,buffers);indirect('contactVertices',36);indirect('contactEdges',48);indirect('contactSort',48);
       }else if(posedContacts&&(fineOnlyOrdinary||nativeCompleteFallback||completeIncumbentFallback)){
         // Fine-only late producers still need posed contact/canonical ports,
         // but have no chart, residual or voxel stages in this profile.
@@ -4383,6 +4495,7 @@ export class SurfaceRelations {
         direct('voxelHome',home?chartHomeWords(home.levels):0,held.groups,used.voxelHome!,buffers);
         direct('voxelBin',contactEdges,held.groups,used.voxelBin!,buffers);
         direct('chartCorners',faces*2,held.groups,used.chartCorners!,buffers);
+        direct('chartNeighbourCache',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartNeighbourCache!,buffers);
         direct('chartCertify',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartCertify!,buffers);
         direct('chartSelectStage',contactEdges,held.groups,used.chartSelectStage!,buffers);
         direct('chartEmit',chart?Math.max(chart.clusters,anchorParts):0,held.groups,used.chartEmit!,buffers);
@@ -4593,7 +4706,7 @@ export class SurfaceRelations {
     bound[16]=anchorEntry?.input??this.emptyPartAnchorVertices!;
     const relationBase2=[contactBase,0,frontierDispatchBase,Number(frontierAdmitted)];
     if(anchorEntry&&this.partAnchorBuffer){const anchorBound=[...bound];anchorBound[16]=anchorEntry.input;anchorBound[17]=this.partAnchorBuffer;push('partAnchors',anchorEntry.parts*anchorEntry.instances,words,relationBase2,anchorBound,frontierAdmitted);}
-    if(posedContacts){const compact=chartClusters>0;push('contactClear',contactWords,words,relationBase2,bound,frontierAdmitted);push('voxelVote',faces*2,words,relationBase2,bound,frontierAdmitted);push('voxelBin',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartCorners',faces*2,words,relationBase2,bound,frontierAdmitted);push('chartCertify',Math.max(chartClusters,anchorParts),words,relationBase2,bound,frontierAdmitted);push('chartSelectStage',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartEmit',chartClusters,words,relationBase2,bound,frontierAdmitted);push('chartPublish',1,words,relationBase2,bound);push('contactVertices',Math.max(faces*2,anchorParts),words,relationBase2,bound,frontierAdmitted||compact);push('contactEdges',contactEdges,words,relationBase2,bound,frontierAdmitted||compact);push('contactSort',contactEdges,words,relationBase2,bound,frontierAdmitted||compact);}
+    if(posedContacts){const compact=chartClusters>0;push('contactClear',contactWords,words,relationBase2,bound,frontierAdmitted);push('voxelVote',faces*2,words,relationBase2,bound,frontierAdmitted);push('voxelBin',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartCorners',faces*2,words,relationBase2,bound,frontierAdmitted);push('chartNeighbourCache',Math.max(chartClusters,anchorParts),words,relationBase2,bound);push('chartCertify',Math.max(chartClusters,anchorParts),words,relationBase2,bound,frontierAdmitted);push('chartSelectStage',contactEdges,words,relationBase2,bound,frontierAdmitted);push('chartEmit',chartClusters,words,relationBase2,bound,frontierAdmitted);push('chartPublish',1,words,relationBase2,bound);push('contactVertices',Math.max(faces*2,anchorParts),words,relationBase2,bound,frontierAdmitted||compact);push('contactEdges',contactEdges,words,relationBase2,bound,frontierAdmitted||compact);push('contactSort',contactEdges,words,relationBase2,bound,frontierAdmitted||compact);}
     const lineBound=[...bound];
     lineBound[11]=earlyDetail?formDepths(this.device).matrix(this.detailField!):(this.emptyMatrix??=this.device.createBuffer({label:'MAIN unselected detail matrix',size:64,usage:GPUBufferUsage.UNIFORM}));
     // Keep the original fused operation's boundary-before-contour order, but

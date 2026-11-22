@@ -13,6 +13,9 @@ export const PATH_HARD_PLAYBACK='pathHard' as const;
 /** Programmed soft paths share the PATH queue but close over the canonical
  * source-part producer instead of the legacy row-pair producer. */
 export const PATH_PROGRAM_PLAYBACK='pathProgram' as const;
+/** Existing PATH hard consumer writes the camera-local contour retry. */
+export const SOURCE_CONTOUR_NATIVE_RETRY=64;
+export const CONTOUR_RETRY_WGSL="var<private> farSourceContourEmitted:bool;\nfn farRecordContourRetry(run:Run){\n let base=p.farLoops.w+p.extent.z*8u;\n let slot=atomicAdd(&counts[base],1u);\n if(slot<p.standing.w){let row=p.standing.y+slot/p.standing.z;let field=(slot%p.standing.z)*2u;rowWords[row].data[field]=run.identity.y;rowWords[row].data[field+1u]=run.identity.z;}\n atomicOr(&counts[rowCount()],64u);\n}\n";
 export type PathPlaybackClass='soft'|'softProgram'|'hard'|'anchor'|'pair'|'boundary';
 
 /**
@@ -461,9 +464,27 @@ function compileSoftPlayback(source:string,kind:'legacy'|'program'):string{
 function pathSoftPlayback(source:string):string{return compileSoftPlayback(source,'legacy');}
 export function pathProgramPlayback(source:string):string{return compileSoftPlayback(source,'program');}
 export function pathHardPlayback(source:string):string{
- let code=pathPlaybackBase(source);
- code=code.replace('if(pathPlaybackClass(run,geometry)!=PATH_SOFT){return;}','if(pathPlaybackClass(run,geometry)!=PATH_HARD&&pathPlaybackClass(run,geometry)!=PATH_ANCHOR){return;}');
+ const contourPath=' if((run.paper.w&0x08000000u)!=0u&&(run.paper.w&0xf0000000u)==0u){farSourceContourEmitted=false;hardBoundaryConstruction(runID,run,priority,false);if(!farSourceContourEmitted){farRecordContourRetry(run);}return;}\n';
+ if(source.split(PLANAR).length!==2)throw Error('PATH hard contour anchor changed');
+ let code=pathPlaybackBase(source.replace(PLANAR,PLANAR+contourPath));
+ // This consumer calls the boundary producer only for source contours, with
+ // volume=false. Remove impossible volume producers before closure extraction
+ // instead of making a portable driver compile the planar fan and tiny stamp.
+ code=rewriteFunction(code,'hardBoundaryConstruction',body=>{
+  body=replace(body,' if(volume&&!faceRun&&planarFanConstruction(id,run,priority)){return;}\n','');
+  body=removeUntil(body,' if(volume&&((extent.y<',' // Face source vertices');
+  return body.replaceAll('!volume&&!faceRun','!faceRun')
+   .replaceAll('select(edgeKey<<12u,0u,volume)','edgeKey<<12u')
+   .replaceAll('select(lidKey<<12u,0u,volume)','lidKey<<12u');
+ });
+ code=code.replace('if(pathPlaybackClass(run,geometry)!=PATH_SOFT){return;}','if(pathPlaybackClass(run,geometry)!=PATH_HARD&&pathPlaybackClass(run,geometry)!=PATH_ANCHOR&&!(pathPlaybackClass(run,geometry)==PATH_BOUNDARY&&(run.paper.w&0x08000000u)!=0u&&(run.paper.w&0xf0000000u)==0u)){return;}');
  code=stripNonProgrammedCanonicalContext(code);
+ code=rewriteFunction(code,'emitMapped',body=>{
+  const marker=' let at=p.proposals.x+slot*';
+  if(body.split(marker).length!==2)throw Error('Playback contour proposal anchor changed');
+  return body.replace(marker,' farSourceContourEmitted=true;\n'+marker);
+ });
+ code=CONTOUR_RETRY_WGSL+'\n'+code;
  code=rewriteComputeEntry(code,'featurecurves',body=>{
   const softStart=' if(soft){\n';
   const hardStart=' let count=grammar[instruction+1u];let advance=grammar[instruction+2u];';

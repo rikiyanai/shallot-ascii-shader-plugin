@@ -49,6 +49,12 @@ export interface GpuIndexedRestCellChartInput {
 export interface GpuIndexedCellOccupancy {
  readonly kind:'voxel-column-occupancy-v1';
  readonly columns:GPUBufferBinding;
+ /** Optional exact X/Z neighbour halo around the chart extent.  The buffer is
+  * laid out with width extent[0]+2*halo[0] and depth extent[2]+2*halo[1],
+  * with local cell (0,*,0) at column (halo[0],halo[1]); radii are 0..32767
+  * to share the existing parameter word with its frontier admission bit. A missing halo keeps
+  * the legacy local-only certificate and all chart seams fail closed. */
+ readonly halo?:readonly [number,number];
 }
 export const occupancyWordsPerColumn=(extent:readonly [number,number,number]):number=>Math.ceil(extent[1]/32);
 export const occupancyWords=(extent:readonly [number,number,number]):number=>extent[0]*extent[2]*occupancyWordsPerColumn(extent);
@@ -212,7 +218,10 @@ export function validateGpuIndexedSourceDescriptor(value:GpuIndexedSourceDescrip
   const occupancy=value.restCellChart.occupancy;
   if(occupancy){
    if(occupancy.kind!=='voxel-column-occupancy-v1')throw Error('GPU indexed source rest-cell occupancy has an unsupported kind');
-   bindingBytes(occupancy.columns,'source rest-cell occupancy',occupancyWords(value.restCellChart.extent)*4);
+   const halo=occupancy.halo??[0,0];
+   if(halo.length!==2||halo.some((n)=>!Number.isSafeInteger(n)||n<0||n>32767))throw Error('GPU indexed source rest-cell occupancy halo must contain two integers in 0..32767');
+   const [hx,hz]=halo;
+   bindingBytes(occupancy.columns,'source rest-cell occupancy',(value.restCellChart.extent[0]+2*hx)*(value.restCellChart.extent[2]+2*hz)*occupancyWordsPerColumn(value.restCellChart.extent)*4);
   }
  }
  if(value.poseContent){

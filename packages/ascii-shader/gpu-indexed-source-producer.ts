@@ -68,17 +68,19 @@ function validateRestCellChartInput(value:GpuIndexedRestCellChartInput,vertexCap
 
  if(value.occupancy){
   if(value.occupancy.kind!=='voxel-column-occupancy-v1')throw Error('Unsupported GPU indexed source producer rest-cell occupancy kind');
-  const at=value.occupancy.columns.offset??0,bytes=value.occupancy.columns.size??value.occupancy.columns.buffer.size-at,need=value.extent[0]*value.extent[2]*Math.ceil(value.extent[1]/32)*4;
+  const halo=value.occupancy.halo??[0,0];
+  if(halo.length!==2||halo.some(n=>!Number.isSafeInteger(n)||n<0||n>32767))throw Error('GPU indexed source producer rest-cell occupancy halo must contain two integers in 0..32767');
+  const [hx,hz]=halo,at=value.occupancy.columns.offset??0,bytes=value.occupancy.columns.size??value.occupancy.columns.buffer.size-at,need=(value.extent[0]+2*hx)*(value.extent[2]+2*hz)*Math.ceil(value.extent[1]/32)*4;
   if(!Number.isSafeInteger(at)||at<0||at%4||!Number.isSafeInteger(bytes)||bytes<need||at+bytes>value.occupancy.columns.buffer.size)
    throw Error('GPU indexed source producer rest-cell occupancy binding is shorter than its extent');
  }
 }
 function cloneRestCellChartInput(value:GpuIndexedRestCellChartInput):GpuIndexedRestCellChartInput{
- return {kind:value.kind,cornerOrder:value.cornerOrder,extent:[...value.extent] as GpuIndexedRestCellChartInput['extent'],vertexCellCodes:value.vertexCellCodes,...(value.occupancy?{occupancy:{kind:value.occupancy.kind,columns:value.occupancy.columns}}:{})};
+ return {kind:value.kind,cornerOrder:value.cornerOrder,extent:[...value.extent] as GpuIndexedRestCellChartInput['extent'],vertexCellCodes:value.vertexCellCodes,...(value.occupancy?{occupancy:{kind:value.occupancy.kind,columns:value.occupancy.columns,...(value.occupancy.halo?{halo:[...value.occupancy.halo] as [number,number]}:{})}}:{})};
 }
 function sameRestCellChart(a:GpuIndexedRestCellChart|GpuIndexedRestCellChartInput,b:GpuIndexedRestCellChart|GpuIndexedRestCellChartInput):boolean{
  return a.kind===b.kind&&a.cornerOrder===b.cornerOrder&&a.extent.every((value,index)=>value===b.extent[index])&&sameStorageBinding(a.vertexCellCodes,b.vertexCellCodes)&&
-  !!a.occupancy===!!b.occupancy&&(!a.occupancy||!b.occupancy||a.occupancy.kind===b.occupancy.kind&&sameStorageBinding(a.occupancy.columns,b.occupancy.columns));
+  !!a.occupancy===!!b.occupancy&&(!a.occupancy||!b.occupancy||a.occupancy.kind===b.occupancy.kind&&sameStorageBinding(a.occupancy.columns,b.occupancy.columns)&&JSON.stringify(a.occupancy.halo??[0,0])===JSON.stringify(b.occupancy.halo??[0,0]));
 }
 function samePoseContent(a:GpuIndexedSourcePoseContent,b:GpuIndexedSourcePoseContentInput,sourceGeneration:number):boolean{
  return a.sourceGeneration===sourceGeneration&&a.kind===b.kind&&a.vertexRevision===b.vertexRevision&&

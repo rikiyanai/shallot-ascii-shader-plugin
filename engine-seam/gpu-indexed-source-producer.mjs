@@ -29,7 +29,7 @@ export const GPU_INDEXED_SOURCE_METADATA_TYPE=`{
         posedNormalClass?: "face-constant";
         edgeContactClass?: "posed-coincident";
         parts?: { kind: "closed-cells"; extent: readonly [number, number, number]; cellCodes: GPUBufferBinding };
-        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding; occupancy?: { kind: "voxel-column-occupancy-v1"; columns: GPUBufferBinding } };
+        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding; occupancy?: { kind: "voxel-column-occupancy-v1"; columns: GPUBufferBinding; halo?: readonly [number, number] } };
         poseContent?: {
             kind: "voxel-terrain-material";
             sourceGeneration: number;
@@ -82,7 +82,8 @@ export function transformGpuIndexedSourceSources({mesh,forward}){
  const parts='\n        parts?: { kind: "closed-cells"; extent: readonly [number, number, number]; cellCodes: GPUBufferBinding };';
  if(!mesh.includes('parts?: { kind: "closed-cells"'))mesh=once(mesh,kind,kind+parts,'Mesh construction parts');
  if(!forward.includes('parts?: { kind: "closed-cells"'))forward=once(forward,kind,kind+parts,'visitor construction parts');
- const restCellChart='        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding; occupancy?: { kind: "voxel-column-occupancy-v1"; columns: GPUBufferBinding } };';
+ const restCellChart='        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding; occupancy?: { kind: "voxel-column-occupancy-v1"; columns: GPUBufferBinding; halo?: readonly [number, number] } };';
+ const noHaloRestCellChart='        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding; occupancy?: { kind: "voxel-column-occupancy-v1"; columns: GPUBufferBinding } };';
  const legacyRestCellChart='        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding };';
  const noOccupancyRestCellChart='        restCellChart?: { kind: "voxel-rest-cell-chart"; sourceGeneration: number; cornerOrder: "shallot-voxel-quad-v1"; extent: readonly [number, number, number]; vertexCellCodes: GPUBufferBinding };';
  const upgradeRestCellChart=(text,label)=>{
@@ -91,6 +92,7 @@ export function transformGpuIndexedSourceSources({mesh,forward}){
   if(declarations.length!==1)throw Error(`MAIN GPU indexed source ${label} expected one rest-cell chart declaration, found ${declarations.length}`);
   const declaration=declarations[0];
   if(declaration===restCellChart)return text;
+  if(declaration===noHaloRestCellChart)return once(text,declaration,restCellChart,label+' occupancy schema without halo');
   if(declaration===legacyRestCellChart)return once(text,declaration,restCellChart,label+' legacy schema');
   if(declaration===noOccupancyRestCellChart)return once(text,declaration,restCellChart,label+' no-occupancy schema');
   throw Error(`MAIN GPU indexed source ${label} has an unexpected rest-cell chart declaration`);
@@ -118,6 +120,8 @@ export function transformVoxelTerrainSource(source,{importSpecifier='../../../pa
  source=once(source,resourceAnchor,`${resourceAnchor}\n    producer: GpuIndexedSourceProducerRuntime | null;`,'voxel producer resource type');
  const slotAnchor='    geometry: Geometry;\n    dirty: boolean;';
  source=once(source,slotAnchor,`    geometry: Geometry;\n    /** Counts source-buffer emission changes independently of topology generation. */\n    poseRevision: number;\n    dirty: boolean;\n    /** A wrapped chunk calls resetInterpolation; omit pose retention for that frame. */\n    poseDiscontinuous: boolean;\n    /** Per-slot column occupancy written by voxel:emit (voxel-column-occupancy-v1). */\n    occupancy: GPUBuffer;`,'voxel pose revision and occupancy slot');
+ const sizeAnchor='    const size = config.chunkSize;';
+ source=once(source,sizeAnchor,`${sizeAnchor}\n    const OCCUPANCY_HALO = 17;`,'voxel terrain occupancy halo');
  const terrainAnchor='export const Terrain: Resource<{';
  source=once(source,terrainAnchor,`/** Exact CPU-owned inputs of TerrainMaterial.vertex for one chunk draw.\n * The producer updates this certificate whenever emission, chunk Transform, or\n * the material's radial parameters can change. Unknown stages do not call it.\n * The transform is the same previous/current interpolation used by Shallot's\n * global-transform render table; a wrapped chunk fails closed for one frame. */\nfunction voxelPoseContent(slot: Pick<Slot, "x" | "z" | "poseRevision" | "poseDiscontinuous">, previousViewer: number, viewer: number, alpha: number, config: TerrainConfig) {\n    if (slot.poseDiscontinuous) return undefined;\n    const { inner, outer } = radii(config);\n    const currentX = chunkTranslation(slot.x, viewer, config);\n    const previousX = chunkTranslation(slot.x, previousViewer, config);\n    const x = previousX * (1 - alpha) + currentX * alpha;\n    return {\n        kind: "voxel-terrain-material" as const,\n        vertexRevision: slot.poseRevision,\n        instanceTransform: [\n            x, -config.height / 2, chunkTranslation(slot.z, 0, config),\n            0, 0, 0, 1, 1, 1, 1,\n        ] as const,\n        materialParameters: [inner, outer] as const,\n    };\n}\n${terrainAnchor}`,'voxel pose certificate helper');
  const createAnchor='        emitPass: { label: "voxel:emit" },';
@@ -147,7 +151,7 @@ export function transformVoxelTerrainSource(source,{importSpecifier='../../../pa
                     posedNormalClass: "face-constant",
                     edgeContactClass: "posed-coincident",
                     poseContent: voxelPoseContent({ x, z, poseRevision: 0, poseDiscontinuous: false }, s.previousViewer, s.viewer, 0, config),
-                    restCellChart: { kind: "voxel-rest-cell-chart", cornerOrder: "shallot-voxel-quad-v1", extent: [config.chunkSize, config.height, config.chunkSize], vertexCellCodes: { buffer: root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 }, occupancy: { kind: "voxel-column-occupancy-v1", columns: { buffer: geometry.occupancy, size: geometry.occupancy.size } } },
+                    restCellChart: { kind: "voxel-rest-cell-chart", cornerOrder: "shallot-voxel-quad-v1", extent: [config.chunkSize, config.height, config.chunkSize], vertexCellCodes: { buffer: root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 }, occupancy: { kind: "voxel-column-occupancy-v1", halo: [17, 17], columns: { buffer: geometry.occupancy, size: geometry.occupancy.size } } },
                     parts: geometry.allFaces ? { kind: "closed-cells", extent: [config.chunkSize, config.height, config.chunkSize], cellCodes: { buffer: root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 } } : undefined,
                 });
                 const handle = world.resource(Meshes).add(geometry.mesh);`;
@@ -170,7 +174,7 @@ export function transformVoxelTerrainSource(source,{importSpecifier='../../../pa
                             posedNormalClass: "face-constant",
                             edgeContactClass: "posed-coincident",
                             poseContent: voxelPoseContent(slot, s.previousViewer, s.viewer, world.time.fixedAlpha, config),
-                            restCellChart: { kind: "voxel-rest-cell-chart", cornerOrder: "shallot-voxel-quad-v1", extent: [config.chunkSize, config.height, config.chunkSize], vertexCellCodes: { buffer: world.gpu.root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 }, occupancy: { kind: "voxel-column-occupancy-v1", columns: { buffer: slot.occupancy, size: slot.occupancy.size } } },
+                            restCellChart: { kind: "voxel-rest-cell-chart", cornerOrder: "shallot-voxel-quad-v1", extent: [config.chunkSize, config.height, config.chunkSize], vertexCellCodes: { buffer: world.gpu.root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 }, occupancy: { kind: "voxel-column-occupancy-v1", halo: [17, 17], columns: { buffer: slot.occupancy, size: slot.occupancy.size } } },
                             parts: geometry.allFaces ? { kind: "closed-cells", extent: [config.chunkSize, config.height, config.chunkSize], cellCodes: { buffer: world.gpu.root.unwrap(geometry.mesh.attributes!.voxel!), size: Math.floor(producerVertices.size / 16) * 4 } } : undefined,
                         });
                         slot.poseDiscontinuous = false;`;
@@ -179,6 +183,8 @@ export function transformVoxelTerrainSource(source,{importSpecifier='../../../pa
  source=once(source,poseAnchor,`                        const slot = s.slots[i];\n                        if (slot.dirty) slot.poseRevision++;\n                        s.producer?.observePoseContent(\`voxel/chunk-slot/\${i}\`, voxelPoseContent(slot, s.previousViewer, s.viewer, world.time.fixedAlpha, config));\n                        if (!slot.dirty) continue;`,'voxel pose certificate update');
  const endAnchor='                    if (pass) endComputePass(pass);';
  source=once(source,endAnchor,`                    if (pass) {\n                        endComputePass(pass);\n                        // Copies are encoded after voxel:emit closes, then mapped by the host after submit.\n                        s.producer?.encodeCountCopies(world.frameEncoder()!);\n                        // World invokes this callback after its ordinary queue submission.\n                        world.onFrameSubmit(() => onTerrainGpuIndexedSourceFrameSubmit(world));\n                    }`,'voxel producer count copy');
+ const dispatchAnchor='                        pass.dispatchWorkgroups(size / 4, size / 4);';
+ source=once(source,dispatchAnchor,'                        pass.dispatchWorkgroups(Math.ceil((size + OCCUPANCY_HALO * 2) / 4), Math.ceil((size + OCCUPANCY_HALO * 2) / 4));','voxel terrain occupancy halo dispatch');
  const exportAnchor='export const TerrainPlugin = terrainPlugin(CONFIG);';
  source=once(source,exportAnchor,`${exportAnchor}
 ${GPU_INDEXED_SOURCE_VOXEL_MARKER}
@@ -205,18 +211,21 @@ export function transformVoxelMesherSource(source){
  const layoutAnchor='    chunk: { uniform: d.vec4i },';
  source=once(source,layoutAnchor,`${layoutAnchor}\n    occupancy: { storage: d.arrayOf(d.u32), access: "mutable" },`,'voxel mesher occupancy layout');
  const wordsAnchor='    const Height = config.height;';
- source=once(source,wordsAnchor,`${wordsAnchor}\n    const occupancyWords = Math.ceil(config.height / 32);`,'voxel mesher occupancy words');
+ source=once(source,wordsAnchor,`${wordsAnchor}\n    const occupancyWords = Math.ceil(config.height / 32);\n    const OccupancyHalo = 17;\n    const OccupancyStride = Chunk + OccupancyHalo * 2;`,'voxel mesher occupancy words');
+ const coordinateAnchor='                const x = d.i32(input.gid.x);\n                const z = d.i32(input.gid.y);';
+ source=once(source,coordinateAnchor,'                const x = d.i32(input.gid.x) - d.i32(OccupancyHalo);\n                const z = d.i32(input.gid.y) - d.i32(OccupancyHalo);\n                if (x < -d.i32(OccupancyHalo) || x >= d.i32(Chunk) + d.i32(OccupancyHalo) || z < -d.i32(OccupancyHalo) || z >= d.i32(Chunk) + d.i32(OccupancyHalo)) return;','voxel mesher halo coordinates');
  const writeAnchor='                const h = height(wx, wz);';
  source=once(source,writeAnchor,`${writeAnchor}
                 const solid = std.max(0, std.min(h, d.i32(Height)));
-                const column = (d.u32(z) * d.u32(Chunk) + d.u32(x)) * d.u32(occupancyWords);
+                const column = (d.u32(z + d.i32(OccupancyHalo)) * d.u32(OccupancyStride) + d.u32(x + d.i32(OccupancyHalo))) * d.u32(occupancyWords);
                 for (let w = 0; w < occupancyWords; w++) {
                     let word = d.u32(0);
                     for (let b = 0; b < 32; b++) {
                         if (d.i32(w * 32 + b) < solid) word = word | (d.u32(1) << d.u32(b));
                     }
                     layout.$.occupancy[column + d.u32(w)] = word;
-                }`,'voxel mesher occupancy write');
+                }
+                if (x < 0 || x >= d.i32(Chunk) || z < 0 || z >= d.i32(Chunk)) return;`,'voxel mesher occupancy write');
  return `${source}\n${GPU_INDEXED_SOURCE_MESHER_MARKER}\n`;
 }
 
@@ -233,9 +242,9 @@ export function transformVoxelPoolSource(source){
  const typeAnchor='    group: GPUBindGroup;\n    allFaces: boolean;';
  source=once(source,typeAnchor,'    group: GPUBindGroup;\n    occupancy: GPUBuffer;\n    allFaces: boolean;','voxel pool occupancy type');
  const hoistAnchor='    for (let i = 0; i < count; i++) {';
- source=once(source,hoistAnchor,'    const occupancyWordsPerColumn = Math.ceil(config.height / 32);\n'+hoistAnchor,'voxel pool occupancy words');
+ source=once(source,hoistAnchor,'    const occupancyWordsPerColumn = Math.ceil(config.height / 32);\n    const occupancyHalo = 17;\n    const occupancyStride = config.chunkSize + occupancyHalo * 2;\n'+hoistAnchor,'voxel pool occupancy words');
  const allocAnchor='        const uniform = allocate(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);';
- source=once(source,allocAnchor,`${allocAnchor}\n        const occupancy = allocate(config.chunkSize * config.chunkSize * occupancyWordsPerColumn * 4, GPUBufferUsage.STORAGE);`,'voxel pool occupancy allocation');
+ source=once(source,allocAnchor,`${allocAnchor}\n        const occupancy = allocate(occupancyStride * occupancyStride * occupancyWordsPerColumn * 4, GPUBufferUsage.STORAGE);`,'voxel pool occupancy allocation');
  const entriesAnchor='            entries: [vertices, position, indices, voxel, counts, uniform].map(';
  source=once(source,entriesAnchor,'            entries: [vertices, position, indices, voxel, counts, uniform, occupancy].map(','voxel pool occupancy binding');
  const pushAnchor='            group,\n            allFaces: false,';

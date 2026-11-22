@@ -1,4 +1,5 @@
-import {farPlayback} from './gpu-playback-program.ts';
+import {farPlayback,CONTOUR_RETRY_WGSL} from './gpu-playback-program.ts';
+export {SOURCE_CONTOUR_NATIVE_RETRY} from './gpu-playback-program.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
 import {PARENT_LEAVE_ROWS,SOURCE_COARSE_CONTOUR_FLAG} from './source-lod.ts';
 import {SMALL_CONSTRUCTION_WGSL} from './gpu-small-construction.ts';
@@ -9,8 +10,6 @@ import type {SourceConstructionClass} from './gpu-construction-runs.ts';
  * and packed canonical profile-loop limits. Drawing functions are extracted from
  * the current canonical far playback source before specialization. */
 export const FAR_PLAN_WORDS=8;
-/** Native producer refusal, consumed by the existing complete-child retry. */
-export const SOURCE_CONTOUR_NATIVE_RETRY=64;
 /** Reserve only source-part retry addresses, never a second fine-run arena.
  * Raw packets may emit once per contributor; coherent packets emit fewer.
  * Both are bounded by the already prepared run allocation. */
@@ -78,6 +77,7 @@ function blockEnd(source:string,open:number):number{
  throw Error('Unbalanced WGSL block');
 }
 function functionText(source:string,name:string):string{const [start,end]=functionRange(source,name);return source.slice(start,end);}
+function functionBody(source:string,name:string):string{const [start,end]=functionRange(source,name),open=codeMask(source).indexOf('{',start);return source.slice(open+1,end-1);}
 function replaceFunction(source:string,name:string,replacement:string):string{const [start,end]=functionRange(source,name);return source.slice(0,start)+replacement+source.slice(end);}
 /** Keep a small closure of canonical soft-playback helpers when the far
  * profile is first isolated.  The far profile never calls these helpers, so
@@ -96,6 +96,18 @@ function retainCanonicalFunctions(source:string,code:string,roots:readonly strin
  const pending=[...roots],kept:string[]=[],names=new Set<string>();
  while(pending.length){const name=pending.pop()!;if(available.has(name)||names.has(name))continue;const fn=functions.get(name);if(!fn)continue;names.add(name);kept.push(fn.body);for(const id of fn.code.matchAll(/\b[A-Za-z_]\w*\b/g)){if(functions.has(id[0]!)&&!available.has(id[0]!))pending.push(id[0]!);}}
  return kept.join('\n');
+}
+function admissionClosure(standing:string,base:string,roots:readonly string[]):string{
+ const closure=retainCanonicalFunctions(standing,base,roots);
+ const globals=new Map<string,string>();
+ for(const match of standing.matchAll(/(?:^|\n)(var<(?:private|workgroup)>\s+([A-Za-z_]\w*)[^;]*;)/g))globals.set(match[2]!,match[1]!);
+ const used=new Set<string>();for(const match of closure.matchAll(/\b([A-Za-z_]\w*)\b/g))if(globals.has(match[1]!))used.add(match[1]!);
+ return [...used].map(name=>globals.get(name)!).join('\n')+'\n'+closure;
+}
+function nativeWholeAdmissionFunction(standing:string):string{
+ const whole=functionBody(standing,'farNativeWholePart'),marker=' var emitted=false;',cut=whole.indexOf(marker);
+ if(cut<0)throw Error('Native whole admission anchor changed');
+ return 'fn farNativeWholeAdmission(run:Run)->bool{'+whole.slice(0,cut)+'return true;}';
 }
 function once(source:string,before:string,after:string):string{
  if(source.split(before).length!==2)throw Error(`Far kind anchor changed: ${before.slice(0,120)}`);
@@ -147,14 +159,13 @@ fn scheduledRunWorkgroup(group:vec3u,family:u32)->u32{
 }
 `;
 
-function planPrepare(source:string):string{
- const combined=farPlayback(source),incumbent=functionText(combined,'featurefar');
+function planPrepare(source:string,admission=''):string{
+ const combined=farPlayback(source)+(admission?'\n'+admission:''),incumbent=functionText(combined,'featurefar');
  const boundary=incumbent.indexOf(' lineTier=away;');if(boundary<0)throw Error('Missing incumbent far eligibility boundary');
  const open=incumbent.indexOf('{'),body=incumbent.slice(open+1,boundary);
- const tail=`let first=finiteRunStart(run).position;let last=finiteRunEnd(run).position;
- let priority=min(rank(run,first.xy,last.xy),0x7fffffffu);
- let span=skySpan(run);let far=farKind(run,away,span);let kind=select(0u,far,far==1u||far==3u);
- farPlanWrite(runID,kind,away,priority,span);`;
+ const tail=admission
+  ? 'let first=finiteRunStart(run).position;let last=finiteRunEnd(run).position;\n let priority=min(rank(run,first.xy,last.xy),0x7fffffffu);\n let span=skySpan(run);let far=farKind(run,away,span);let contourPathHard=far==3u&&contourSource(run)&&!contourNativeBankCovered(run);var kind=select(0u,far,far==1u||far==3u);if(contourPathHard){kind=4u;}\n farPlanWrite(runID,kind,away,priority,span);'
+  : 'let first=finiteRunStart(run).position;let last=finiteRunEnd(run).position;\n let priority=min(rank(run,first.xy,last.xy),0x7fffffffu);\n let span=skySpan(run);let far=farKind(run,away,span);let kind=select(0u,far,far==1u||far==3u);\n farPlanWrite(runID,kind,away,priority,span);';
  const planClear=' let runID=scheduledRunFamily(id,4u);if(runID==0xffffffffu||runID>=p.extent.z){return;}\n atomicStore(&counts[farStatus(runID)],0u);';
  const plannedBody=once(body,planClear,' let runID=scheduledRunFamily(id,4u);if(runID==0xffffffffu||runID>=p.extent.z){return;}\n atomicStore(&counts[farStatus(runID)],0u);farPlanWrite(runID,0u,0u,0u,vec4f(0));');
  const entry=`fn featurefarPrepare(@builtin(global_invocation_id) id:vec3u){${plannedBody}${tail}\n}`;
@@ -238,7 +249,9 @@ function emitter(source:string,name:'featurefarTerrain'|'featurefarStanding',kin
 export type FarKindStages={prepare:string;terrain:string;standing:string;entries:readonly[{entryPoint:'featurefarPrepare';code:string},{entryPoint:'featurefarTerrain';code:string},{entryPoint:'featurefarStanding';code:string}]};
 export function buildFarKindStages(source:string):FarKindStages{
  const rawStanding=cooperativeStanding(emitter(source,'featurefarStanding',3),source),bounds=deriveFarProfileLoopBounds(rawStanding);
- const prepare=isolateComputeEntry(lowerPrepareProfileLoops(planPrepare(source),bounds),'featurefarPrepare');
+ const nativeAdmission=nativeWholeAdmissionFunction(rawStanding);
+ const admission=admissionClosure(rawStanding+'\n'+nativeAdmission,farPlayback(source),['farNativeWholeAdmission'])+'\nfn contourSource(run:Run)->bool{return (run.paper.w&'+SOURCE_COARSE_CONTOUR_FLAG+'u)!=0u&&(run.paper.w&0xf0000000u)==0u;}\nfn contourNativeBankCovered(run:Run)->bool{return contourSource(run)&&farNativeWholeAdmission(run);}';
+ const prepare=isolateComputeEntry(lowerPrepareProfileLoops(planPrepare(source,admission),bounds),'featurefarPrepare');
  const terrain=emitter(source,'featurefarTerrain',1),standing=isolateComputeEntry(lowerStandingProfileLoops(rawStanding,bounds),'featurefarStanding');
  return {prepare,terrain,standing,entries:[{entryPoint:'featurefarPrepare',code:prepare},{entryPoint:'featurefarTerrain',code:terrain},{entryPoint:'featurefarStanding',code:standing}]};
 }
@@ -319,28 +332,6 @@ function cooperativeStanding(standing:string,canonical:string):string{
  // table for the role/context record; `entryRef` is an opaque source token and
  // is never treated as an index into the native grammar bank.
  const nativeBridge=`
-// A closed principal contour may not fit a resident whole-part entry. It
-// nevertheless already owns a complete ordered source passage. Route
-// that packet through MAIN's canonical hard-boundary/native grammar consumer;
-// never convert it to the neutral skyline or a per-edge search.
-fn farSourceContourNative(runID:u32,run:Run,priority:u32)->bool{
- var live=false;
- for(var pair=0u;pair*2u+1u<run.range.y;pair++){
-  let a=points[run.range.x+pair*2u];let b=points[run.range.x+pair*2u+1u];
-  if(pointVisible(a)&&pointVisible(b)&&length(b.position.xy-a.position.xy)>=1.0){live=true;}
- }
- if(!live){return false;}
- farSourceContourEmitted=false;
- hardBoundaryConstruction(runID,run,priority,false);return farSourceContourEmitted;
-}
-// Only a refused job reads this compact list. Keep the exact source owner,
-// not a global invalid-source bit: visibility/placement is camera-local.
-fn farRecordContourRetry(run:Run){
- let base=p.farLoops.w+p.extent.z*${FAR_PLAN_WORDS}u;
- let slot=atomicAdd(&counts[base],1u);
- if(slot<p.standing.w){let row=p.standing.y+slot/p.standing.z;let field=(slot%p.standing.z)*2u;rowWords[row].data[field]=run.identity.y;rowWords[row].data[field+1u]=run.identity.z;}
- atomicOr(&counts[rowCount()],${SOURCE_CONTOUR_NATIVE_RETRY}u);
-}
 fn farPartDirection(delta:vec2f)->u32{return u32(round(fract(atan2(delta.y,delta.x)/6.28318530718+1.0)*8.0))&7u;}
 fn farPartContext(run:Run)->u32{
  let contextClass=(run.part.y>>6u)&7u;if(contextClass==0u||run.range.y<2u){return 0u;}
@@ -436,9 +427,7 @@ fn farNativePart(runID:u32,run:Run,priority:u32)->bool{
  if(farNativeWholePart(runID,run,priority)){return true;}
  let sourceContour=(run.paper.w&${SOURCE_COARSE_CONTOUR_FLAG}u)!=0u&&
   (run.paper.w&0xf0000000u)==0u;
- if(!sourceContour){return false;}
- if(farSourceContourNative(runID,run,priority)){return true;}
- farRecordContourRetry(run);
+ if(sourceContour){farRecordContourRetry(run);}
  return false;
 }
 // A compound parent is one coherent source product: ordinary outer passages
@@ -509,40 +498,8 @@ fn farCompoundParent(runID:u32,run:Run,priority:u32)->bool{
   ['wholeHeightCachePivot','var<private> wholeHeightCachePivot:i32=0;'],
  ].filter(([name])=>!standing.includes('var<private> '+name+':')).map(([,declaration])=>declaration).join('\n');
  const wordConstant=standing.includes('const NATIVE_ROW_NONE:')?'':'\nconst NATIVE_ROW_NONE:u32=0xffffffffu;\n';
- const declarations=`var<workgroup> farCachedCells:array<SkyCell,${cells}>;\nvar<workgroup> farWorkgroupKind:u32;\nvar<private> farCacheBase:i32;\n// hardBoundaryConstruction's source-edge closure is retained in the isolated\n// far stage; keep its invocation-local cache in the same private address space.\nvar<private> softBlockCacheBase:u32=0xffffffffu;\nvar<private> softBlockCacheCount:u32;\nvar<private> softBlockCacheBounds:vec2u;\nvar<private> boxHold:array<vec4i,24>;\nvar<private> boxHolds:u32;\nvar<private> boxDrawn:array<u32,8>;\nvar<private> boxRowLid:array<vec4f,16>;\nvar<private> boxRowLids:u32;\n`+wordState+wordConstant;
- // This closed stage calls only the non-volume boundary construction. Remove
- // both impossible volume branches before closure extraction, rather than
- // making the phone driver compile planar fans and tiny-box stamps anyway.
- let contourBoundary=functionText(canonical,'hardBoundaryConstruction');
- for(let removed=0;removed<2;removed++){
-  const masked=codeMask(contourBoundary),start=masked.indexOf('if(volume&&');
-  if(start<0)throw Error('Missing source contour non-volume branch');
-  const open=masked.indexOf('{',start),end=blockEnd(masked,open);
-  contourBoundary=contourBoundary.slice(0,start)+contourBoundary.slice(end);
- }
- if(codeMask(contourBoundary).includes('if(volume&&'))throw Error('Unexpected source contour volume branch');
- contourBoundary=contourBoundary.replace('!volume&&!faceRun','!faceRun')
-  .replace('select(edgeKey<<12u,0u,volume)','edgeKey<<12u')
-  .replace('select(lidKey<<12u,0u,volume)','lidKey<<12u');
- let contourCanonical=replaceFunction(canonical,'hardBoundaryConstruction',contourBoundary);
- // Functional submission result, invocation-local: a visible source edge is
- // not proof that the native boundary actually queued a word. No global count
- // can answer that question while other source invocations run concurrently.
- const emit=functionText(contourCanonical,'emitMapped'),record=' let at=p.proposals.x+slot*';
- contourCanonical=replaceFunction(contourCanonical,'emitMapped',once(emit,record,' farSourceContourEmitted=true;\n'+record));
- if(codeMask(standing).includes('fn emitMapped(')){
-  let standingEmit=functionText(standing,'emitMapped');
-  // This producer now writes boxHold; the earlier far-only zero-writer fold
-  // is no longer legal. Restore that reader before proposals are queued.
-  if(!codeMask(standingEmit).includes('k<boxHolds;')){
-   const original=codeMask(emit),start=original.indexOf('for(var k=0u;k<boxHolds;k++){');
-   if(start<0)throw Error('Missing canonical source contour hold reader');
-   const open=original.indexOf('{',start),end=blockEnd(original,open);
-   standingEmit=once(standingEmit,' let slot=atomicAdd(&counts[p.proposals.z],1u);',emit.slice(start,end)+'\n let slot=atomicAdd(&counts[p.proposals.z],1u);');
-  }
-  standing=replaceFunction(standing,'emitMapped',once(standingEmit,record,' farSourceContourEmitted=true;\n'+record));
- }
- const canonicalFunctions=retainCanonicalFunctions(contourCanonical,standing,['hardBoundaryConstruction','softPartRecord','markSoftPartPaper','wholePartRowGrowth','wholePartAtomX','wholePartMember','spanPartWord','spanPartSourceWord','interpolatePoint',
+ const declarations=`var<workgroup> farCachedCells:array<SkyCell,${cells}>;\nvar<workgroup> farWorkgroupKind:u32;\nvar<private> farCacheBase:i32;\n// Native whole-part and retry consumers share the existing invocation-local caches.\n// The hard-boundary producer is owned by PATH hard, not this far-standing stage.\nvar<private> softBlockCacheBase:u32=0xffffffffu;\nvar<private> softBlockCacheCount:u32;\nvar<private> softBlockCacheBounds:vec2u;\nvar<private> boxHold:array<vec4i,24>;\nvar<private> boxHolds:u32;\nvar<private> boxDrawn:array<u32,8>;\nvar<private> boxRowLid:array<vec4f,16>;\nvar<private> boxRowLids:u32;\n`+wordState+wordConstant;
+ const canonicalFunctions=retainCanonicalFunctions(canonical,standing,['softPartRecord','markSoftPartPaper','wholePartRowGrowth','wholePartAtomX','wholePartMember','spanPartWord','spanPartSourceWord','interpolatePoint',
   'wholePartHeightRowsFit','nativeWholeRowsFit','nativeWholeEmit','nativeWholeRow']);
- return isolateComputeEntry(standing+'\n'+nativeBridge+'\n'+SMALL_CONSTRUCTION_WGSL+'\n'+canonicalFunctions+'\n'+base+'\n'+compute+'\n'+declarations+'\nvar<private> farSourceContourEmitted:bool;\n'+WORKGROUP_SCHEDULER_WGSL,'featurefarStanding');
+ return isolateComputeEntry(standing+'\n'+nativeBridge+'\n'+CONTOUR_RETRY_WGSL+'\n'+SMALL_CONSTRUCTION_WGSL+'\n'+canonicalFunctions+'\n'+base+'\n'+compute+'\n'+declarations+'\n'+WORKGROUP_SCHEDULER_WGSL,'featurefarStanding');
 }

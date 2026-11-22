@@ -335,15 +335,16 @@ fn appendQueue(family:u32,id:u32,capacity:u32){
   let boundary=select(raw&0x4120000u,0u,anchor);
   appendQueue(QUEUE_MEMO,i,sourceCount);appendQueue(QUEUE_FAR_PREPARE,i,sourceCount);
   let paired=(raw&0x1000000u)!=0u;
+  let farKind=atomicLoad(&counts[p.farLoops.w+i*8u]);let contourPathHard=farKind==4u;
   var family=select(select(QUEUE_PATH,QUEUE_ROUND,(boundary&0x20000u)!=0u),QUEUE_PLANAR,(boundary&0x4100000u)!=0u);
   // Authored pairs have a dedicated consumer, but deliberately share the
   // existing PATH queue. Do not let a future boundary bit route them to a
   // generic family and leave the pair pipeline unscheduled.
-  if(paired){family=QUEUE_PATH;}
+  // Authored pairs and uncovered source contours share the existing PATH queue.
+  if(paired||contourPathHard){family=QUEUE_PATH;}
   appendQueue(family,i,sourceCount);
-  let farKind=atomicLoad(&counts[p.farLoops.w+i*8u]);
   if(farKind==1u){appendQueue(QUEUE_FAR_TERRAIN,i,sourceCount);}
-  if(farKind==3u){appendQueue(QUEUE_FAR_STANDING,i,sourceCount);}
+  if(farKind==3u&&!contourPathHard){appendQueue(QUEUE_FAR_STANDING,i,sourceCount);}
   return;
  }
  if(i<sourceCount+labelCount){appendQueue(QUEUE_LABEL,i,labelCount);return;}
@@ -782,8 +783,8 @@ export function nativeSourceWordGroupId(input:{readonly owner:string;readonly ki
  return `${input.owner}/gpu-run/${input.kind>>>0}/${input.context>>>0}${stableSource}${input.contact}`;
 }
 /** Append the immutable source edge/unit address to a source-word group. */
-export function nativeSourceWordOccurrenceId(group:string,sourceEdge:number,unit:number,sourceScalar:number):string{
- return `${group}${sourceEdge!==0xffffffff?`/edge-${sourceEdge>>>0}`:''}/unit-${unit>>>0}/${sourceScalar>>>0}`;
+export function nativeSourceWordOccurrenceId(group:string,sourceEdge:number,unit:number,sourceScalar:number,sourceLocal=false):string{
+ return `${group}${sourceEdge!==0xffffffff?`/${sourceLocal?'local-edge':'edge'}-${sourceEdge>>>0}`:''}/unit-${unit>>>0}/${sourceScalar>>>0}`;
 }
 /** Ports of old MAIN featurecurves/featureplace. Expressive decisions are
  * immutable grammar records. A run looks up its instruction ONCE; its units
@@ -1705,6 +1706,13 @@ fn gridCell(grid:u32,x:f32,row:i32)->u32{
 fn gridDir(d:vec2f)->u32{return u32(round(fract(atan2(d.y,d.x)/3.14159265359+1.0)*16.0))&15u;}
 var<private> gridKeyBase:u32;
 var<private> collapseDir:u32;
+// A hard producer can carry a local source-edge key without claiming that key
+// is an authored feature ID. The producer sets this per invocation immediately
+// around sourceWord; emitMapped publishes the explicit local flag in the
+// existing proposal metadata and then the row record keeps the same domain.
+var<private> mappedSourceEdge:u32;
+var<private> mappedSourceLocal:bool;
+var<private> mappedSourceOwned:bool;
 fn gridWrite(run:Run,rank:u32){
  let terrain=terrainRun(run);
  let tag=select((((run.identity.y*0x9e3779b9u)^(run.identity.z*0x85ebca6bu))>>24u)&0xfeu,0xffu,terrain);
@@ -1839,7 +1847,7 @@ fn sourceGlyphVisible(run:Run,x:i32,row:i32,glyph:u32,a:Point,b:Point)->bool{
  // visible neighbors retain the selected word's pens and scalar addresses.
  return visible*2u>pixels;
 }
-fn emitRecord(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,part:u32,depth:f32,sourceScalar:u32,sourceEdge:u32,sourceContext:u32){
+fn emitRecord(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,part:u32,depth:f32,sourceScalar:u32,sourceEdge:u32,sourceContext:u32,sourceLocal:bool){
  let slot=atomicAdd(&counts[u32(row)],1u);
  atomicMax(&counts[rowCount()+3u],slot+1u);
  if(slot>=rowLimit(u32(row))){atomicOr(&counts[rowCount()],1u);return;}
@@ -1852,7 +1860,7 @@ fn emitRecord(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u
  // NOT an edge identity. Carry the exact source address beside the local
  // unit ordinal through scalar cuts, publication and explicit export.
  // These two fields are region coordinates for part 3, edge/tag for part 0.
- w.data[14]=select(sourceEdge,0u,sourceEdge==NONE);w.data[15]=u32(sourceEdge!=NONE);
+ w.data[14]=select(sourceEdge,0u,sourceEdge==NONE);w.data[15]=select(0u,select(1u,2u,sourceLocal),sourceEdge!=NONE);
  w.data[16]=sourceContext;
  rowWords[at]=w;
 }
@@ -1862,6 +1870,12 @@ fn emit(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u32,adv
 }
 fn sourceWord(id:u32,ordinal:u32,q:vec4f,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,a:Point,b:Point){
  emitMapped(id,ordinal,q.w,x,row,word,count,advance,priority,0u,q.z,a,b,true);
+}
+fn sourceWordLocal(id:u32,ordinal:u32,q:vec4f,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,a:Point,b:Point,sourceKey:u32){
+ mappedSourceEdge=sourceKey;mappedSourceLocal=pointFeatureId(a)==NONE;
+ mappedSourceOwned=true;
+ sourceWord(id,ordinal,q,x,row,word,count,advance,priority,a,b);
+ mappedSourceEdge=NONE;mappedSourceLocal=false;mappedSourceOwned=false;
 }
 fn spanWord(id:u32,ordinal:u32,q:vec4f,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,pair:u32){
  spanPartWord(id,ordinal,q,x,row,word,count,advance,priority,pair,0u);
@@ -1891,24 +1905,24 @@ fn emitMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u
  let slot=atomicAdd(&counts[p.proposals.z],1u);if(slot>=p.proposals.y){return;}
  let at=p.proposals.x+slot*${WORD_PROPOSAL_WORDS}u;
  let collapse=select(0u,gridKeyBase|(collapseDir&15u),gridKeyBase!=0u&&collapseDir!=NONE&&part==0u);
- let data=array<u32,${WORD_PROPOSAL_WORDS}>(runID,ordinal,bitcast<u32>(parameter),bitcast<u32>(x),u32(row),word,count,advance,priority,part,bitcast<u32>(depth),u32(mapped),a.visible.y,b.visible.y,a.visible.w,collapse,
+ let data=array<u32,${WORD_PROPOSAL_WORDS}>(runID,ordinal,bitcast<u32>(parameter),bitcast<u32>(x),u32(row),word,count,advance,priority,part,bitcast<u32>(depth),u32(mapped)|select(0u,2u,mappedSourceLocal)|select(0u,4u,mappedSourceOwned),a.visible.y,b.visible.y,select(a.visible.w,mappedSourceEdge,mappedSourceLocal),collapse,
   bitcast<u32>(a.position.x),bitcast<u32>(a.position.y),bitcast<u32>(a.position.z),bitcast<u32>(a.position.w),
   bitcast<u32>(b.position.x),bitcast<u32>(b.position.y),bitcast<u32>(b.position.z),bitcast<u32>(b.position.w),a.visible.z);
  for(var i=0u;i<${WORD_PROPOSAL_WORDS}u;i++){atomicStore(&counts[at+i],data[i]);}
 }
 // The incumbent whole-word visibility algorithm, unchanged. The only move
 // is its execution owner: one candidate word, not a whole source run.
-fn realizeMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,part:u32,depth:f32,a:Point,b:Point,mapped:bool,collapse:u32){
+fn realizeMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,count:u32,advance:u32,priority:u32,part:u32,depth:f32,a:Point,b:Point,mapped:bool,collapse:u32,sourceLocal:bool,sourceOwned:bool){
 
  // The selection grid (gridWrite): a parallel same-owner line of higher rank
  // holds this cell. The word is that line; recorded, not placed.
  if(gridCollapsed(collapse,x,row,advance)){probeAdd(34u);return;}
  let context=select(0u,a.visible.z,terrainRun(runs[runID])&&a.visible.z!=NONE&&(a.visible.z&0x80000000u)!=0u);
- let sourceEdge=select(NONE,pointFeatureId(a),context!=0u||(mapped&&(wholeBoundaryFlags(runs[runID])&0x100000u)!=0u));
+ let sourceEdge=select(NONE,pointFeatureId(a),sourceOwned||sourceLocal||context!=0u||(mapped&&(wholeBoundaryFlags(runs[runID])&0x100000u)!=0u));
  let source=spanSource(runs[runID],context);
  if(part!=0u){
   if(x>=0&&x+i32(advance)<=i32(p.extent.x)&&visibleWord(source,x,row,word,count,part,depth,0u)){
-   emitRecord(runID,ordinal,parameter,x,row,word,count,advance,priority,part,depth,0u,NONE,0u);
+   emitRecord(runID,ordinal,parameter,x,row,word,count,advance,priority,part,depth,0u,NONE,0u,false);
   }
   return;
  }
@@ -1938,7 +1952,7 @@ fn realizeMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,coun
   pen+=width;
  }
  if(mask==0u){return;}
- if(complete){emitRecord(runID,ordinal,parameter,x,row,word,count,advance,priority,0u,depth,0u,sourceEdge,context);return;}
+ if(complete){emitRecord(runID,ordinal,parameter,x,row,word,count,advance,priority,0u,depth,0u,sourceEdge,context,sourceLocal);return;}
  // A visibility cut changes the visible range of a passage, not its
  // vocabulary or internal spacing. Keep each contiguous visible range as
  // one word-table slice through admission, sealing and export. Empty
@@ -1954,7 +1968,7 @@ fn realizeMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,coun
    if(span==0u){start=scalar;startPen=pen;}
    span=scalar-start+1u;spanAdvance=u32(pen-startPen)+width;
   }else if(hasInk&&span>0u){
-   emitRecord(runID,ordinal,parameter,startPen,row,word,span,spanAdvance,priority,0u,depth,start,sourceEdge,context);
+   emitRecord(runID,ordinal,parameter,startPen,row,word,span,spanAdvance,priority,0u,depth,start,sourceEdge,context,sourceLocal);
    span=0u;
   }
   pen+=i32(width);
@@ -1968,7 +1982,7 @@ fn realizeMapped(runID:u32,ordinal:u32,parameter:f32,x:i32,row:i32,word:u32,coun
  let a=Point(bitcast<vec4f>(vec4u(data[16],data[17],data[18],data[19])),vec4u(0u,data[12],data[24],data[14]));
  let b=Point(bitcast<vec4f>(vec4u(data[20],data[21],data[22],data[23])),vec4u(0u,data[13],0u,0u));
 
- realizeMapped(data[0],data[1],bitcast<f32>(data[2]),bitcast<i32>(data[3]),i32(data[4]),data[5],data[6],data[7],data[8],data[9],bitcast<f32>(data[10]),a,b,data[11]!=0u,data[15]);
+ realizeMapped(data[0],data[1],bitcast<f32>(data[2]),bitcast<i32>(data[3]),i32(data[4]),data[5],data[6],data[7],data[8],data[9],bitcast<f32>(data[10]),a,b,(data[11]&1u)!=0u,data[15],(data[11]&2u)!=0u,(data[11]&4u)!=0u);
 
 }
 struct CircleSection {left:vec4f,right:vec4f,visible:u32}
@@ -2293,7 +2307,7 @@ fn shallowEdgeRow(id:u32,ordinal:u32,a:Point,b:Point,wholeA:Point,wholeB:Point,r
   let q=interpolatePoint(a,b,clamp((f32(x)+f32(advance)*.5-a.position.x)/screenAdvance,0.0,1.0));
 
   // the passage origin and unit ordinals still advance from the whole edge.
-  if(!clipped||hardUnitVisibleX(run,block,f32(x),f32(x+advance))){sourceWord(id,shallowMemberOrdinal(ordinal,k,hard),q,x,row,word,words[word*WS],u32(advance),priority,a,b);}
+  if(!clipped||hardUnitVisibleX(run,block,f32(x),f32(x+advance))){if(hard){sourceWordLocal(id,shallowMemberOrdinal(ordinal,k,hard),q,x,row,word,words[word*WS],u32(advance),priority,a,b,boxEdgeKey(run,block.x));}else{sourceWord(id,shallowMemberOrdinal(ordinal,k,hard),q,x,row,word,words[word*WS],u32(advance),priority,a,b);}}
   x+=advance;
  }
 }
@@ -2985,7 +2999,7 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
    for(var row=visibleRows.x;row<=visibleRows.y;row++){
     if(fragmented&&!hardUnitVisible(run,block,row)){continue;}
     let q=boxEdgeAt(a,b,f32(row)*17.0+8.5);
-    sourceWord(id,ordinal|u32(row-rows.x),q,i32(round(q.x))+offset,row,word,words[word*WS],words[word*WS+1u],priority,a,b);
+    sourceWordLocal(id,ordinal|u32(row-rows.x),q,i32(round(q.x))+offset,row,word,words[word*WS],words[word*WS+1u],priority,a,b,edgeKey/2u);
    }
    continue;
   }
@@ -3008,7 +3022,7 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
      doubled=depth>q.z+.0000001||(abs(depth-q.z)<=.0000001&&j<i);
     }
     if(doubled||(fragmented&&!hardUnitVisible(run,block,row))){continue;}
-    sourceWord(id,ordinal|u32(row-rows.x),q,i32(round(q.x))-1,row,upright,1u,u32(uprightAdvance),priority,a,b);}
+    sourceWordLocal(id,ordinal|u32(row-rows.x),q,i32(round(q.x))-1,row,upright,1u,u32(uprightAdvance),priority,a,b,edgeKey/2u);}
    continue;
   }
   if(kindOf==2u){
@@ -3067,7 +3081,7 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
    let dl=boxDiagonalFrom(run,leftEnd);let dr=boxDiagonalFrom(run,rightEnd);
 
    // rises from the chain's left end; a hidden holder clips its ink only.
-   if(dl==1u){if(faceRun||boxLidUnitInked(run,row,middle,f32(begin),f32(begin+cornerAdvance),fragmented,block)){sourceWord(id,lidOrdinal|0x800u,leftEnd.position,begin,row,corner,1u,u32(cornerAdvance),anchorWeight,leftEnd,rightEnd);}begin+=cornerAdvance;}
+   if(dl==1u){if(faceRun||boxLidUnitInked(run,row,middle,f32(begin),f32(begin+cornerAdvance),fragmented,block)){sourceWordLocal(id,lidOrdinal|0x800u,leftEnd.position,begin,row,corner,1u,u32(cornerAdvance),anchorWeight,leftEnd,rightEnd,lidKey/2u);}begin+=cornerAdvance;}
    else if(boxUprightAt(run,l.x,row)){begin+=uprightAdvance-1;}
    if(dr==2u){finish-=riseAdvance;}else if(dr==0u&&boxUprightAt(run,r.x,row)){finish-=uprightAdvance-1;}
    // Whole ＿ units from the left corner, then the half-width _ remainder at
@@ -3080,9 +3094,9 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
    for(var k=visibleUnits.x;k<visibleUnits.y;k++){let x=origin+i32(k)*fillAdvance;let q=interpolatePoint(leftEnd,rightEnd,clamp((f32(x)+f32(fillAdvance)*.5-l.x)/span,0.0,1.0));
     if(faceRun&&!faceBorders(run,f32(x)+f32(fillAdvance)*.5,q.y)){continue;}
     if(!faceRun&&!boxLidUnitInked(run,row,middle,f32(x),f32(x+fillAdvance),fragmented,block)){continue;}
-    sourceWord(id,lidOrdinal|0x400u|k,q,x,row,lid,1u,u32(fillAdvance),anchorWeight,leftEnd,rightEnd);}
+    sourceWordLocal(id,lidOrdinal|0x400u|k,q,x,row,lid,1u,u32(fillAdvance),anchorWeight,leftEnd,rightEnd,lidKey/2u);}
    if(extra==1u&&(faceRun||boxLidUnitInked(run,row,middle,f32(origin+i32(count)*fillAdvance),f32(origin+i32(count)*fillAdvance+restAdvance),fragmented,block))){let x=origin+i32(count)*fillAdvance;let q=interpolatePoint(leftEnd,rightEnd,clamp((f32(x)+f32(restAdvance)*.5-l.x)/span,0.0,1.0));
-    sourceWord(id,lidOrdinal|0x400u|count,q,x,row,remainder,1u,u32(restAdvance),anchorWeight,leftEnd,rightEnd);}
+    sourceWordLocal(id,lidOrdinal|0x400u|count,q,x,row,remainder,1u,u32(restAdvance),anchorWeight,leftEnd,rightEnd,lidKey/2u);}
    continue;
   }
   // A depth edge: ／ rising to the right or ＼ falling, one unit per row it
@@ -3116,10 +3130,10 @@ fn hardBoundaryConstruction(id:u32,run:Run,priority:u32,volume:bool){
    }
    if(!rising){
     var word=fall;if(travel>=20.0){word=fallTail;}
-    sourceWord(id,ordinal|u32(row-span.x),qt,i32(round(qt.x)),row,word,words[word*WS],words[word*WS+1u],priority,a,b);continue;
+    sourceWordLocal(id,ordinal|u32(row-span.x),qt,i32(round(qt.x)),row,word,words[word*WS],words[word*WS+1u],priority,a,b,edgeKey/2u);continue;
    }
-   if(boxUprightAt(run,qb.x,row)){sourceWord(id,ordinal|u32(row-span.x),qb,i32(round(qb.x))+uprightAdvance-1,row,narrow,1u,u32(words[narrow*WS+1u]),priority,a,b);}
-   else{sourceWord(id,ordinal|u32(row-span.x),qb,i32(round(qb.x)),row,rise,1u,u32(riseAdvance),priority,a,b);}
+   if(boxUprightAt(run,qb.x,row)){sourceWordLocal(id,ordinal|u32(row-span.x),qb,i32(round(qb.x))+uprightAdvance-1,row,narrow,1u,u32(words[narrow*WS+1u]),priority,a,b,edgeKey/2u);}
+   else{sourceWordLocal(id,ordinal|u32(row-span.x),qb,i32(round(qb.x)),row,rise,1u,u32(riseAdvance),priority,a,b,edgeKey/2u);}
   }
  }
 }
@@ -5940,8 +5954,11 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
  let anchorX=runAnchor.position.x;
  let pitch=max(f32(unitAdvance),8.0);
  let lattice=anchorX+floor((enter.x-anchorX)*way/pitch)*pitch*way;
- // Start at the page edge when the portion enters from outside it.
- var pen=select(min(lattice,f32(p.extent.x)+64.0),max(lattice,-64.0),way>0.0);
+ // Skip only whole source units at the viewport. A coordinate clamp changes
+ // the lattice phase as row cuts move; floor keeps the boundary-crossing unit.
+ var pen=lattice;
+ if(way>0.0&&pen< -64.0){pen+=floor((-64.0-pen)/pitch)*pitch;}
+ if(way<0.0&&pen>f32(p.extent.x)+64.0){pen-=floor((pen-f32(p.extent.x)-64.0)/pitch)*pitch;}
  var cursor=startPair;var index=0u;var priorUpright=false;
  for(var guard=0u;guard<512u;guard++){
   let room=(leave.x-pen)*way;
@@ -8833,7 +8850,8 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
     owners.push(receiver);supportOwners.push({reference:receiverLifetime,source:receiverDomain,kind:receiverProducer?'producer-row':'entity'});
     contact=`/receiver-${receiver}/face-${memory[at+30]}/port-${memory[at+31]}`;
    }
-   const sourceEdge=memory[at+9]===0&&memory[at+15]===1;
+   const sourceLocal=memory[at+9]===0&&memory[at+15]===2;
+   const sourceEdge=memory[at+9]===0&&(memory[at+15]===1||sourceLocal);
    // A run with no source address (0: a far form or far aggregate run of the
 
    // of one owner on one page keep distinct occurrence identities (tonemapping
@@ -8851,7 +8869,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
     const spanProducer=!!(encodedSpan&0x80000000),spanLifetime=spanProducer?spanIndex:context.owners.get(spanIndex);
     if(spanLifetime===undefined)throw Error('GPU native span lost its contributor lifetime');
     const spanOwner=`${context.camera}/${spanDomain}/${spanProducer?'producer-row':'entity'}/${spanLifetime}`;
-    contributor=`${spanOwner}/source-edge/${memory[at+14]}`;
+    contributor=`${spanOwner}/${sourceLocal?'local-edge':'source-edge'}/${memory[at+14]}`;
     if(!owners.includes(spanOwner)){owners.push(spanOwner);supportOwners.push({reference:spanLifetime,source:spanDomain,kind:spanProducer?'producer-row':'entity'});}
    }
    let entry=groups.get(id);
@@ -8875,7 +8893,7 @@ const bank=new Uint32Array(foliageAt+this.packed.foliageEdges.length);bank.set(t
    // An address-0 run (far form / far aggregate) can commit one unit ordinal on
 
    // is told apart by its committed-word address (snapshot-local).
-   const ordinal=form===3?`${id}/node-${memory[at+14]}/${memory[at+15]}/${memory[at+22]}/${memory[at+23]}/${row}/word-${index}/${scalar}`:nativeSourceWordOccurrenceId(id,sourceEdge?memory[at+14]!:0xffffffff,memory[at+1]!,sourceScalar)+(snapshotLocal?`/word-${index}`:'');
+   const ordinal=form===3?`${id}/node-${memory[at+14]}/${memory[at+15]}/${memory[at+22]}/${memory[at+23]}/${row}/word-${index}/${scalar}`:nativeSourceWordOccurrenceId(id,sourceEdge?memory[at+14]!:0xffffffff,memory[at+1]!,sourceScalar,sourceLocal)+(snapshotLocal?`/word-${index}`:'');
     // Publication shades from this committed word. Export must retain the
     // same packed RGBA value; omitting it makes NativePresentation default
     // every decoded GPU occurrence to black.
