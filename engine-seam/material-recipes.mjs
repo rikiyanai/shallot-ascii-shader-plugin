@@ -137,21 +137,35 @@ const SET_PIPELINE = 0;`);
  return ENGINE_MARK+"\nimport type {RenderPipelineRecipe} from '../../engine/runtime/pipeline-source';\n"+s;
 }
 export function materialWarmSource(s){
- if(s.includes(ENGINE_MARK))return s;
+ if(s.includes(ENGINE_MARK)){
+  // --refresh also materializes over an existing patched install. Do not
+  // attest the old captured-primary race merely because its marker exists.
+  const captured='const primary=world.resource(PhaseGeometryCapture).isPrimary?.()===true;';
+  const live='const isPrimary=()=>world.resource(PhaseGeometryCapture).isPrimary?.()===true;';
+  if(s.includes(captured)){
+   s=engineOnce(s,captured,live);
+   s=engineOnce(s,'pending = primary&&beauty.has(pipeline)','pending = isPrimary()&&beauty.has(pipeline)');
+  }else if(!s.includes(live))throw Error('Missing patched material warm primary owner');
+  return s;
+ }
  // Scope every edit to the existing warm owner, not other pipeline factories.
  const a=s.indexOf('export async function prepareMaterialTypes('),b=s.indexOf('\n/* TRUEFF_MAIN_GEOMETRY_',a);
  if(a<0||b<0)throw Error('Missing current material warm owner');
  let warm=s.slice(a,b);
  warm=engineOnce(warm,'    const pipelines = new Map<TgpuRenderPipeline<any>, string>();',`    const pipelines = new Map<TgpuRenderPipeline<any>, string>();
     const beauty=new Set<TgpuRenderPipeline<any>>(),nativeRequired=new Set<TgpuRenderPipeline<any>>();
-    const primary=world.resource(PhaseGeometryCapture).isPrimary?.()===true;`);
+    // MAIN and StandardRendering warm concurrently. MAIN installs its primary
+    // predicate after its own GPU preparation, before the app drains this
+    // queue. Read it at init time, not while StandardRendering is still
+    // warming, or the shared precompile drain compiles unused beauty PSOs.
+    const isPrimary=()=>world.resource(PhaseGeometryCapture).isPrimary?.()===true;`);
  warm=engineOnce(warm,'                    if (pipeline) pipelines.set(pipeline, type.name);','                    if (pipeline) {pipelines.set(pipeline, type.name);nativeRequired.add(pipeline);}');
  warm=engineOnce(warm,'                for (const p of [\n                    compiled.color,',`                for(const p of [compiled.color,compiled.transparent,compiled.single?.color,compiled.single?.transparent,compiled.stacked])if(p)beauty.add(p);
                 for(const p of [compiled.point,compiled.cascade,compiled.prepass,compiled.prepassSingle])if(p)nativeRequired.add(p);
                 for (const p of [
                     compiled.color,`);
  warm=engineOnce(warm,'        pipelines.set(cb.single, bg.name);','        pipelines.set(cb.single, bg.name);\n        beauty.add(cb.color);beauty.add(cb.single);');
- warm=engineOnce(warm,'                        pending = pipeline.initAsync();',`                        pending = primary&&beauty.has(pipeline)&&!nativeRequired.has(pipeline)
+ warm=engineOnce(warm,'                        pending = pipeline.initAsync();',`                        pending = isPrimary()&&beauty.has(pipeline)&&!nativeRequired.has(pipeline)
                             ? Promise.resolve(prepareRenderPipelineRecipe(pipeline))
                             : pipeline.initAsync();`);
  return ENGINE_MARK+"\nimport {PhaseGeometryCapture} from '../../core/rendering/phase-geometry';\nimport {prepareRenderPipelineRecipe} from '../../engine/runtime/pipeline-source';\n"+s.slice(0,a)+warm+s.slice(b);

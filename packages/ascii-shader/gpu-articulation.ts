@@ -4085,6 +4085,10 @@ fn markSoftPartPaperAt(record:u32,origin:i32,row:i32,nativeRow:i32,growth:vec4u,
  }
 }
 fn sourcePartDirection(delta:vec2f)->u32{return u32(round(fract(atan2(delta.y,delta.x)/6.28318530718+1.0)*8.0))&7u;}
+fn sourcePartDirectionVector(direction:u32)->vec2f{
+ let angle=f32(direction&7u)*.7853981633974483;
+ return vec2f(cos(angle),sin(angle));
+}
 // Canonical source passages are projected into the camera-owned part-anchor
 // snapshot by SurfaceRelations. The snapshot header keeps the raw table's
 // canonical offset/count/stride in words 5..7; these words are deliberately
@@ -4420,6 +4424,18 @@ fn sourcePartCanonicalOrigin(run:Run)->Point{
  let descriptor=sourcePartCanonicalPair(run,partAnchorWord(at+5u),partAnchorWord(at+6u));if(descriptor.x==NONE){return finiteRunStart(run);}
  let clip=vec4f(bitcast<f32>(partAnchorWord(at)),bitcast<f32>(partAnchorWord(at+1u)),bitcast<f32>(partAnchorWord(at+2u)),bitcast<f32>(partAnchorWord(at+3u)));
  let source=runs[descriptor.x];return sourcePartCanonicalPoint(clip,bitcast<f32>(partAnchorWord(at+4u)),points[source.range.x+descriptor.y*2u]);
+}
+// The matching terminal sample of the immutable canonical passage. A visible
+// fragment may end at any clipped interval, so finiteRunEnd is not a source
+// endpoint for a programmed passage. Keep the fallback only for a malformed
+// or unavailable packet; callers select this helper only after the canonical
+// playable verdict has been published.
+fn sourcePartCanonicalTerminal(run:Run)->Point{
+ let range=sourcePartCanonicalRangeCached(run);if(range.x==NONE||range.y<2u){return finiteRunEnd(run);}
+ let at=sourcePartCanonicalRowAddress(range,range.y-1u);
+ let descriptor=sourcePartCanonicalPair(run,partAnchorWord(at+5u),partAnchorWord(at+6u));if(descriptor.x==NONE){return finiteRunEnd(run);}
+ let clip=vec4f(bitcast<f32>(partAnchorWord(at)),bitcast<f32>(partAnchorWord(at+1u)),bitcast<f32>(partAnchorWord(at+2u)),bitcast<f32>(partAnchorWord(at+3u)));
+ let source=runs[descriptor.x];return sourcePartCanonicalPoint(clip,bitcast<f32>(partAnchorWord(at+4u)),points[source.range.x+descriptor.y*2u+1u]);
 }
 fn sourcePartCanonicalDirections(source:Run)->vec2u{
  let range=sourcePartCanonicalRangeCached(source);if(range.x==NONE||range.y<2u||(range.z&SOURCE_PART_CANONICAL_FLAG_CONTEXT)==0u){return vec2u(NONE);}
@@ -5636,6 +5652,22 @@ fn softRetainedRecordPresent(record:u32)->bool{
 const SOFT_RETAINED_PASSAGE_GENERIC=0u;
 const SOFT_RETAINED_PASSAGE_PAIR=1u;
 const SOFT_RETAINED_PASSAGE_FOLIAGE=2u;
+// One source-owned chord for every retained decision. Programmed runs use the
+// validated canonical packet; legacy runs retain the finite fragment chord.
+// Keeping this in one helper prevents D5 admission and passage classification
+// from observing different visibility fragments of the same source feature.
+fn softRetainedSourceChord(run:Run)->vec2f{
+ let canonical=runProgramFeature(run)!=0u&&(run.range.z&0x40000u)==0u&&sourcePartCanonicalPlayable(run);
+ var sourceA=finiteRunStart(run);var sourceB=finiteRunEnd(run);
+ if(canonical){sourceA=sourcePartCanonicalOrigin(run);sourceB=sourcePartCanonicalTerminal(run);}
+ var chord=sourceB.position.xy-sourceA.position.xy;
+ if(canonical&&length(chord)<.00001){
+  let directions=sourcePartCanonicalDirections(run);
+  if(directions.y!=NONE){chord=sourcePartDirectionVector(directions.y);}
+  else if(directions.x!=NONE){chord=-sourcePartDirectionVector(directions.x);}
+ }
+ return chord;
+}
 // Admit the retained source spelling once per programmed run.  The source
 // instruction owns the column/phase; D5 may replace that one complete native
 // word with the compiled safe alternative, but a destination row or visibility
@@ -5659,7 +5691,7 @@ fn softRetainedSourcePrepare(table:u32,run:Run,size:u32,instruction:u32)->bool{
  // the incumbent's legacy D5 path. Reject this replacement as a whole so that
  // the complete incumbent (including its D5 rules) remains responsible.
  if(!softD5TableReady()){softRetainedRecord=NONE;softRetainedUnit=NONE;return false;}
- let chord=finiteRunEnd(run).position.xy-finiteRunStart(run).position.xy;
+ let chord=softRetainedSourceChord(run);
  if(exactUpright){
   let shallow=softD5Record(table,softD5Want(table,runRole(run),size,softRetainedDirection,softRetainedPhase,chord,false));
   if(!softRetainedRecordPresent(shallow)||uprightWord(grammar[shallow])){softRetainedRecord=NONE;softRetainedUnit=NONE;return false;}
@@ -5678,7 +5710,7 @@ fn softRetainedSourcePrepare(table:u32,run:Run,size:u32,instruction:u32)->bool{
 // foliage side used by every row. Visibility fragments never enter this choice.
 fn softRetainedPassagePrepare(run:Run){
  softRetainedPassage=SOFT_RETAINED_PASSAGE_GENERIC;softRetainedPairRecord=NONE;softRetainedFoliageSide=4u;
- let sourceChord=finiteRunEnd(run).position.xy-finiteRunStart(run).position.xy;
+ let sourceChord=softRetainedSourceChord(run);
  if(limbPairable(run)&&lineTier==0u){
   let rowLean=sourceChord.x*17.0/max(abs(sourceChord.y),.0001)*sign(sourceChord.y);
   var leanClass=2u;
@@ -6281,6 +6313,12 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
  var run=runs[runID];if(run.range.y==0u){return;}
  gridKeyBase=0u;collapseDir=NONE;
  let first=finiteRunStart(run).position;let last=finiteRunEnd(run).position;
+ let canonicalCandidate=runProgramFeature(run)!=0u&&(run.range.z&0x40000u)==0u&&sourcePartCanonicalPlayable(run);
+ var canonicalDirections=vec2u(NONE);
+ if(canonicalCandidate){canonicalDirections=sourcePartCanonicalDirections(run);}
+ let canonicalContext=canonicalCandidate&&canonicalDirections.x!=NONE&&canonicalDirections.y!=NONE;
+ var contextFirst=first;var contextLast=last;var contextDirections=vec2u(NONE);
+ if(canonicalContext){contextFirst=sourcePartCanonicalOrigin(run).position;contextLast=sourcePartCanonicalTerminal(run).position;contextDirections=canonicalDirections;}
  let anchorOnly=(run.range.z&0x10000u)!=0u;
  let boundary=wholeBoundaryFlags(run);
  for(var i=0u;i<run.range.y;i++){if(pointVisible(points[run.range.x+i])){atomicOr(&counts[drawnSlot(run)],0x80000000u);break;}}
@@ -6391,7 +6429,7 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
  }}
  if(anchorOnly){if(run.part.y==0u&&pointVisible(finiteRunStart(run))){atomicAdd(&counts[rowCount()+1u],1u);probeAdd(0u);}return;}
  if(run.range.y<2u){return;}
- let delta=last.xy-first.xy;if(length(delta)<.00001){return;}
+ let delta=last.xy-first.xy;if(length(delta)<.00001&&!canonicalContext){return;}
  var straightVertical=true;var bent=false;var monotone=true;var havePrevious=false;var previousY=first.y;
  for(var i=0u;i<run.range.y;i++){
   let point=points[run.range.x+i];if(pointWholeEdgeDescriptor(point)){continue;}
@@ -6400,6 +6438,28 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
   if(havePrevious){monotone=monotone&&(q.y-previousY)*sign(delta.y)>=-.00001;}
   previousY=q.y;havePrevious=true;
  }
+ var activeDelta=delta;
+ if(canonicalContext){
+  // A validated programmed source owns its complete posed span. Endpoint
+  // directions distinguish a genuine source turn without allowing a clipped
+  // fragment to reclassify the run; the legacy path above retains its exact
+  // point walk and visibility behaviour.
+  activeDelta=contextLast.xy-contextFirst.xy;
+  if(length(activeDelta)<.00001){
+   // Closed/returning projected passages still have a validated source
+   // tangent. Keep the construction alive rather than turning a coincident
+   // endpoint projection into a blank frame.
+   if(contextDirections.y!=NONE){activeDelta=sourcePartDirectionVector(contextDirections.y);}
+   else if(contextDirections.x!=NONE){activeDelta=-sourcePartDirectionVector(contextDirections.x);}
+   else{activeDelta=delta;}
+  }
+  straightVertical=abs(activeDelta.x)*17.0<=abs(activeDelta.y);
+  // The packet stores the incoming tangent pointing into the source's first
+  // anchor and the outgoing tangent pointing out of its last anchor. A
+  // straight path therefore has opposite encoded bins, not equal bins.
+  bent=contextDirections.x!=NONE&&contextDirections.y!=NONE&&contextDirections.x!=((contextDirections.y+4u)&7u);
+  monotone=true;
+ }
  // Practitioner upright run: a posed WORLD-UP edge keeps its identity while
  // its perspective lean is below half a native cell advance per row.
  // Perspective lean accumulates over a tall edge; it is not a reason to
@@ -6407,24 +6467,24 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
  // genuinely diagonal hard edges do not acquire upright permission.
  if((run.range.z&0x40000u)!=0u&&!bent){
   let lean=select(1.0,5.5,(run.range.z&0x80000u)!=0u);
-  straightVertical=abs(delta.x)*17.0<=abs(delta.y)*lean;
+  straightVertical=abs(activeDelta.x)*17.0<=abs(activeDelta.y)*lean;
  }
  // A straight SOFT edge (the side of a post or a trunk) leaning at most one
  // dot per row is the practitioner upright run too; the playback moves the
  // unit by that shift. A curved run never qualifies (UPRIGHT_RUN).
- if((run.range.z&0x40000u)==0u&&!bent){straightVertical=abs(delta.x)*17.0<=abs(delta.y);}
+ if((run.range.z&0x40000u)==0u&&!bent){straightVertical=abs(activeDelta.x)*17.0<=abs(activeDelta.y);}
  // Current geometry decides the grammar, not silhouette vs occluding label.
  let articulated=!straightVertical||bent;
- let direction=normalize(delta);let angle=atan2(direction.y,direction.x);
+ let direction=normalize(activeDelta);let angle=atan2(direction.y,direction.x);
  var dir=u32(round(fract(angle/6.28318530718+1.0)*64.0))&63u;
  let hardLine=(run.range.z&0x40000u)!=0u&&!bent;
- let horizontal=hardLine&&abs(delta.y)<=.5;
- if((run.range.z&0x40000u)!=0u&&straightVertical&&!bent){dir=select(48u,16u,delta.y>0.0);}
- if(horizontal){dir=select(32u,0u,delta.x>0.0);}
+ let horizontal=hardLine&&abs(activeDelta.y)<=.5;
+ if((run.range.z&0x40000u)!=0u&&straightVertical&&!bent){dir=select(48u,16u,activeDelta.y>0.0);}
+ if(horizontal){dir=select(32u,0u,activeDelta.x>0.0);}
  // Direction quantization must not turn a visibly shallow slant into the
  // flat underscore program. Keep it in the shallow-line family instead.
  if(hardLine&&!horizontal&&(dir==0u||dir==32u)){
-  dir=select(select(33u,31u,delta.y>0.0),select(63u,1u,delta.y>0.0),delta.x>0.0);
+  dir=select(select(33u,31u,activeDelta.y>0.0),select(63u,1u,activeDelta.y>0.0),activeDelta.x>0.0);
  }
  let soft=!hardLine&&(run.range.y&1u)==0u;
  var softPhaseAnchor=first.y;
@@ -6483,7 +6543,7 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
   let unitWord=select(word,grammar[instruction+4u],wholeSlope);
   let unitCount=words[unitWord*WS];let unitAdvance=words[unitWord*WS+1u];
   let unitOffset=select(offset,bitcast<i32>(grammar[instruction+5u]),wholeSlope);
-  var segment=select(run.range.y-2u,0u,delta.y>0.0);
+  var segment=select(run.range.y-2u,0u,activeDelta.y>0.0);
   for(var row=max(0,firstRow);row<min(i32(rowCount()),endRow);row++){
    let lower=max(low,f32(row)*17.0);let upper=min(high,f32(row+1)*17.0);
    let y=clamp(f32(row)*17.0+8.5,lower,upper);
@@ -6494,9 +6554,9 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
    var found=false;
    loop{
     let a=points[run.range.x+segment].position.y;let b=points[run.range.x+segment+1u].position.y;
-    let lastSpan=select(segment==0u,segment+2u>=run.range.y,delta.y>0.0);
+    let lastSpan=select(segment==0u,segment+2u>=run.range.y,activeDelta.y>0.0);
     if(abs(b-a)>.00001&&y>=min(a,b)&&(y<max(a,b)||(lastSpan&&y<=max(a,b)))){found=true;break;}
-    if(lastSpan){break;}if(delta.y>0.0){segment+=2u;}else{segment-=2u;}
+    if(lastSpan){break;}if(activeDelta.y>0.0){segment+=2u;}else{segment-=2u;}
    }
    if(!found){continue;}
    let pa=points[run.range.x+segment];let pb=points[run.range.x+segment+1u];
@@ -6505,7 +6565,7 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
    // unit in the row. Keep the selected passage and cut its members against
    // the source span below; soft paths retain their interval semantics.
    let t=clamp((y-pa.position.y)/(pb.position.y-pa.position.y),0.0,1.0);let q=interpolatePoint(pa,pb,t);
-   let x0=first.x+(lower-first.y)*delta.x/delta.y;let x1=first.x+(upper-first.y)*delta.x/delta.y;
+   let x0=first.x+(lower-first.y)*activeDelta.x/activeDelta.y;let x1=first.x+(upper-first.y)*activeDelta.x/activeDelta.y;
    // Shallow HARD edges retain their horizontal repeat span. A steep path
    // carries exactly one complete grammar unit, never an ink-length quota.
    let units=select(1u,max(1u,u32(ceil(abs(x1-x0)/f32(unitAdvance)))),shallow&&!wholeSlope);
@@ -6513,7 +6573,7 @@ fn rowUnitVisible(run:Run,r0:f32,r1:f32,shallow:bool,lo:f32,hi:f32,fallback:bool
    // A graded unit carries the WHOLE row's rise. Keep its row-centre pen
    // even when only an endpoint fragment survives: clipping changes visible
    // members, not the phase/placement of the surviving construction.
-   if(wholeSlope){origin=first.x+(f32(row)*17.0+8.5-first.y)*delta.x/delta.y;}
+   if(wholeSlope){origin=first.x+(f32(row)*17.0+8.5-first.y)*activeDelta.x/activeDelta.y;}
    for(var unit=0u;unit<units;unit++){
 
     // unit is named by its row relative to the run's first source point and its

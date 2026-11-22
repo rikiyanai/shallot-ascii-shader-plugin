@@ -5,6 +5,10 @@ import type {
  SourceWholePartRole,
  SourceWholePoint,
 } from './source-lod.ts';
+import {
+ unionSourceComponentContours,
+ type SourceComponentContour,
+} from './source-component-union.ts';
 
 /**
  * MAIN source-owned coherent parent compiler.
@@ -166,6 +170,18 @@ const mix=(hash:number,word:number):number=>Math.imul((hash^(word>>>0))>>>0,1677
 const featureHash=(features:readonly number[],revision:number):number=>{
  let hash=2166136261>>>0;hash=mix(hash,revision);for(const feature of features)hash=mix(hash,feature);return hash||1;
 };
+const canonicalFeatureAliases=(values:readonly {readonly retained:number;readonly aliases:readonly number[]}[]):{readonly retained:number;readonly aliases:readonly number[]}[]=>{
+ const groups:number[][]=[];
+ for(const value of values){
+  const members=[value.retained,...value.aliases].sort((left,right)=>left-right),matches:number[]=[];
+  for(let index=0;index<groups.length;index++)if(members.some(member=>groups[index]!.includes(member)))matches.push(index);
+  if(!matches.length){groups.push([...new Set(members)]);continue;}
+  const merged=[...members];for(const index of matches)merged.push(...groups[index]!);
+  const keep=matches[0]!;groups[keep]=[...new Set(merged)].sort((left,right)=>left-right);
+  for(let index=matches.length-1;index>0;index--)groups.splice(matches[index]!,1);
+ }
+ return groups.filter(group=>group.length>1).map(group=>({retained:group[0]!,aliases:group.slice(1)}));
+};
 
 interface SegmentRecord {
  readonly first:SourceWholePoint;
@@ -193,6 +209,7 @@ interface PartSegment {
 
 interface PartWork {
  readonly part:SourceWholePartRef;
+ readonly member:CoherentParentMember;
  readonly pose:ArrayLike<number>;
  readonly segments:readonly PartSegment[];
  readonly plane?:Plane;
@@ -224,10 +241,11 @@ const planeFromPoints=(points:readonly SourceWholePoint[]):Plane|undefined=>{
  }
  return;
 };
-const planeContains=(plane:Plane,point:SourceWholePoint):boolean=>Math.abs(dot(plane.normal,vector(plane.origin,point)))<=1e-4;
+const planeContains=(plane:Plane,point:SourceWholePoint):boolean=>dot(plane.normal,vector(plane.origin,point))===0;
 const planesCompatible=(left:Plane|undefined,right:Plane|undefined):boolean=>{
  if(!left||!right)return false;
- return Math.abs(Math.abs(dot(left.normal,right.normal))-1)<=1e-4&&planeContains(left,right.origin)&&planeContains(right,left.origin);
+ const normalCross=cross(left.normal,right.normal);
+ return normalCross[0]===0&&normalCross[1]===0&&normalCross[2]===0&&planeContains(left,right.origin)&&planeContains(right,left.origin);
 };
 const planeKey=(plane:Plane|undefined):string|undefined=>{
  if(!plane)return;
@@ -339,7 +357,7 @@ export function compileCoherentParent(members:readonly CoherentParentMember[]):C
      partSegments.push(current);
     }
    }
-   partWorks.push({part,pose,segments:partSegments,plane:usablePlane});
+   partWorks.push({part,member,pose,segments:partSegments,plane:usablePlane});
    partSegmentGroups.push(partSegments);
   }
  }
@@ -403,9 +421,109 @@ export function compileCoherentParent(members:readonly CoherentParentMember[]):C
   pushRun(current);for(const run of runs)addPassage(work,run.points,run.refs,false);
  };
  for(const work of partWorks)addRuns(work);
+
+ // The resident segment map above is still the incumbent for unsupported
+ // source geometry.  This second, source-owned product is deliberately
+ // narrower: only closed parts with one identical native role/context/ports
+ // contract and disjoint owner contributors may be replaced by an ordered
+ // component union.  A missing or conflicting contract leaves every original
+ // passage in place; no part donates its native entry to another part.
+ const nativeSignature=(part:SourceWholePartRef):string=>`${part.role}|${part.entryRef}|${part.context}|${part.ports[0]}|${part.ports[1]}`;
+ const samePoints=(left:readonly SourceWholePoint[],right:readonly SourceWholePoint[]):boolean=>left.length===right.length&&left.every((point,index)=>point.every((value,axis)=>value===right[index]![axis]));
+ const unionGroups=new Map<string,PartWork[]>();
+ for(const work of partWorks){
+  if(work.part.closed!==true||!work.part.geometry||work.part.geometry.length<3)continue;
+  if(!Number.isSafeInteger(work.part.entryRef)||!Number.isSafeInteger(work.part.context))continue;
+  const group=unionGroups.get(nativeSignature(work.part))??[];group.push(work);unionGroups.set(nativeSignature(work.part),group);
+ }
+ type ComponentUnionPlan={readonly retained:number;readonly features:readonly number[];readonly geometry:readonly SourceWholePoint[];readonly template:SourceWholePartRef;readonly contributors:readonly (readonly [number,number])[]};
+ const unionPlans:ComponentUnionPlan[]=[];
+ for(const group of unionGroups.values()){
+  if(group.length<2)continue;
+  const ownerKeys=new Set<string>();let ownerConflict=false;
+  for(const work of group){
+   for(const pair of work.part.contributors){const key=pairKey(pair);if(ownerKeys.has(key)){ownerConflict=true;break;}ownerKeys.add(key);}
+   if(ownerConflict)break;
+  }
+  // Same-owner repeated role parts are separate native members, even when
+  // their source coordinates happen to coincide.
+  if(ownerConflict)continue;
+  const protectedByFeature=new Map<number,SourceComponentContour>();let protectedConflict=false;
+  for(const work of group){
+   const relationLists:[SourceComponentContour['kind'],readonly SourceWholeOpening[]][]=[
+    ['hole',work.member.construction.openings],
+    ['hole',work.member.construction.protectedVoids],
+    ['paper',work.member.construction.paper??[]],
+   ];
+   for(const [kind,values] of relationLists)for(const value of values){
+    const mapped=relationWorld(value,work.member);
+    if(!mapped||mapped.closed!==true||!mapped.geometry||mapped.geometry.length<3){protectedConflict=true;break;}
+    const contour:SourceComponentContour={feature:value.feature,contributors:[value.feature],kind,points:mapped.geometry};
+    const existing=protectedByFeature.get(contour.feature);
+    if(existing&&!samePoints(existing.points,contour.points)){protectedConflict=true;break;}
+    // The same source aperture may be listed in both the opening/void and
+    // paper ledgers.  Keep one protected contour for the union certificate;
+    // the original relation ledgers remain intact on the resulting parent.
+    if(existing&&existing.kind==='paper'&&contour.kind==='hole')protectedByFeature.set(contour.feature,contour);
+    else if(!existing)protectedByFeature.set(contour.feature,contour);
+   }
+   if(protectedConflict)break;
+  }
+  if(protectedConflict)continue;
+  // Source feature IDs are bank-local and may repeat for different instances.
+  // Give the temporary union graph owner-scoped identities, then recover the
+  // original feature IDs only after the topology is certified.  This avoids
+  // aliasing two copies merely because their bank feature number is equal.
+  const sortedGroup=[...group].sort((left,right)=>{
+   const leftOwner=left.part.contributors.map(pairKey).sort().join('|'),rightOwner=right.part.contributors.map(pairKey).sort().join('|');
+   return leftOwner.localeCompare(rightOwner)||left.part.feature-right.part.feature;
+  });
+  const reserved=new Set(protectedByFeature.keys()),temporaryToWork=new Map<number,PartWork>();
+  let temporaryFeature=-1;const contours:SourceComponentContour[]=[];
+  for(const work of sortedGroup){while(reserved.has(temporaryFeature))temporaryFeature--;reserved.add(temporaryFeature);temporaryToWork.set(temporaryFeature,work);contours.push({feature:temporaryFeature,contributors:[temporaryFeature],kind:'outer',points:work.part.geometry!.map(value=>posed(value,work.pose))});temporaryFeature--;}
+  contours.push(...protectedByFeature.values());
+  const union=unionSourceComponentContours(contours);if(union.status!=='union'||!union.featureAliases.length)continue;
+  const groupPlans:ComponentUnionPlan[]=[];let invalidPlan=false;
+  for(const alias of union.featureAliases){
+   const temporaryFeatures=[alias.retained,...alias.aliases].sort((left,right)=>left-right);
+   const sourceParts=temporaryFeatures.map(feature=>temporaryToWork.get(feature)).filter((work):work is PartWork=>!!work);
+   if(sourceParts.length!==temporaryFeatures.length){invalidPlan=true;break;}
+   const loop=union.loops.find(candidate=>candidate.kind==='outer'&&candidate.sourceFeatures.some(feature=>temporaryFeatures.includes(feature)));
+   if(!loop||loop.points.length<3){invalidPlan=true;break;}
+   const contributors=exactContributorSet(uniquePairs(sourceParts.flatMap(work=>work.part.contributors)).slice().sort((left,right)=>pairKey(left).localeCompare(pairKey(right))),known);
+   if(!contributors){invalidPlan=true;break;}
+   const sourceFeatures=[...new Set(sourceParts.map(work=>work.part.feature))].sort((left,right)=>left-right);
+   const template=sourceParts.slice().sort((left,right)=>left.part.feature-right.part.feature||left.part.contributors.map(pairKey).join('|').localeCompare(right.part.contributors.map(pairKey).join('|')))[0]!.part;
+   groupPlans.push({retained:sourceFeatures[0]!,features:sourceFeatures,geometry:loop.points,template,contributors});
+  }
+  if(!invalidPlan)unionPlans.push(...groupPlans);
+ }
+ if(unionPlans.length){
+  // Bank-local features repeat across copies. Only a passage belonging to
+  // THIS union's source owners/native contract is replaced; a disjoint copy
+  // with the same feature number must retain its complete construction.
+  for(let index=passages.length-1;index>=0;index--){
+   const passage=passages[index]!;
+   if(unionPlans.some(plan=>nativeSignature(passage)===nativeSignature(plan.template)&&
+    passage.sourceFeatures.every(feature=>plan.features.includes(feature))&&
+    passage.contributors.every(pair=>plan.contributors.some(owner=>owner[0]===pair[0]&&owner[1]===pair[1]))))passages.splice(index,1);
+  }
+  for(const plan of unionPlans){
+   passages.push({feature:plan.retained,sourceFeatures:plan.features,role:plan.template.role,entryRef:plan.template.entryRef,context:plan.template.context,ports:plan.template.ports,contributors:plan.contributors,geometry:plan.geometry,closed:true,removedSharedJoin:true});
+   const existing=featureAliases.find(value=>value.retained===plan.retained);
+   const missingAliases=plan.features.filter(feature=>feature!==plan.retained&&!(existing?.aliases.includes(feature)??false));
+   if(existing){for(const feature of missingAliases)existing.aliases.push(feature);}
+   else featureAliases.push({retained:plan.retained,aliases:plan.features.filter(feature=>feature!==plan.retained)});
+   removedSharedJoins+=missingAliases.length;
+  }
+ }
+ const normalizedAliases=canonicalFeatureAliases(featureAliases);
+ featureAliases.splice(0,featureAliases.length,...normalizedAliases.map(value=>({retained:value.retained,aliases:[...value.aliases]})));
  if(passageContributorFailure)return {status:'children',reason:'invalid-contributor'};
  const parts:SourceWholePartRef[]=passages.map(passage=>({feature:passage.feature,entryRef:passage.entryRef,context:passage.context,role:passage.role,ports:passage.ports,contributors:passage.contributors,geometry:passage.geometry,closed:passage.closed,worldFromSource:IDENTITY}));
  const allPaper=[...paperSource,...openings,...protectedVoids];
+ // The compound ledger names emitted parts. Absorbed source features remain
+ // in passage provenance/featureAliases, not as nonexistent emitted parts.
  const outerFeatures=[...new Set(parts.map(part=>part.feature))];
  const openingFeatures=[...new Set(openings.map(value=>value.feature))];
  const contactFeatures=[...new Set(contacts.map(value=>value.feature))];

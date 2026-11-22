@@ -217,6 +217,51 @@ function rewriteFunction(source:string,name:string,edit:(body:string)=>string):s
  if(end<0)throw Error(`Playback compiler function body unbalanced: ${name}`);
  return source.slice(0,open+1)+edit(source.slice(open+1,end))+source.slice(end);
 }
+function removeFunction(source:string,name:string):string{
+ const marker=`fn ${name}(`,start=source.indexOf(marker);
+ if(start<0)return source;
+ const open=source.indexOf('{',start);if(open<0)throw Error(`Playback compiler function body missing: ${name}`);
+ let depth=1,end=-1;
+ for(let i=open+1;i<source.length;i++){
+  if(source[i]==='/'&&source[i+1]==='/'){const line=source.indexOf('\n',i+2);i=line<0?source.length:line;continue;}
+  if(source[i]==='/'&&source[i+1]==='*'){const comment=source.indexOf('*/',i+2);if(comment<0)throw Error(`Playback compiler comment missing: ${name}`);i=comment+1;continue;}
+  if(source[i]==='{')depth++;
+  else if(source[i]==='}'&&--depth===0){end=i;break;}
+ }
+ if(end<0)throw Error(`Playback compiler function body unbalanced: ${name}`);
+ return source.slice(0,start)+source.slice(end+1);
+}
+function stripNonProgrammedCanonicalContext(code:string):string{
+ code=rewriteFunction(code,'softRetainedSourcePrepare',()=>`\n return false;\n`);
+ code=rewriteFunction(code,'softRetainedPassagePrepare',body=>{
+  const marker=' let sourceChord=softRetainedSourceChord(run);';
+  if(!body.includes(marker))throw Error('Playback compiler canonical passage context changed');
+  return body.replace(marker,' let sourceChord=finiteRunEnd(run).position.xy-finiteRunStart(run).position.xy;');
+ });
+ code=rewriteFunction(code,'featurecurves',body=>{
+  const contextStart=' let canonicalCandidate=runProgramFeature(run)!=0u&&(run.range.z&0x40000u)==0u&&sourcePartCanonicalPlayable(run);';
+  const contextEnd=' let anchorOnly=';
+  const at=body.indexOf(contextStart),to=body.indexOf(contextEnd,at);
+  if(at<0||to<0)throw Error('Playback compiler canonical feature context changed');
+  body=body.slice(0,at)+body.slice(to);
+  body=body.replace(' let delta=last.xy-first.xy;if(length(delta)<.00001&&!canonicalContext){return;}',' let delta=last.xy-first.xy;if(length(delta)<.00001){return;}');
+  const activeStart=' var activeDelta=delta;';
+  const activeEnd=' // Practitioner upright run:';
+  const activeAt=body.indexOf(activeStart),activeTo=body.indexOf(activeEnd,activeAt);
+  if(activeAt>=0){
+   if(activeTo<0)throw Error('Playback compiler canonical active delta changed');
+   body=body.slice(0,activeAt)+' var activeDelta=delta;\n'+body.slice(activeTo);
+  }
+  return body;
+ });
+ // Once the non-programmed bodies have been cut over, these source-authority
+ // entry points have no callers in the isolated closure. Removing them keeps
+ // the legacy/hard/mobile modules from carrying the programmed packet code.
+ code=removeFunction(code,'sourcePartCanonicalOrigin');
+ code=removeFunction(code,'sourcePartCanonicalTerminal');
+ code=removeFunction(code,'softRetainedSourceChord');
+ return code;
+}
 function removeUntil(source:string,startMarker:string,endMarker:string):string{
  const start=source.indexOf(startMarker),end=start<0?-1:source.indexOf(endMarker,start);
  if(start<0||end<0)throw Error(`Playback compiler section changed: ${startMarker.slice(0,80)}`);
@@ -286,7 +331,7 @@ function specializeSoftProducer(code:string,kind:'legacy'|'program'):string{
    if(body.includes('programFeature')||body.includes('canonicalReady')||body.includes('sourcePartCanonical')||body.includes('programmedWhole'))throw Error('Legacy soft closure retained programmed source authority: '+(body.match(/[^\\n]*(?:programFeature|canonicalReady|sourcePartCanonical|programmedWhole)[^\\n]*/g)||[]).join(' || '));
    return body;
   });
-  return code;
+  return stripNonProgrammedCanonicalContext(code);
  }
  code=rewriteFunction(code,'softRunPlayback',body=>body.replace('if(runProgramFeature(run)==0u){directionSegments(run);}',''));
  code=rewriteFunction(code,'softPortion',body=>{
@@ -340,6 +385,7 @@ function genericFamilyPlayback(source:string,family:PlaybackFamily):string{
   if(from<0||to<0)throw Error('Missing path program boundaries');
   code=code.slice(0,from)+' return;\n}\n'+code.slice(to);
  }
+ code=stripNonProgrammedCanonicalContext(code);
  return isolateComputeEntry(code,'featurecurves');
 }
 function pathPlaybackBase(source:string):string{
@@ -382,6 +428,7 @@ export function pathProgramPlayback(source:string):string{return compileSoftPlay
 export function pathHardPlayback(source:string):string{
  let code=pathPlaybackBase(source);
  code=code.replace('if(pathPlaybackClass(run,geometry)!=PATH_SOFT){return;}','if(pathPlaybackClass(run,geometry)!=PATH_HARD&&pathPlaybackClass(run,geometry)!=PATH_ANCHOR){return;}');
+ code=stripNonProgrammedCanonicalContext(code);
  code=rewriteComputeEntry(code,'featurecurves',body=>{
   const softStart=' if(soft){\n';
   const hardStart=' let count=grammar[instruction+1u];let advance=grammar[instruction+2u];';
