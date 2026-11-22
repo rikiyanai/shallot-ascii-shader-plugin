@@ -6052,7 +6052,12 @@ fn softPortion(runID:u32,run:Run,table:u32,size:u32,row:i32,portion:u32,startPai
    // An upright unit is one mark per row: one directly after another upright
    // of the same row portion is skipped (no ||||| along a row); the row goes on.
    let upright=uprightWord(grammar[record]);
-   if(!(upright&&priorUpright)&&softUnitStands(run,startPair,startT,endPair,endT,select(pen-f32(fit.y),pen,way>0.0),select(pen,pen+f32(fit.y),way>0.0))){sourceWord(runID,softMemberOrdinal(runAnchor,row,i32(round((pen-anchorX)*way))),q,i32(round(pen))-select(i32(fit.y),0,way>0.0),row,grammar[record],fit.x,fit.y,priority,sourceA,sourceB);softWords++;if(upright){lastUprightRow=row;}}else{probeAdd(95u);}// PROBE
+   // Name the signed source interval, not distance along either direction:
+   // the first forward and reverse units meet at the anchor but are not one
+   // occurrence. Subtract before rounding so translation cannot rename it.
+   let placedX=i32(round(pen))-select(i32(fit.y),0,way>0.0);
+   let memberOffset=i32(round(pen-anchorX))-select(i32(fit.y),0,way>0.0);
+   if(!(upright&&priorUpright)&&softUnitStands(run,startPair,startT,endPair,endT,select(pen-f32(fit.y),pen,way>0.0),select(pen,pen+f32(fit.y),way>0.0))){sourceWord(runID,softMemberOrdinal(runAnchor,row,memberOffset),q,placedX,row,grammar[record],fit.x,fit.y,priority,sourceA,sourceB);softWords++;if(upright){lastUprightRow=row;}}else{probeAdd(95u);}// PROBE
    priorUpright=upright;
    index++;step=f32(fit.y);
   }else{probeAdd(93u);}// PROBE

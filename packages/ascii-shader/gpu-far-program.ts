@@ -1,7 +1,7 @@
 import {farPlayback,CONTOUR_RETRY_WGSL} from './gpu-playback-program.ts';
 export {SOURCE_CONTOUR_NATIVE_RETRY} from './gpu-playback-program.ts';
 import {isolateComputeEntry} from './gpu-compute-program.ts';
-import {PARENT_LEAVE_ROWS,SOURCE_COARSE_CONTOUR_FLAG} from './source-lod.ts';
+import {SOURCE_WHOLE_NATIVE_ROW_PLAN_MAX,SOURCE_COARSE_CONTOUR_FLAG} from './source-lod.ts';
 import {SMALL_CONSTRUCTION_WGSL} from './gpu-small-construction.ts';
 import type {SourceConstructionClass} from './gpu-construction-runs.ts';
 
@@ -23,11 +23,8 @@ export function sourceContourRetryCapacity(classes:readonly SourceConstructionCl
 export const FAR_PLAN_BASE='p.farLoops.w';
 export const FAR_PLAN_LAYOUT=['kind','away','priority','span.x','span.y','span.z','span.w','profileLoops'] as const;
 export const FAR_KIND_ENTRIES=['featurefarPrepare','featurefarTerrain','featurefarStanding'] as const;
-/** The parent selector's held leave band is the only row bound for this
- * representation.  Include one boundary row because a projected box may
- * straddle two native row edges; a source geometry beyond this bound declines
- * the parent and keeps the incumbent representation. */
-const FAR_PARENT_ROW_PLAN_MAX=Math.ceil(PARENT_LEAVE_ROWS)+1;
+/** Principal and parent products use the same capacity as CPU admission. */
+const FAR_PARENT_ROW_PLAN_MAX=SOURCE_WHOLE_NATIVE_ROW_PLAN_MAX;
 
 const bits=(value:number)=>new Uint32Array(new Float32Array([value]).buffer)[0]!;
 const float=(value:number)=>new Float32Array(new Uint32Array([value>>>0]).buffer)[0]!;

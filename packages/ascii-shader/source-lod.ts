@@ -20,6 +20,9 @@ export const PARENT_ENTER_ROWS=FAR_STRIP_BELOW_ROWS*LOD_TIER_HOLD,PARENT_LEAVE_R
  * existing middle tier too, not just below one cell. The hold belongs to the
  * exact source lifetime/revision and uses the same native-page size bands. */
 export const PRINCIPAL_ENTER_ROWS=NEAR_FROM_ROWS*LOD_TIER_HOLD,PRINCIPAL_LEAVE_ROWS=NEAR_FROM_ROWS/LOD_TIER_HOLD;
+/** Shared CPU/GPU native plan capacity covers both held tiers and the row
+ * intersected by an endpoint. A parent-only cap rejects valid principals. */
+export const SOURCE_WHOLE_NATIVE_ROW_PLAN_MAX=Math.ceil(Math.max(PARENT_LEAVE_ROWS,PRINCIPAL_LEAVE_ROWS))+1;
 /** Page columns one parent profile may span (the emitter's workgroup table). */
 export const PARENT_MAX_COLUMNS=64;
 
@@ -587,6 +590,7 @@ export function sourceWholeConstructionExecutable(value:SourceWholeConstruction|
   // overrun or an endpoint on the first invalid integer row.
   if(minX<0||maxX>pageWidth||origin<0||origin+sourceWidth>pageWidth||minY<0||maxY>pageHeight||lowRow<0||highRow>=rowCount)return false;
   const rows=highRow-lowRow+1,closed=part.closed===true;
+  if(rows>SOURCE_WHOLE_NATIVE_ROW_PLAN_MAX)return false;
   // A required contact uses the existing open-hard boundary consumer, not a
   // fabricated whole-part bank entry. Its source geometry, pose and relation
   // identity remain in the packet; the ordinary planar queue owns spelling.
