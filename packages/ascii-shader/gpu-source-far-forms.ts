@@ -322,7 +322,7 @@ const RELATION_PARENT_BIT=0x20000000;
 const COMPOUND_PARENT_BIT=0x10000000;
 const relationFloatValue=new Float32Array(1),relationFloatWord=new Uint32Array(relationFloatValue.buffer);
 const relationFloatBits=(value:number):number=>{relationFloatValue[0]=value;return relationFloatWord[0]!;};
-const relationKey=(item:SourceWholeOpening):string=>`${item.feature}:${item.contributors.map(pair=>`${pair[0]}:${pair[1]}`).join(',')}:${item.worldFromSource?Array.from(item.worldFromSource,relationFloatBits).join(','):''}:${item.geometry?.map(point=>point.map(relationFloatBits).join(',')).join(';')??''}`;
+const relationKey=(item:SourceWholeOpening):string=>`${item.feature}:${item.ports.join(',')}:${item.contributors.map(pair=>`${pair[0]}:${pair[1]}`).join(',')}:${item.worldFromSource?Array.from(item.worldFromSource,relationFloatBits).join(','):''}:${item.geometry?.map(point=>point.map(relationFloatBits).join(',')).join(';')??''}`;
 const relationListKey=(kind:SourceWholePartRef['relationKind'],item:SourceWholeOpening):string=>`${kind==='contact'?'contact':'boundary'}:${relationKey(item)}`;
 const relationLists=(value:SourceWholeConstruction):readonly (readonly [readonly SourceWholeOpening[],SourceWholePartRef['relationKind']])[]=>[[value.openings,'opening'],[value.contacts,'contact'],[value.protectedVoids,'protected-void'],[value.paper??[],'paper']];
 function relationParts(value:SourceWholeConstruction):SourceWholePartRef[]|undefined{

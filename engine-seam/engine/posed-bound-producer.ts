@@ -8,7 +8,7 @@ type SpatialBounds=[number,number,number,number,number,number];
 export const ENGINE_POSED_BOUND_CERTIFICATE='engine-deformed-cull-sphere-v1' as const;
 export type PosedBoundAuthority='native-affine'|'entity-cull-sphere'|'engine-deformed-cull-sphere'|'material-source-cull-sphere';
 export interface PosedBoundMaterial {readonly vertex?:unknown;readonly mainPosedBounds?:unknown}
-export interface PosedBoundSource {readonly cullBounds?: (row:number,out:Float32Array)=>void}
+export interface PosedBoundSource {readonly cullBounds?: (row:number,out:Float32Array,nativeSphere?:ArrayLike<number>)=>void}
 export interface PosedBoundInput {
  readonly material?:PosedBoundMaterial;
  readonly source?:PosedBoundSource;
@@ -51,7 +51,8 @@ export function resolvePosedBound(input:PosedBoundInput):PosedBoundResult{
   // no-op or partial producer cannot accidentally certify the origin with a
   // zero-radius sphere.  The producer must author all four values.
   const value=new Float32Array([NaN,NaN,NaN,-1]);
-  try{input.source.cullBounds(input.materialRow,value);}catch{return {};} // an invalid producer keeps the incumbent
+  const base=sphere(input.override)??sphere(input.nativeSphere);
+  try{input.source.cullBounds(input.materialRow,value,base);}catch{return {};} // an invalid producer keeps the incumbent
   const bounds=posedSphereBounds(value,input.pose);
   return bounds?{bounds,authority:'material-source-cull-sphere'}:{};
  }

@@ -2,10 +2,11 @@
 import {readFile,writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 const key='{ kind: "gltf-material"; asset: string; material: number }';
+const cullBoundMarker='MAIN_MATERIAL_CULL_BOUNDS_ABI_20261122';
 function once(text,from,to,label){if(text.split(from).length!==2)throw Error('MAIN material metadata anchor changed: '+label);return text.replace(from,to);}
 export async function applySourceMaterialMetadata(engine){
- const relative=['src/core/mesh/mesh.ts','src/extras/gltf/gltf.ts','src/extras/gltf/load.ts','src/standard/rendering/forward.ts'];
- const original=await Promise.all(relative.map(path=>readFile(resolve(engine,path),'utf8')));let [mesh,gltf,load,forward]=original;
+ const relative=['src/core/mesh/mesh.ts','src/extras/gltf/gltf.ts','src/extras/gltf/load.ts','src/standard/rendering/forward.ts','src/standard/rendering/material-type.ts'];
+ const original=await Promise.all(relative.map(path=>readFile(resolve(engine,path),'utf8')));let [mesh,gltf,load,forward,materialType]=original;
  if(!mesh.includes('MAIN_SOURCE_MATERIAL_METADATA_0103')){
   const source='sourceGeometry?: { positions: Float32Array; indices: Uint32Array; contactKeys?: Uint32Array; revision: number }';
   mesh=once(mesh,source,source+' & { materialSource?: '+key+' }','packed source');
@@ -61,6 +62,27 @@ export async function applySourceMaterialMetadata(engine){
   mesh=once(mesh,'surface: sourceSurfaces.get(s.handle) }','surface: sourceSurfaces.get(s.handle), semantic: sourceSemantics.get(s.handle) }','source semantic publication');
  }
  if(!forward.includes(semantic))forward=once(forward,source,source+' & '+semantic,'visitor semantic type');
+ // A generic material producer may expand the native local sphere after the
+ // material row is selected. Publish that optional callback through the
+ // actual MaterialType -> MaterialAssets -> MaterialSource chain. This is a
+ // public engine seam, not a scene-specific material transform.
+ if(!materialType.includes(cullBoundMarker)){
+  materialType=once(materialType,'    cullBounds?(row: number, out: Float32Array): void;',
+   '    cullBounds?(row: number, out: Float32Array, nativeSphere?: ArrayLike<number>): void;','material source ABI');
+  materialType=once(materialType,'    readonly defaults?: d.InferInput<P>;\n',
+   '    readonly defaults?: d.InferInput<P>;\n    readonly cullBounds?: (row: number, out: Float32Array, nativeSphere?: ArrayLike<number>) => void;\n','material type ABI');
+  materialType=once(materialType,'    private _table: GpuTable<P> | undefined;\n',
+   '    private _table: GpuTable<P> | undefined;\n    /** Published only when this material type owns a deformation bound. */\n    readonly cullBounds?: (row: number, out: Float32Array, nativeSphere?: ArrayLike<number>) => void;\n','material asset ABI');
+  materialType=once(materialType,'        this._type = type;\n',
+   '        this._type = type;\n        if (type.cullBounds) this.cullBounds = (row, out, nativeSphere) => type.cullBounds!(row, out, nativeSphere);\n','material asset publication');
+  materialType+='\n/* '+cullBoundMarker+' */\n';
+ }
+ if(!forward.includes(cullBoundMarker)){
+  const call='            source.cullBounds(materials.material.get(instanceEid), state.materialBounds);';
+  forward=once(forward,'    materialBounds: Float32Array;\n','    materialBounds: Float32Array;\n    nativeMaterialBounds: Float32Array;\n','forward native sphere scratch declaration');
+  forward=once(forward,'        materialBounds: new Float32Array(4),\n','        materialBounds: new Float32Array(4),\n        nativeMaterialBounds: new Float32Array(4),\n','forward native sphere scratch allocation');
+  forward=once(forward,call,'            state.nativeMaterialBounds[0] = bx;\n            state.nativeMaterialBounds[1] = by;\n            state.nativeMaterialBounds[2] = bz;\n            state.nativeMaterialBounds[3] = radius;\n            source.cullBounds(materials.material.get(instanceEid), state.materialBounds, state.nativeMaterialBounds);\n        /* '+cullBoundMarker+' */','forward native sphere');
+ }
  // The native quantizer already owns each typed mesh's exact decoded box.
  // Publish that small extent once; a ground patch's bounding sphere must not
  // pretend its horizontal radius is occupied height. Custom/GPU sources have
@@ -80,5 +102,5 @@ export async function applySourceMaterialMetadata(engine){
 `+anchor,'native position bounds publication');
   mesh=once(mesh,'            bounds: bounds.get(s.handle),','            bounds: bounds.get(s.handle),\n            positionBounds: sourcePositionBounds,','native position bounds owner');
  }
- for(const [i,text]of [mesh,gltf,load,forward].entries())if(text!==original[i])await writeFile(resolve(engine,relative[i]),text);
+ for(const [i,text]of [mesh,gltf,load,forward,materialType].entries())if(text!==original[i])await writeFile(resolve(engine,relative[i]),text);
 }
